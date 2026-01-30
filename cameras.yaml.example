@@ -1,0 +1,67 @@
+# Пример конфигурации IP камер
+# Скопируйте этот файл в cameras.yaml и настройте под ваши IP камеры
+
+cameras:
+  # RTSP IP камера (наиболее распространенный формат)
+  - camera_id: "ip_camera_1"
+    name: "IP Camera Front Door"
+    source: "rtsp://admin:password123@192.168.1.100:554/stream1"
+    type: "rtsp"
+    ip_address: "192.168.1.100"
+    port: 554
+    rtsp_path: "/stream1"
+    username: "admin"
+    password: "password123"
+    fps: 15.0
+    width: 1280
+    height: 720
+    enabled: true
+    description: "Камера на входной двери"
+  
+  # RTSP камера без аутентификации
+  - camera_id: "ip_camera_2"
+    name: "IP Camera Backyard"
+    source: "rtsp://192.168.1.101:554/stream1"
+    type: "rtsp"
+    ip_address: "192.168.1.101"
+    port: 554
+    rtsp_path: "/stream1"
+    username: null
+    password: null
+    fps: 10.0
+    width: 640
+    height: 480
+    enabled: true
+    description: "Камера заднего двора"
+  
+  # HTTP/MJPEG камера
+  - camera_id: "ip_camera_3"
+    name: "IP Camera Side"
+    source: "http://192.168.1.102:8080/mjpeg"
+    type: "http"
+    ip_address: "192.168.1.102"
+    port: 8080
+    rtsp_path: "/mjpeg"
+    username: null
+    password: null
+    fps: 10.0
+    width: 640
+    height: 480
+    enabled: true
+    description: "Боковая камера"
+  
+  # RTSP камера с другим путем потока
+  - camera_id: "ip_camera_4"
+    name: "IP Camera Garage"
+    source: "rtsp://user:pass@192.168.1.103:8554/h264"
+    type: "rtsp"
+    ip_address: "192.168.1.103"
+    port: 8554
+    rtsp_path: "/h264"
+    username: "user"
+    password: "pass"
+    fps: 20.0
+    width: 1920
+    height: 1080
+    enabled: true
+    description: "Камера в гараже"
