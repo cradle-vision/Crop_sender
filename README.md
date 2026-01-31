@@ -1,171 +1,75 @@
-# Sender Crop - Snapshot Sending System
+# Sender Crop
 
-System for sending snapshots from IP cameras: **two senders** — (1) full snapshot → gRPC AI server, (2) face detect → crop → POST to user endpoint. Cameras list from **backend** (env) or `cameras.yaml`.
+Камера наблюдает людей → детекция (лица или люди) → обрезка (crop) → отправка на gRPC сервер.
 
-## Architecture
+## Схема
 
-- **Snapshot Capture Agent** — Captures frames from IP cameras (FPS configurable)
-- **Sender 1 (gRPC)** — Sends full snapshot to AI server via gRPC
-- **Sender 2 (Crop)** — Detects face, crops, sends crop to user endpoint (HTTP POST)
-- **Main Agent** — Coordinates capture + both senders
-- **Camera Manager** — Loads cameras from backend (env `BACKEND_URL` + `CAMERAS_ENDPOINT`) or `cameras.yaml`
-- **IP Camera Scanner** — Utility for scanning network and managing cameras (file mode)
+- **Камера(ы)** — захват кадров (RTSP/HTTP/USB), FPS из `cameras.yaml`
+- **Детекция** — **person** (бинарник `person_detect` из `cpu-person-detection/`) или **face** (OpenCV Haar)
+- **Обрезка** — crop по найденным областям
+- **gRPC** — каждый crop отправляется на сервер (`SendSnapshot`: camera_id, image_data, timestamp)
 
-## Installation
-
-### Local
+## Установка
 
 ```bash
 ./setup.sh
 ```
 
-### Docker
+## Конфигурация
 
-```bash
-docker-compose build
-docker-compose up -d
-```
+- **config.yaml** — `grpc.server_address`, `rtsp.use_ffmpeg_pipe` (true = захват RTSP через FFmpeg-подпроцесс, меньше ошибок RTP/декодирования), `detection.type` (person | face), `detection.person_conf`, `agent.timeout`, `agent.default_fps`
+- **cameras.yaml** — список камер (создать из `cameras.yaml.example` или `python3 scan_ip_cameras.py --add`)
 
-## Configuration
+Переменные окружения: `GRPC_SERVER_ADDRESS`, `RTSP_USE_FFMPEG_PIPE` (1/true/yes переопределяет config), `DETECTION_TYPE` (person | face), `PERSON_MODEL_PATH`, `DEFAULT_FPS`, `CAM1_FPS` (и т.д.).
 
-### Environment (recommended)
+Для **person** нужны: бинарник `cpu-person-detection/person_detection_linux_x64/person_detect` и модель `cpu-person-detection/models/person_detection_model.onnx` (собрать пакет: `cd cpu-person-detection && ./create_linux_package.sh`).
 
-| Env | Description |
-|-----|-------------|
-| `BACKEND_URL` | Base URL for backend (e.g. `http://localhost:8000`) — cameras loaded from API |
-| `CAMERAS_ENDPOINT` | Path for cameras list (default `/api/cameras`), GET returns `{"cameras": [...]}` |
-| `GRPC_SERVER_ADDRESS` | gRPC server for full snapshots (Sender 1) |
-| `CROP_ENABLED` | `true` to enable Sender 2 (face crop → user) |
-| `CROP_DESTINATION_URL` | URL for POST cropped face (e.g. `http://backend/api/user/crop`) |
-| `DEFAULT_FPS` | Default FPS for all cameras |
-
-### Main config (`config.yaml`)
-
-```yaml
-grpc:
-  server_address: "localhost:50051"
-  max_message_size: 4194304
-
-backend:
-  url: null  # or set; env BACKEND_URL overrides
-  cameras_endpoint: "/api/cameras"  # env CAMERAS_ENDPOINT
-  timeout: 10
-
-crop:
-  enabled: false  # env CROP_ENABLED=true
-  destination_url: null  # env CROP_DESTINATION_URL
-  timeout: 5
-
-agent:
-  buffer_size: 30
-  timeout: 5.0
-```
-
-### Cameras: backend or file
-
-- **From backend:** set `BACKEND_URL` (and optionally `CAMERAS_ENDPOINT`). Backend GET returns JSON: `{"cameras": [...]}` with fields: `camera_id`, `name`, `type` (rtsp/http), `source` (full URL) or `ip_address`, `port`, `rtsp_path`, `fps`, `width`, `height`, `enabled`.
-- **From file:** `cp cameras.yaml.example cameras.yaml` and edit, or `python3 scan_ip_cameras.py --add`
-
-## Usage
-
-### Add IP cameras
-
-```bash
-# Interactive
-python3 scan_ip_cameras.py --add
-
-# Scan network
-python3 scan_ip_cameras.py --scan 192.168.1.0/24
-
-# Auto-detect
-python3 scan_ip_cameras.py --auto-detect 192.168.1.100:554
-```
-
-### Run
+## Запуск
 
 ```bash
 ./run.sh
-# or
-python3 main_agent.py
+# или из папки sender:
+cd sender && python3 main_agent.py
 ```
 
-### Docker
+Docker (sender + person_detect в одном образе):
 
 ```bash
-docker-compose up
+docker-compose build && docker-compose up -d
 ```
 
-## Camera Types
+В образ копируются `cpu-person-detection/` (бинарник `person_detect`, `lib/`, модель). Нужны `config.yaml` и `cameras.yaml` в каталоге сборки (монтируются в контейнер).
+
+## Типы камер
 
 - **RTSP**: `rtsp://[user:pass@]ip:port/path`
 - **HTTP/MJPEG**: `http://ip:port/path`
 
-## FPS Configuration
+При "RTP: bad cseq" и "error while decoding MB": включите **захват через FFmpeg** — в `config.yaml` задайте `rtsp.use_ffmpeg_pipe: true` (или env `RTSP_USE_FFMPEG_PIPE=1`). В коде также включены TCP, таймаут и авто-переподключение для OpenCV. Если ошибки остаются — переключитесь на **субпоток** камеры (Hikvision: `/Streaming/Channels/102` вместо `101`; у других — `/stream2`) — меньше битрейт, стабильнее по сети.
 
-FPS can be configured in multiple ways (priority order):
-
-1. **Camera-specific environment variable** (highest priority)
-   ```bash
-   CAM1_FPS=20.0 docker-compose up
-   # Or for any camera: CAMERA_ID_FPS=value
-   ```
-
-2. **Default FPS environment variable**
-   ```bash
-   DEFAULT_FPS=15.0 docker-compose up
-   ```
-
-3. **config.yaml default_fps**
-   ```yaml
-   agent:
-     default_fps: 15.0  # Overrides cameras.yaml for all cameras
-   ```
-
-4. **cameras.yaml** (lowest priority)
-   ```yaml
-   cameras:
-     - camera_id: "cam1"
-       fps: 10.0
-   ```
-
-### Examples
-
-```bash
-# Set FPS for specific camera
-CAM1_FPS=5.0 docker-compose up
-
-# Set default FPS for all cameras
-DEFAULT_FPS=15.0 docker-compose up
-
-# Set multiple camera FPS
-CAM1_FPS=10.0 IP_CAMERA_1_FPS=20.0 docker-compose up
-```
-
-## Troubleshooting
-
-**Error: UNIMPLEMENTED - unknown service snapshot.SnapshotService**
-
-Server doesn't recognize the service. Verify server uses same proto file:
-- Package: `snapshot`
-- Service: `SnapshotService`  
-- Method: `SendSnapshot`
-
-## Project Structure
+## Структура проекта
 
 ```
 Sender_Crop/
-├── snapshot_service.proto      # gRPC proto definition
-├── snapshot_capture_agent.py    # Capture agent
-├── grpc_sender_agent.py         # gRPC sender agent
-├── main_agent.py                # Main coordinator
-├── camera_manager.py             # Camera manager
-├── scan_ip_cameras.py            # Camera scanner utility
-├── config.yaml                   # Main config
-├── cameras.yaml                  # Camera config
-├── cameras.yaml.example          # Camera config example
-├── docker-compose.yml            # Docker compose
-├── Dockerfile                    # Docker image
-├── requirements.txt              # Dependencies
-├── setup.sh                      # Setup script
-└── run.sh                        # Run script
+├── sender/
+│   ├── main_agent.py           # Оркестратор: кадр → detect → crop → gRPC
+│   ├── snapshot_capture_agent.py # Захват с камер
+│   ├── face_crop.py            # Детекция лиц (Haar) + crop
+│   ├── person_crop.py          # Детекция людей (person_detect binary) + crop
+│   ├── grpc_sender_agent.py    # Отправка crop на gRPC
+│   ├── camera_manager.py       # Камеры из cameras.yaml
+│   ├── scan_ip_cameras.py      # Утилита добавления камер
+│   ├── cameras.yaml
+│   └── cameras.yaml.example
+├── snapshot_service.proto      # gRPC: SnapshotService.SendSnapshot
+├── config.yaml
+├── docker-compose.yml
+├── Dockerfile
+├── requirements.txt
+├── setup.sh
+└── run.sh
 ```
+
+## gRPC
+
+Сервер должен реализовать `snapshot.SnapshotService` / `SendSnapshot`. Запрос: `camera_id`, `image_data` (JPEG crop), `timestamp`, `format`.

@@ -4,10 +4,8 @@
 
 echo "=== Sender Crop - Snapshot Sending System ==="
 
-# Cameras: from backend (BACKEND_URL + CAMERAS_ENDPOINT) or cameras.yaml
-if [ ! -f "cameras.yaml" ] && [ -z "$BACKEND_URL" ]; then
-    echo "Note: cameras.yaml not found and BACKEND_URL not set."
-    echo "  Set BACKEND_URL to load cameras from API, or create cameras.yaml"
+if [ ! -f "sender/cameras.yaml" ] && [ ! -f "cameras.yaml" ]; then
+    echo "Create cameras.yaml from sender/cameras.yaml.example or cameras.yaml.example"
 fi
 
 # Check generated gRPC files
@@ -16,6 +14,6 @@ if [ ! -f "snapshot_service_pb2.py" ] || [ ! -f "snapshot_service_pb2_grpc.py" ]
     python3 -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. snapshot_service.proto
 fi
 
-# Start system
+# Start from project root so config.yaml and cameras.yaml are found
 echo "Starting system..."
-python3 main_agent.py
+python3 sender/main_agent.py

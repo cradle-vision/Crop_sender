@@ -1,15 +1,12 @@
 """
-Camera Manager - camera configuration management
-Supports IP cameras (RTSP/HTTP), load from backend API or file
+Camera Manager - camera configuration (cameras.yaml)
+Supports IP cameras RTSP/HTTP and USB.
 """
 
 import cv2
 import yaml
 import os
-import json
-import urllib.request
-import urllib.error
-from typing import List, Dict, Optional, Union, Any
+from typing import List, Dict, Optional, Union
 from dataclasses import dataclass, asdict
 
 
@@ -88,81 +85,6 @@ class CameraManager:
             print(f"[Camera Manager] Config file not found: {self.config_file}")
             print(f"[Camera Manager] Create file from example: cp cameras.yaml.example {self.config_file}")
             self.cameras = {}
-    
-    def load_cameras_from_backend(self, base_url: str, endpoint: str = "/api/cameras", timeout: float = 10.0) -> bool:
-        """Load cameras from backend HTTP GET. Expects JSON: {\"cameras\": [...]} or [...]. Returns True on success."""
-        url = base_url.rstrip("/") + "/" + endpoint.lstrip("/")
-        print(f"[Camera Manager] Fetching cameras from backend: {url}")
-        try:
-            req = urllib.request.Request(url, method="GET")
-            req.add_header("Accept", "application/json")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            cameras_list = data.get("cameras", data) if isinstance(data, dict) else data
-            if not isinstance(cameras_list, list):
-                print(f"[Camera Manager] Backend response: expected list or dict with 'cameras', got {type(data)}")
-                return False
-            self.cameras = {}
-            for item in cameras_list:
-                if not isinstance(item, dict):
-                    continue
-                cam = self._normalize_camera_dict(item)
-                if not cam.get("camera_id"):
-                    continue
-                try:
-                    camera = CameraInfo(**cam)
-                    if camera.type in ("rtsp", "http") and (not isinstance(camera.source, str) or "://" not in str(camera.source)):
-                        camera.source = self._build_source_url(camera)
-                    self.cameras[camera.camera_id] = camera
-                except Exception as e:
-                    print(f"[Camera Manager] Skip camera {cam.get('camera_id', item)}: {e}")
-            print(f"[Camera Manager] Loaded {len(self.cameras)} cameras from backend {url}")
-            return True
-        except urllib.error.HTTPError as e:
-            print(f"[Camera Manager] Backend HTTP error: {e.code} {e.reason}")
-            return False
-        except urllib.error.URLError as e:
-            print(f"[Camera Manager] Backend URL error: {e.reason}")
-            return False
-        except Exception as e:
-            print(f"[Camera Manager] Backend load error: {e}")
-            return False
-    
-    def _normalize_camera_dict(self, d: Dict[str, Any]) -> Dict[str, Any]:
-        """Normalize API camera dict to CameraInfo fields."""
-        source = d.get("source")
-        if source is None and d.get("ip_address"):
-            t = (d.get("type") or "rtsp").lower()
-            if t == "rtsp":
-                port = d.get("port", 554)
-                path = d.get("rtsp_path") or d.get("path") or "/stream1"
-                user, pwd = d.get("username"), d.get("password")
-                ip = d.get("ip_address", "")
-                source = f"rtsp://{user}:{pwd}@{ip}:{port}{path}" if (user and pwd) else f"rtsp://{ip}:{port}{path}"
-            elif t == "http":
-                port = d.get("port", 80)
-                path = d.get("rtsp_path") or d.get("path") or "/mjpeg"
-                source = f"http://{d.get('ip_address', '')}:{port}{path}"
-            else:
-                source = 0
-        if source is None:
-            source = 0
-        return {
-            "camera_id": str(d.get("camera_id", "")).strip() or f"camera_{id(d)}",
-            "name": str(d.get("name", d.get("camera_id", ""))),
-            "source": source,
-            "type": (d.get("type") or "usb").lower(),
-            "ip_address": d.get("ip_address"),
-            "port": d.get("port"),
-            "username": d.get("username"),
-            "password": d.get("password"),
-            "rtsp_path": d.get("rtsp_path") or d.get("path"),
-            "fps": float(d.get("fps", 10.0)),
-            "width": int(d.get("width", 640)),
-            "height": int(d.get("height", 480)),
-            "enabled": bool(d.get("enabled", True)),
-            "description": str(d.get("description", "")),
-        }
     
     def save_cameras(self):
         """Save cameras to config file"""

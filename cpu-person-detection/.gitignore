@@ -1,0 +1,17 @@
+# Build
+build/
+
+# Python reference (not used by main C++ pipeline)
+python_for_reference/
+
+# Virtual env
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

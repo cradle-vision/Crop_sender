@@ -1,34 +1,36 @@
-version: '3.8'
+# Два сервиса: sender-crop (камеры + person detection + gRPC клиент) и gRPC сервер (отдельно).
+# Sender с network_mode: host видит камеры в LAN и подключается к gRPC на localhost:50051.
+# Порт 50051 проброшен с grpc-server на хост — sender (host) подключается к localhost:50051.
 
 services:
   sender-crop:
     build: .
     container_name: sender-crop
     restart: unless-stopped
-    
     volumes:
       - ./config:/app/config:ro
       - ./cameras.yaml:/app/cameras.yaml:rw
       - ./config.yaml:/app/config.yaml:ro
-    
     environment:
       - CONFIG_PATH=/app/config.yaml
       - CAMERAS_CONFIG_PATH=/app/cameras.yaml
       - GRPC_SERVER_ADDRESS=${GRPC_SERVER_ADDRESS:-localhost:50051}
-      - BACKEND_URL=${BACKEND_URL:-}
-      - CAMERAS_ENDPOINT=${CAMERAS_ENDPOINT:-/api/cameras}
-      - CROP_ENABLED=${CROP_ENABLED:-false}
-      - CROP_DESTINATION_URL=${CROP_DESTINATION_URL:-}
       - DEFAULT_FPS=${DEFAULT_FPS:-}
-      # Camera-specific FPS: use CAMERA_ID_FPS (e.g., CAM1_FPS=15.0)
-    
     network_mode: host
-    
     deploy:
       resources:
         limits:
-          cpus: '2'
+          cpus: "2"
           memory: 2G
         reservations:
-          cpus: '0.5'
+          cpus: "0.5"
           memory: 512M
+
+  # gRPC сервер (SnapshotService). Раскомментируйте и укажите свой образ, если сервер в Docker.
+  # Sender с network_mode: host подключается к localhost:50051 — порт пробросится с этого сервиса.
+  # grpc-server:
+  #   image: your-registry/your-grpc-server:latest
+  #   container_name: grpc-server
+  #   restart: unless-stopped
+  #   ports:
+  #     - "50051:50051"

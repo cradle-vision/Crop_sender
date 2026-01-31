@@ -2,13 +2,13 @@ cameras:
 
 - camera_id: cam1
   name: Camera1
-  source: rtsp://admin:1234567@192.168.0.121:554/stream1
+  source: rtsp://admin:1234567@192.168.0.122:554/stream1
   type: rtsp
-  ip_address: 192.168.0.121
+  ip_address: 192.168.0.122
   port: 554
   username: admin
   password: '1234567'
-  rtsp_path: /Streaming/Channels/101
+  rtsp_path: /stream1
   fps: 10.0
   width: 640
   height: 480

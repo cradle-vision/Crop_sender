@@ -1,6 +1,6 @@
 """
 Main Coordinator Agent
-Manages multiple Capture Agents and gRPC Sender Agent
+Camera → detect people (face or person) → crop → send crop to gRPC server.
 """
 
 import yaml
@@ -8,12 +8,12 @@ import time
 import signal
 import sys
 import os
-from typing import Dict, List, Optional
+from typing import Dict
 from snapshot_capture_agent import SnapshotCaptureAgent
 from grpc_sender_agent import GrpcSenderAgent
-from crop_sender_agent import CropSenderAgent
 from camera_manager import CameraManager
 from face_crop import detect_faces, crop_faces
+from person_crop import detect_persons, crop_persons
 
 
 class MainAgent:
@@ -30,48 +30,46 @@ class MainAgent:
         self.config = self._load_config(config_path)
         self.running = False
         
-        # Initialize camera manager
+        # Camera manager: cameras from cameras.yaml (resolve path from project root if needed)
         cameras_config = cameras_config_path or self.config.get('cameras_config', 'cameras.yaml')
+        cameras_config = self._resolve_path(cameras_config)
         self.camera_manager = CameraManager(config_file=cameras_config, auto_save=False)
         
-        # Load cameras from backend (env BACKEND_URL + CAMERAS_ENDPOINT)
-        backend_config = self.config.get('backend', {})
-        backend_url = os.getenv('BACKEND_URL') or backend_config.get('url')
-        if backend_url:
-            endpoint = os.getenv('CAMERAS_ENDPOINT') or backend_config.get('cameras_endpoint', '/api/cameras')
-            timeout = float(backend_config.get('timeout', 10))
-            if self.camera_manager.load_cameras_from_backend(backend_url, endpoint, timeout):
-                print("[Main Agent] Using camera list from backend")
-            else:
-                print("[Main Agent] Backend failed, using cameras from file (if any)")
-        
-        # Initialize agents
         grpc_config = self.config.get('grpc', {})
-        self.agent_config = self.config.get('agent', {})  # Save for use in _init_cameras
-        
-        # Get server address from environment variable or config
+        self.agent_config = self.config.get('agent', {})
+        rtsp_config = self.config.get('rtsp', {})
+        # RTSP: use FFmpeg pipe (env overrides config)
+        _env_ffmpeg = os.getenv("RTSP_USE_FFMPEG_PIPE", "").strip().lower() in ("1", "true", "yes")
+        self.rtsp_use_ffmpeg_pipe = _env_ffmpeg if os.getenv("RTSP_USE_FFMPEG_PIPE") is not None else rtsp_config.get('use_ffmpeg_pipe', False)
         server_address = os.getenv('GRPC_SERVER_ADDRESS') or grpc_config.get('server_address', 'localhost:50051')
-        print(f"[Main Agent] gRPC server address: {server_address} (from {'environment variable' if os.getenv('GRPC_SERVER_ADDRESS') else 'config.yaml'})")
+        print(f"[Main Agent] gRPC server: {server_address}")
         
-        # Sender 1: full snapshot → gRPC
+        # gRPC sender: sends cropped images to server
         self.sender_agent = GrpcSenderAgent(
             server_address=server_address,
             max_message_size=grpc_config.get('max_message_size', 4194304),
             timeout=self.agent_config.get('timeout', 5.0)
         )
         
-        # Sender 2: face crop → user endpoint (env CROP_ENABLED + CROP_DESTINATION_URL)
-        crop_config = self.config.get('crop', {})
-        crop_enabled = os.getenv('CROP_ENABLED', '').lower() in ('1', 'true', 'yes') or crop_config.get('enabled', False)
-        crop_url = os.getenv('CROP_DESTINATION_URL') or crop_config.get('destination_url')
-        self.crop_sender: Optional[CropSenderAgent] = None
-        if crop_enabled and crop_url:
-            self.crop_sender = CropSenderAgent(destination_url=crop_url, timeout=float(crop_config.get('timeout', 5)))
-            print(f"[Main Agent] Crop sender enabled → {crop_url}")
-        else:
-            print("[Main Agent] Crop sender disabled (set CROP_ENABLED=true and CROP_DESTINATION_URL)")
+        # Detection: face (Haar) or person (cpu-person-detection binary)
+        det_config = self.config.get('detection', {})
+        self.detection_type = (os.getenv('DETECTION_TYPE') or det_config.get('type', 'person')).lower()
+        self.person_conf = float(det_config.get('person_conf', 0.4))
+        self.person_iou = float(det_config.get('person_iou', 0.5))
+        self.person_model_path = os.getenv('PERSON_MODEL_PATH') or det_config.get('person_model_path')
+        if self.detection_type == 'person':
+            from person_crop import is_available
+            if not is_available():
+                print("[Main Agent] Person detector (person_detect binary) not found, falling back to face detection")
+                self.detection_type = 'face'
+            else:
+                print("[Main Agent] Using person detection (cpu-person-detection binary)")
+        if self.detection_type == 'face':
+            print("[Main Agent] Using face detection (OpenCV Haar)")
+        if self.rtsp_use_ffmpeg_pipe:
+            print("[Main Agent] RTSP capture: using FFmpeg pipe (avoids RTP/decoding errors)")
         
-        # Initialize capture agents for each camera
+        # Capture agents for each camera
         self.capture_agents: Dict[str, SnapshotCaptureAgent] = {}
         self._init_cameras()
         
@@ -90,8 +88,7 @@ class MainAgent:
             
             # Don't create default camera - user must configure IP cameras
             if not cameras_config:
-                print("[Main Agent] WARNING: No cameras found!")
-                print("[Main Agent] Set BACKEND_URL + CAMERAS_ENDPOINT (or create cameras.yaml)")
+                print("[Main Agent] WARNING: No cameras. Create cameras.yaml from cameras.yaml.example")
                 cameras_config = []
             
             # Convert old configuration to CameraInfo
@@ -153,21 +150,36 @@ class MainAgent:
                 except (ValueError, TypeError):
                     print(f"[Main Agent] Invalid FPS value in config.yaml, using cameras.yaml: {camera.fps}")
             
+            use_ffmpeg_pipe = self.rtsp_use_ffmpeg_pipe if camera.type == 'rtsp' else None
             capture_agent = SnapshotCaptureAgent(
                 source=source,
                 fps=fps,
                 width=camera.width,
                 height=camera.height,
                 camera_id=camera.camera_id,
-                camera_type=camera.type
+                camera_type=camera.type,
+                use_ffmpeg_pipe_rtsp=use_ffmpeg_pipe
             )
             
             self.capture_agents[camera.camera_id] = capture_agent
             print(f"[Main Agent] Initialized camera: {camera.camera_id} "
                   f"({camera.name}, type: {camera.type}, source: {source})")
         
+    def _resolve_path(self, path: str) -> str:
+        """Resolve path: if relative and not found in cwd, try project root (parent of sender/)."""
+        if os.path.isabs(path) and os.path.isfile(path):
+            return path
+        if os.path.isfile(path):
+            return os.path.abspath(path)
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        fallback = os.path.join(root, path)
+        if os.path.isfile(fallback):
+            return fallback
+        return path
+
     def _load_config(self, config_path: str) -> dict:
         """Load configuration from YAML file"""
+        config_path = self._resolve_path(config_path)
         try:
             with open(config_path, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f)
@@ -223,28 +235,29 @@ class MainAgent:
         return True
     
     def _on_frame_captured(self, frame, timestamp: float, camera_id: str):
-        """
-        Callback for processing captured frame.
-        Sender 1: full snapshot → gRPC. Sender 2: face detect → crop → POST to user.
-        """
+        """Detect people (face or person), crop, send each crop to gRPC server."""
         if not self.running:
             return
-        
-        # Sender 1: full snapshot → gRPC
-        self.sender_agent.send_snapshot(frame, timestamp, camera_id)
-        if hasattr(self.sender_agent, 'service_unimplemented') and self.sender_agent.service_unimplemented:
-            if not hasattr(self, '_service_error_logged'):
-                print(f"[Main Agent] ✗ Service not implemented on server. Stopping send attempts.")
-                self._service_error_logged = True
-            return
-        
-        # Sender 2: face crop → user endpoint
-        if self.crop_sender:
+        if self.detection_type == 'person':
+            rects = detect_persons(
+                frame,
+                model_path=self.person_model_path,
+                conf_threshold=self.person_conf,
+                iou_threshold=self.person_iou,
+            )
+            crops = crop_persons(frame, rects)
+        else:
             rects = detect_faces(frame)
-            if rects:
-                crops = crop_faces(frame, rects)
-                for crop_img in crops:
-                    self.crop_sender.send_crop(crop_img, camera_id, timestamp)
+            crops = crop_faces(frame, rects)
+        if not crops:
+            return
+        for crop_img in crops:
+            self.sender_agent.send_snapshot(crop_img, timestamp, camera_id)
+            if hasattr(self.sender_agent, 'service_unimplemented') and self.sender_agent.service_unimplemented:
+                if not hasattr(self, '_service_error_logged'):
+                    print("[Main Agent] ✗ Service not implemented. Stopping.")
+                    self._service_error_logged = True
+                return
     
     def stop(self):
         """Stop all agents"""
