@@ -187,6 +187,9 @@ class CameraManager:
         print(f"[Camera Manager] Found {len(available)} USB cameras: {available}")
         return available
     
+    # RTSP options for test_camera (same as snapshot_capture_agent to avoid RTP/decoding errors)
+    _RTSP_FFMPEG_OPTS = "rtsp_transport=tcp|rtsp_flags=prefer_tcp|fflags=nobuffer|flags=low_delay|max_delay=5000000|stimeout=5000000"
+
     def test_camera(self, camera: CameraInfo) -> bool:
         """
         Test camera connection
@@ -198,16 +201,24 @@ class CameraManager:
             True if camera is available
         """
         source = self._build_source_url(camera)
-        
+        if camera.type == 'rtsp' and isinstance(source, str):
+            if 'rtsp_transport=' not in source:
+                source = source + ('&' if '?' in source else '?') + 'rtsp_transport=tcp'
         try:
-            cap = cv2.VideoCapture(source)
+            old_opts = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS", "")
+            if camera.type == 'rtsp':
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self._RTSP_FFMPEG_OPTS
+            try:
+                cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG if camera.type == 'rtsp' else 0)
+            finally:
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = old_opts
             if not cap.isOpened():
                 print(f"[Camera Manager] Failed to open camera {camera.camera_id}")
                 return False
             
             ret, frame = cap.read()
             cap.release()
-            
+
             if ret and frame is not None:
                 print(f"[Camera Manager] ✓ Camera {camera.camera_id} available")
                 return True
@@ -217,7 +228,7 @@ class CameraManager:
         except Exception as e:
             print(f"[Camera Manager] Camera test error {camera.camera_id}: {e}")
             return False
-    
+
     def _build_source_url(self, camera: CameraInfo) -> Union[int, str]:
         """
         Build source URL for camera

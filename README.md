@@ -47,6 +47,12 @@ docker-compose build && docker-compose up -d
 
 При "RTP: bad cseq" и "error while decoding MB": включите **захват через FFmpeg** — в `config.yaml` задайте `rtsp.use_ffmpeg_pipe: true` (или env `RTSP_USE_FFMPEG_PIPE=1`). В коде также включены TCP, таймаут и авто-переподключение для OpenCV. Если ошибки остаются — переключитесь на **субпоток** камеры (Hikvision: `/Streaming/Channels/102` вместо `101`; у других — `/stream2`) — меньше битрейт, стабильнее по сети.
 
+### Откуда берутся ошибки RTP / decoding MB
+
+- Сообщения **идут из FFmpeg** при декодировании RTSP (OpenCV внутри использует FFmpeg). В коде RTSP открывается только в **snapshot_capture_agent** (основной захват) и в **camera_manager.test_camera** (разовый тест). Остальные модули (person_crop, grpc_sender) камеру не открывают.
+- При **OpenCV-захвате** (`rtsp.use_ffmpeg_pipe: false`) stderr FFmpeg попадает в консоль — в логах видны "RTP: PT=60: bad cseq" и "h264 ... error while decoding MB". При **захвате через FFmpeg pipe** (`rtsp.use_ffmpeg_pipe: true`) декодирование делает отдельный процесс `ffmpeg -rtsp_transport tcp`; его stderr не выводится — эти сообщения в логах не появятся.
+- Другие причины: нестабильная сеть или Wi‑Fi, несколько клиентов на один поток (cseq путается), прошивка камеры. Решение: один клиент, по возможности провод, субпоток вместо основного.
+
 ## Структура проекта
 
 ```
