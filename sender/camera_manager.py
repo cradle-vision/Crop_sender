@@ -50,63 +50,159 @@ class CameraManager:
             self.load_cameras()
     
     def load_cameras_from_data(self, data: dict) -> None:
-        """Load cameras from dict (same structure as YAML: { 'cameras': [ {...}, ... ] })."""
+        """Load cameras from dict (same structure as YAML or API: { 'cameras': [ {...}, ... ] })."""
         self.cameras = {}
-        cameras_list = data.get('cameras') if isinstance(data.get('cameras'), list) else (data if isinstance(data, list) else [])
+        cameras_list = data.get('cameras')
+        if not isinstance(cameras_list, list):
+            for key in ('items', 'data', 'results', 'content', 'records'):
+                cameras_list = data.get(key)
+                if isinstance(cameras_list, list):
+                    break
+            else:
+                cameras_list = data if isinstance(data, list) else []
         valid_keys = {f.name for f in fields(CameraInfo)}
+        # Map common API field names to CameraInfo (snake_case and camelCase); backend uses ddns_rtsp_url, ddns_stream_url, device_id
+        def normalize(c: dict) -> dict:
+            out = dict(c)
+            # camelCase -> snake_case
+            for camel, snake in [('cameraId', 'camera_id'), ('streamUrl', 'stream_url'), ('rtspUrl', 'rtsp_url'),
+                                 ('ipAddress', 'ip_address'), ('rtspPath', 'rtsp_path')]:
+                if camel in out and snake not in out:
+                    out[snake] = out[camel]
+            if 'id' in out and 'camera_id' not in out:
+                out['camera_id'] = str(out['id'])
+            elif 'device_id' in out and 'camera_id' not in out:
+                out['camera_id'] = str(out['device_id'])
+            # source: prefer RTSP, then stream URL (backend: ddns_rtsp_url, ddns_stream_url)
+            if 'ddns_rtsp_url' in out and out.get('ddns_rtsp_url'):
+                out['source'] = out['ddns_rtsp_url']
+            elif 'ddns_stream_url' in out and out.get('ddns_stream_url'):
+                out['source'] = out['ddns_stream_url']
+            elif 'stream_url' in out and 'source' not in out:
+                out['source'] = out['stream_url']
+            elif 'streamUrl' in out and 'source' not in out:
+                out['source'] = out['streamUrl']
+            elif 'url' in out and 'source' not in out:
+                out['source'] = out['url']
+            elif 'rtsp_url' in out and 'source' not in out:
+                out['source'] = out['rtsp_url']
+            elif 'rtspUrl' in out and 'source' not in out:
+                out['source'] = out['rtspUrl']
+            if 'camera_type' in out and 'type' not in out:
+                out['type'] = out['camera_type']
+            elif 'cameraType' in out and 'type' not in out:
+                out['type'] = out['cameraType']
+            elif 'kind' in out and 'type' not in out:
+                out['type'] = out['kind']
+            if 'label' in out and 'name' not in out:
+                out['name'] = out['label']
+            if 'device_name' in out and (not out.get('name') or out.get('name') == 'camera'):
+                out['name'] = out['device_name']
+            if 'name' not in out:
+                out['name'] = out.get('camera_id') or out.get('cameraId') or 'camera'
+            if 'source' not in out:
+                out['source'] = (out.get('ddns_rtsp_url') or out.get('ddns_stream_url') or out.get('stream_url') or
+                                 out.get('streamUrl') or out.get('url') or out.get('rtsp_url') or out.get('rtspUrl') or '')
+            if 'type' not in out:
+                out['type'] = 'rtsp' if 'rtsp' in str(out.get('source', '')).lower() else 'http'
+            if 'login' in out and out.get('login') and 'username' not in out:
+                out['username'] = out['login']
+            if 'password' in out and 'password' in [f.name for f in fields(CameraInfo)]:
+                pass  # already there
+            return out
         for cam_data in cameras_list:
             if not isinstance(cam_data, dict):
                 continue
+            cam_data = normalize(cam_data)
             if 'camera_id' in cam_data:
                 camera_id = str(cam_data['camera_id']).encode('utf-8', errors='ignore').decode('utf-8').strip()
                 if not camera_id:
                     continue
                 cam_data = {**cam_data, 'camera_id': camera_id}
             filtered = {k: v for k, v in cam_data.items() if k in valid_keys}
+            if not filtered.get('camera_id') or not filtered.get('source') or not filtered.get('type'):
+                continue
             try:
                 camera = CameraInfo(**filtered)
                 self.cameras[camera.camera_id] = camera
             except Exception as e:
                 print(f"[Camera Manager] Skip camera {cam_data.get('camera_id', '?')}: {e}")
+        if len(self.cameras) == 0 and cameras_list:
+            first = cameras_list[0] if cameras_list and isinstance(cameras_list[0], dict) else None
+            print(f"[Camera Manager] Backend returned 0 cameras after mapping. Top-level keys: {list(data.keys())}")
+            if first:
+                print(f"[Camera Manager] First item keys: {list(first.keys())} (add mapping in camera_manager if needed)")
+        elif len(self.cameras) == 0:
+            print(f"[Camera Manager] Backend returned no camera list (empty or unknown structure). Keys: {list(data.keys())}")
         print(f"[Camera Manager] Loaded {len(self.cameras)} cameras from backend/data")
     
     @staticmethod
-    def fetch_cameras_from_backend(url: str, timeout: float = 10.0) -> Optional[dict]:
+    def fetch_cameras_from_backend(url: str, timeout: float = 10.0, token: Optional[str] = None) -> Optional[dict]:
         """
-        GET url, expect JSON { 'cameras': [ { camera_id, name, source, type, ... } ] }.
-        Returns dict or None on error.
+        GET url, expect JSON { 'cameras': [ ... ] } or { 'items': [ ... ] }.
+        Optional Bearer token: Authorization: Bearer <token>.
         """
         try:
             req = urllib.request.Request(url, method='GET')
+            req.add_header('Accept', 'application/json')
+            if token:
+                req.add_header('Authorization', f'Bearer {token.strip()}')
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
                 body = resp.read().decode('utf-8')
             data = json.loads(body)
-            return data if isinstance(data, dict) else {'cameras': data}
+            if not isinstance(data, dict):
+                return {'cameras': data if isinstance(data, list) else []}
+            # Log what backend returned (to fix mapping if 0 cameras)
+            keys = list(data.keys())
+            if 'cameras' in data and isinstance(data['cameras'], list):
+                print(f"[Camera Manager] Backend response keys: {keys}, using 'cameras' list len={len(data['cameras'])}")
+                return data
+            if 'items' in data and isinstance(data['items'], list):
+                print(f"[Camera Manager] Backend response keys: {keys}, using 'items' list len={len(data['items'])}")
+                return {'cameras': data['items']}
+            for key in ('data', 'results', 'content', 'records'):
+                if key in data and isinstance(data[key], list):
+                    print(f"[Camera Manager] Backend response keys: {keys}, using '{key}' list len={len(data[key])}")
+                    return {'cameras': data[key]}
+            # Nested: data.items, data.content (Spring Page)
+            if 'data' in data and isinstance(data['data'], dict):
+                inner = data['data']
+                if 'items' in inner and isinstance(inner['items'], list):
+                    print(f"[Camera Manager] Backend response keys: {keys}, using 'data.items' list len={len(inner['items'])}")
+                    return {'cameras': inner['items']}
+                if 'content' in inner and isinstance(inner['content'], list):
+                    print(f"[Camera Manager] Backend response keys: {keys}, using 'data.content' list len={len(inner['content'])}")
+                    return {'cameras': inner['content']}
+            print(f"[Camera Manager] Backend response keys: {keys}, no known list found")
+            return data
         except Exception as e:
             print(f"[Camera Manager] Backend fetch error: {e}")
             return None
     
     def load_cameras(self):
-        """Load cameras from config file"""
-        if not self.config_file or not os.path.exists(self.config_file):
-            if self.config_file:
-                print(f"[Camera Manager] Config file not found: {self.config_file}")
-                print(f"[Camera Manager] Create from example: cp cameras.yaml.example {self.config_file}")
+        """Load cameras from config file. If path is a directory (e.g. Docker mount), use ../config/cameras.yaml."""
+        if not self.config_file:
             self.cameras = {}
             return
+        load_path = self.config_file
         if os.path.isdir(self.config_file):
-            print(f"[Camera Manager] ERROR: {self.config_file} is a directory, not a file!")
+            load_path = os.path.normpath(os.path.join(os.path.dirname(self.config_file), 'config', 'cameras.yaml'))
+            if not os.path.isfile(load_path):
+                print(f"[Camera Manager] Config path is a directory; expected file at {load_path} (create or fetch from backend)")
+                self.cameras = {}
+                return
+        if not os.path.exists(load_path):
+            print(f"[Camera Manager] Config file not found: {load_path}")
             self.cameras = {}
             return
         try:
-            with open(self.config_file, 'r', encoding='utf-8') as f:
+            with open(load_path, 'r', encoding='utf-8') as f:
                 data = yaml.safe_load(f) or {}
             cameras_list = data.get('cameras', [])
             for cam_data in cameras_list:
-                # Ensure camera_id is valid UTF-8
                 if 'camera_id' in cam_data:
                     camera_id = str(cam_data['camera_id'])
                     camera_id = camera_id.encode('utf-8', errors='ignore').decode('utf-8')
@@ -115,23 +211,28 @@ class CameraManager:
                     cam_data['camera_id'] = camera_id
                 camera = CameraInfo(**cam_data)
                 self.cameras[camera.camera_id] = camera
-            print(f"[Camera Manager] Loaded {len(self.cameras)} cameras from {self.config_file}")
+            print(f"[Camera Manager] Loaded {len(self.cameras)} cameras from {load_path}")
         except Exception as e:
             print(f"[Camera Manager] Config load error: {e}")
             self.cameras = {}
     
     def save_cameras(self):
-        """Save cameras to config file"""
+        """Save cameras to config file. If path is a directory, save to ../config/cameras.yaml."""
         try:
+            save_path = self.config_file
+            if save_path and os.path.isdir(save_path):
+                save_path = os.path.normpath(os.path.join(os.path.dirname(save_path), 'config', 'cameras.yaml'))
+            if not save_path:
+                return False
             cameras_list = [asdict(cam) for cam in self.cameras.values()]
             data = {'cameras': cameras_list}
-            parent = os.path.dirname(self.config_file)
+            parent = os.path.dirname(save_path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            with open(self.config_file, 'w', encoding='utf-8') as f:
+            with open(save_path, 'w', encoding='utf-8') as f:
                 yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
             
-            print(f"[Camera Manager] Saved {len(self.cameras)} cameras to {self.config_file}")
+            print(f"[Camera Manager] Saved {len(self.cameras)} cameras to {save_path}")
             return True
         except Exception as e:
             print(f"[Camera Manager] Save error: {e}")

@@ -37,15 +37,18 @@ class MainAgent:
         self.config = self._load_config(config_path)
         self.running = False
         
-        # Camera manager: from backend API (once → save to cameras.yaml) or from file
+        # Camera manager: from backend API (on startup fetch → save to cameras.yaml) or from file
         backend_cameras_url = os.getenv('BACKEND_CAMERAS_URL') or self.config.get('backend', {}).get('cameras_url')
         cameras_config = os.getenv('CAMERAS_CONFIG_PATH') or cameras_config_path or self.config.get('cameras_config', 'cameras.yaml')
         cameras_config = self._resolve_path(cameras_config)
         self.camera_manager = CameraManager(config_file=cameras_config if not backend_cameras_url else "", auto_save=False)
         if backend_cameras_url:
+            backend_cfg = self.config.get('backend', {})
+            token = os.getenv('BACKEND_CAMERAS_TOKEN') or backend_cfg.get('cameras_token')
             data = CameraManager.fetch_cameras_from_backend(
                 backend_cameras_url,
-                timeout=float(self.config.get('backend', {}).get('cameras_timeout', 10))
+                timeout=float(backend_cfg.get('cameras_timeout', 10)),
+                token=token,
             )
             if data:
                 self.camera_manager.load_cameras_from_data(data)
@@ -56,8 +59,11 @@ class MainAgent:
                     print(f"[Main Agent] Cameras loaded from backend: {backend_cameras_url}")
             else:
                 print(f"[Main Agent] Backend cameras failed, falling back to file: {cameras_config}")
-                if cameras_config and os.path.isfile(cameras_config):
-                    self.camera_manager.config_file = cameras_config
+                fallback_path = cameras_config
+                if cameras_config and os.path.isdir(cameras_config):
+                    fallback_path = os.path.normpath(os.path.join(os.path.dirname(cameras_config), 'config', 'cameras.yaml'))
+                if fallback_path and os.path.isfile(fallback_path):
+                    self.camera_manager.config_file = fallback_path
                     self.camera_manager.load_cameras()
         
         kafka_config = self.config.get('kafka', {})
@@ -67,6 +73,7 @@ class MainAgent:
         _env_ffmpeg = os.getenv("RTSP_USE_FFMPEG_PIPE", "").strip().lower() in ("1", "true", "yes")
         self.rtsp_use_ffmpeg_pipe = _env_ffmpeg if os.getenv("RTSP_USE_FFMPEG_PIPE") is not None else rtsp_config.get('use_ffmpeg_pipe', False)
         bootstrap_servers = os.getenv('KAFKA_BOOTSTRAP_SERVERS') or kafka_config.get('bootstrap_servers', 'localhost:9092')
+        bootstrap_servers = str(bootstrap_servers).replace('http://', '').replace('https://', '').rstrip('/')
         topic = os.getenv('KAFKA_TOPIC') or kafka_config.get('topic', 'snapshots')
         print(f"[Main Agent] Kafka: {bootstrap_servers}, topic={topic}")
 

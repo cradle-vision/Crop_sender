@@ -6,14 +6,13 @@ services:
     container_name: sender-crop
     restart: unless-stopped
     volumes:
-      - ./config:/app/config:ro
-      - ./cameras.yaml:/app/cameras.yaml:rw
+      - ./config:/app/config:rw
       - ./config.yaml:/app/config.yaml:ro
     env_file:
       - .env
     environment:
       - CONFIG_PATH=/app/config.yaml
-      - CAMERAS_CONFIG_PATH=/app/cameras.yaml
+      - CAMERAS_CONFIG_PATH=/app/config/cameras.yaml
       - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS:-localhost:9092}
       - KAFKA_TOPIC=${KAFKA_TOPIC:-snapshots}
       - DEFAULT_FPS=${DEFAULT_FPS:-}

@@ -27,7 +27,8 @@ agent:
   buffer_size: 30
   default_fps: 2  # default FPS for all cameras (cameras per-camera fps as fallback if null)
 
-# Optional: fetch camera list from backend (GET JSON: { "cameras": [ { camera_id, name, source, type, ... } ] })
+# Optional: fetch camera list from backend; auth via Bearer token (env BACKEND_CAMERAS_TOKEN)
 backend:
   cameras_url: null   # e.g. "http://localhost:8000/api/cameras"
   cameras_timeout: 10
+  # cameras_token: null  # or set in .env BACKEND_CAMERAS_TOKEN

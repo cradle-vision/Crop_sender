@@ -23,3 +23,4 @@ env/
 ENV/
 .venv
 .env
+cameras.yaml

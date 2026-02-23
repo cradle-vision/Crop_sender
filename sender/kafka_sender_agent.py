@@ -31,7 +31,7 @@ class KafkaSenderAgent:
                  jpeg_quality: int = 85, minio_config: Optional[Dict[str, Any]] = None):
         """
         Args:
-            bootstrap_servers: Kafka brokers
+            bootstrap_servers: Kafka brokers (host:port; http:// is stripped automatically)
             topic: Topic name for crop messages
             jpeg_quality: JPEG encoding quality (1-100)
             minio_config: If set and enabled, upload crop to MinIO and put only bucket/object_key in Kafka.
@@ -46,6 +46,9 @@ class KafkaSenderAgent:
         self._minio_bucket = self._minio_config.get("bucket", "crops")
         self._producer: Optional[Producer] = None
         self._connected = False
+        # Kafka expects "host:port", not "http://host:port"
+        if self.bootstrap_servers:
+            self.bootstrap_servers = str(self.bootstrap_servers).replace("http://", "").replace("https://", "").rstrip("/")
 
     def connect(self) -> bool:
         """Create Kafka producer and optionally MinIO client."""
