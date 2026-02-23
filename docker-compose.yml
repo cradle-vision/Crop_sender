@@ -1,6 +1,4 @@
-# Два сервиса: sender-crop (камеры + person detection + gRPC клиент) и gRPC сервер (отдельно).
-# Sender с network_mode: host видит камеры в LAN и подключается к gRPC на localhost:50051.
-# Порт 50051 проброшен с grpc-server на хост — sender (host) подключается к localhost:50051.
+# Sender-crop: камеры → детекция → crop → Kafka (опционально MinIO). network_mode: host для доступа к камерам и Kafka.
 
 services:
   sender-crop:
@@ -11,10 +9,13 @@ services:
       - ./config:/app/config:ro
       - ./cameras.yaml:/app/cameras.yaml:rw
       - ./config.yaml:/app/config.yaml:ro
+    env_file:
+      - .env
     environment:
       - CONFIG_PATH=/app/config.yaml
       - CAMERAS_CONFIG_PATH=/app/cameras.yaml
-      - GRPC_SERVER_ADDRESS=${GRPC_SERVER_ADDRESS:-localhost:50051}
+      - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS:-localhost:9092}
+      - KAFKA_TOPIC=${KAFKA_TOPIC:-snapshots}
       - DEFAULT_FPS=${DEFAULT_FPS:-}
     network_mode: host
     deploy:
@@ -26,11 +27,3 @@ services:
           cpus: "0.5"
           memory: 512M
 
-  # gRPC сервер (SnapshotService). Раскомментируйте и укажите свой образ, если сервер в Docker.
-  # Sender с network_mode: host подключается к localhost:50051 — порт пробросится с этого сервиса.
-  # grpc-server:
-  #   image: your-registry/your-grpc-server:latest
-  #   container_name: grpc-server
-  #   restart: unless-stopped
-  #   ports:
-  #     - "50051:50051"

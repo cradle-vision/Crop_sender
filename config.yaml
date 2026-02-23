@@ -1,7 +1,17 @@
-# Camera → detect people → crop → gRPC server
-grpc:
-  server_address: "localhost:50051"
-  max_message_size: 4194304  # 4MB
+# Camera → detect people → crop → [MinIO] → Kafka → backend → Triton
+kafka:
+  bootstrap_servers: "localhost:9092"
+  topic: "snapshots"
+  jpeg_quality: 85
+
+# Optional: upload crops to MinIO, send only bucket + object_key in Kafka (less traffic)
+minio:
+  enabled: false
+  endpoint: "localhost:9000"
+  bucket: "crops"
+  access_key: "minioadmin"
+  secret_key: "minioadmin"
+  secure: false
 
 # RTSP: use FFmpeg subprocess for capture (avoids "RTP bad cseq" / decoding errors)
 rtsp:
@@ -15,5 +25,9 @@ detection:
 
 agent:
   buffer_size: 30
-  timeout: 5.0  # gRPC timeout
-  default_fps: 2  # default FPS for all cameras (cameras.yaml per-camera fps as fallback if null)
+  default_fps: 2  # default FPS for all cameras (cameras per-camera fps as fallback if null)
+
+# Optional: fetch camera list from backend (GET JSON: { "cameras": [ { camera_id, name, source, type, ... } ] })
+backend:
+  cameras_url: null   # e.g. "http://localhost:8000/api/cameras"
+  cameras_timeout: 10

@@ -1,13 +1,16 @@
 """
-Camera Manager - camera configuration (cameras.yaml)
+Camera Manager - camera configuration (cameras.yaml or backend API)
 Supports IP cameras RTSP/HTTP and USB.
 """
 
 import cv2
 import yaml
 import os
+import json
+import ssl
+import urllib.request
 from typing import List, Dict, Optional, Union
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 
 
 @dataclass
@@ -43,47 +46,78 @@ class CameraManager:
         self.config_file = config_file
         self.auto_save = auto_save
         self.cameras: Dict[str, CameraInfo] = {}
-        self.load_cameras()
+        if config_file and os.path.exists(config_file) and not os.path.isdir(config_file):
+            self.load_cameras()
+    
+    def load_cameras_from_data(self, data: dict) -> None:
+        """Load cameras from dict (same structure as YAML: { 'cameras': [ {...}, ... ] })."""
+        self.cameras = {}
+        cameras_list = data.get('cameras') if isinstance(data.get('cameras'), list) else (data if isinstance(data, list) else [])
+        valid_keys = {f.name for f in fields(CameraInfo)}
+        for cam_data in cameras_list:
+            if not isinstance(cam_data, dict):
+                continue
+            if 'camera_id' in cam_data:
+                camera_id = str(cam_data['camera_id']).encode('utf-8', errors='ignore').decode('utf-8').strip()
+                if not camera_id:
+                    continue
+                cam_data = {**cam_data, 'camera_id': camera_id}
+            filtered = {k: v for k, v in cam_data.items() if k in valid_keys}
+            try:
+                camera = CameraInfo(**filtered)
+                self.cameras[camera.camera_id] = camera
+            except Exception as e:
+                print(f"[Camera Manager] Skip camera {cam_data.get('camera_id', '?')}: {e}")
+        print(f"[Camera Manager] Loaded {len(self.cameras)} cameras from backend/data")
+    
+    @staticmethod
+    def fetch_cameras_from_backend(url: str, timeout: float = 10.0) -> Optional[dict]:
+        """
+        GET url, expect JSON { 'cameras': [ { camera_id, name, source, type, ... } ] }.
+        Returns dict or None on error.
+        """
+        try:
+            req = urllib.request.Request(url, method='GET')
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                body = resp.read().decode('utf-8')
+            data = json.loads(body)
+            return data if isinstance(data, dict) else {'cameras': data}
+        except Exception as e:
+            print(f"[Camera Manager] Backend fetch error: {e}")
+            return None
     
     def load_cameras(self):
         """Load cameras from config file"""
-        if os.path.exists(self.config_file):
-            # Check that it's a file, not directory
-            if os.path.isdir(self.config_file):
-                print(f"[Camera Manager] ERROR: {self.config_file} is a directory, not a file!")
-                print(f"[Camera Manager] Remove directory and create file:")
-                print(f"  rm -rf {self.config_file}")
-                print(f"  cp cameras.yaml.example {self.config_file}")
-                self.cameras = {}
-                return
-            
-            try:
-                with open(self.config_file, 'r', encoding='utf-8') as f:
-                    data = yaml.safe_load(f) or {}
-                    
-                cameras_list = data.get('cameras', [])
-                for cam_data in cameras_list:
-                    # Ensure camera_id is valid UTF-8
-                    if 'camera_id' in cam_data:
-                        camera_id = str(cam_data['camera_id'])
-                        # Remove any invalid UTF-8 characters
-                        camera_id = camera_id.encode('utf-8', errors='ignore').decode('utf-8')
-                        # Ensure it's not empty
-                        if not camera_id:
-                            print(f"[Camera Manager] Warning: Empty camera_id, skipping camera")
-                            continue
-                        cam_data['camera_id'] = camera_id
-                    
-                    camera = CameraInfo(**cam_data)
-                    self.cameras[camera.camera_id] = camera
-                    
-                print(f"[Camera Manager] Loaded {len(self.cameras)} cameras from {self.config_file}")
-            except Exception as e:
-                print(f"[Camera Manager] Config load error: {e}")
-                self.cameras = {}
-        else:
-            print(f"[Camera Manager] Config file not found: {self.config_file}")
-            print(f"[Camera Manager] Create file from example: cp cameras.yaml.example {self.config_file}")
+        if not self.config_file or not os.path.exists(self.config_file):
+            if self.config_file:
+                print(f"[Camera Manager] Config file not found: {self.config_file}")
+                print(f"[Camera Manager] Create from example: cp cameras.yaml.example {self.config_file}")
+            self.cameras = {}
+            return
+        if os.path.isdir(self.config_file):
+            print(f"[Camera Manager] ERROR: {self.config_file} is a directory, not a file!")
+            self.cameras = {}
+            return
+        try:
+            with open(self.config_file, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f) or {}
+            cameras_list = data.get('cameras', [])
+            for cam_data in cameras_list:
+                # Ensure camera_id is valid UTF-8
+                if 'camera_id' in cam_data:
+                    camera_id = str(cam_data['camera_id'])
+                    camera_id = camera_id.encode('utf-8', errors='ignore').decode('utf-8')
+                    if not camera_id:
+                        continue
+                    cam_data['camera_id'] = camera_id
+                camera = CameraInfo(**cam_data)
+                self.cameras[camera.camera_id] = camera
+            print(f"[Camera Manager] Loaded {len(self.cameras)} cameras from {self.config_file}")
+        except Exception as e:
+            print(f"[Camera Manager] Config load error: {e}")
             self.cameras = {}
     
     def save_cameras(self):
@@ -91,7 +125,9 @@ class CameraManager:
         try:
             cameras_list = [asdict(cam) for cam in self.cameras.values()]
             data = {'cameras': cameras_list}
-            
+            parent = os.path.dirname(self.config_file)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
             

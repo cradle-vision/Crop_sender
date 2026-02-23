@@ -22,6 +22,4 @@ venv/
 env/
 ENV/
 .venv
-*.proto.bak
-snapshot_service_pb2.py
-snapshot_service_pb2_grpc.py
+.env

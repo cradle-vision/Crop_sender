@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# Install system dependencies for OpenCV and gRPC
+# Install system dependencies for OpenCV
 RUN apt-get update && apt-get install -y \
     libopencv-dev \
     python3-opencv \
@@ -17,8 +17,6 @@ COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
 COPY . .
-RUN python3 -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. snapshot_service.proto
-RUN cp snapshot_service_pb2*.py sender/ 2>/dev/null || true
 
 # Person detection: ensure binary is executable and model is present
 RUN chmod +x /app/cpu-person-detection/person_detection_linux_x64/person_detect 2>/dev/null || true \

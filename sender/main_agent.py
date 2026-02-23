@@ -1,16 +1,23 @@
 """
 Main Coordinator Agent
-Camera → detect people (face or person) → crop → send crop to gRPC server.
+Camera → detect people (face or person) → crop → [MinIO] → Kafka → backend → Triton.
 """
 
+import os
 import yaml
 import time
 import signal
 import sys
-import os
 from typing import Dict
+try:
+    from dotenv import load_dotenv
+    # Load .env from project root (parent of sender/)
+    _root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    load_dotenv(os.path.join(_root, ".env"))
+except ImportError:
+    pass
 from snapshot_capture_agent import SnapshotCaptureAgent
-from grpc_sender_agent import GrpcSenderAgent
+from kafka_sender_agent import KafkaSenderAgent
 from camera_manager import CameraManager
 from face_crop import detect_faces, crop_faces
 from person_crop import detect_persons, crop_persons
@@ -30,25 +37,56 @@ class MainAgent:
         self.config = self._load_config(config_path)
         self.running = False
         
-        # Camera manager: cameras from cameras.yaml (resolve path from project root if needed)
-        cameras_config = cameras_config_path or self.config.get('cameras_config', 'cameras.yaml')
+        # Camera manager: from backend API (once → save to cameras.yaml) or from file
+        backend_cameras_url = os.getenv('BACKEND_CAMERAS_URL') or self.config.get('backend', {}).get('cameras_url')
+        cameras_config = os.getenv('CAMERAS_CONFIG_PATH') or cameras_config_path or self.config.get('cameras_config', 'cameras.yaml')
         cameras_config = self._resolve_path(cameras_config)
-        self.camera_manager = CameraManager(config_file=cameras_config, auto_save=False)
+        self.camera_manager = CameraManager(config_file=cameras_config if not backend_cameras_url else "", auto_save=False)
+        if backend_cameras_url:
+            data = CameraManager.fetch_cameras_from_backend(
+                backend_cameras_url,
+                timeout=float(self.config.get('backend', {}).get('cameras_timeout', 10))
+            )
+            if data:
+                self.camera_manager.load_cameras_from_data(data)
+                self.camera_manager.config_file = cameras_config
+                if self.camera_manager.save_cameras():
+                    print(f"[Main Agent] Cameras fetched from backend and saved to {cameras_config}")
+                else:
+                    print(f"[Main Agent] Cameras loaded from backend: {backend_cameras_url}")
+            else:
+                print(f"[Main Agent] Backend cameras failed, falling back to file: {cameras_config}")
+                if cameras_config and os.path.isfile(cameras_config):
+                    self.camera_manager.config_file = cameras_config
+                    self.camera_manager.load_cameras()
         
-        grpc_config = self.config.get('grpc', {})
+        kafka_config = self.config.get('kafka', {})
         self.agent_config = self.config.get('agent', {})
         rtsp_config = self.config.get('rtsp', {})
         # RTSP: use FFmpeg pipe (env overrides config)
         _env_ffmpeg = os.getenv("RTSP_USE_FFMPEG_PIPE", "").strip().lower() in ("1", "true", "yes")
         self.rtsp_use_ffmpeg_pipe = _env_ffmpeg if os.getenv("RTSP_USE_FFMPEG_PIPE") is not None else rtsp_config.get('use_ffmpeg_pipe', False)
-        server_address = os.getenv('GRPC_SERVER_ADDRESS') or grpc_config.get('server_address', 'localhost:50051')
-        print(f"[Main Agent] gRPC server: {server_address}")
-        
-        # gRPC sender: sends cropped images to server
-        self.sender_agent = GrpcSenderAgent(
-            server_address=server_address,
-            max_message_size=grpc_config.get('max_message_size', 4194304),
-            timeout=self.agent_config.get('timeout', 5.0)
+        bootstrap_servers = os.getenv('KAFKA_BOOTSTRAP_SERVERS') or kafka_config.get('bootstrap_servers', 'localhost:9092')
+        topic = os.getenv('KAFKA_TOPIC') or kafka_config.get('topic', 'snapshots')
+        print(f"[Main Agent] Kafka: {bootstrap_servers}, topic={topic}")
+
+        # MinIO (optional): env overrides config
+        minio_config = dict(self.config.get('minio', {}))
+        if os.getenv('MINIO_ENABLED') is not None:
+            minio_config['enabled'] = os.getenv('MINIO_ENABLED', '').strip().lower() in ('1', 'true', 'yes')
+        for key, env_key in (('endpoint', 'MINIO_ENDPOINT'), ('bucket', 'MINIO_BUCKET'),
+                             ('access_key', 'MINIO_ACCESS_KEY'), ('secret_key', 'MINIO_SECRET_KEY')):
+            if os.getenv(env_key):
+                minio_config[key] = os.getenv(env_key)
+        if os.getenv('MINIO_SECURE') is not None:
+            minio_config['secure'] = os.getenv('MINIO_SECURE', '').strip().lower() in ('1', 'true', 'yes')
+
+        # Kafka sender: publishes crops to topic (optionally upload to MinIO first)
+        self.sender_agent = KafkaSenderAgent(
+            bootstrap_servers=bootstrap_servers,
+            topic=topic,
+            jpeg_quality=kafka_config.get('jpeg_quality', 85),
+            minio_config=minio_config if minio_config.get('enabled') else None,
         )
         
         # Detection: face (Haar) or person (cpu-person-detection binary)
@@ -199,9 +237,9 @@ class MainAgent:
         """Start all agents"""
         print("[Main Agent] Starting snapshot sending system...")
         
-        # Connect to gRPC server
+        # Connect to Kafka (create producer)
         if not self.sender_agent.connect():
-            print("[Main Agent] Failed to connect to gRPC server")
+            print("[Main Agent] Failed to connect to Kafka")
             return False
         
         # Start capture for all cameras
@@ -235,7 +273,7 @@ class MainAgent:
         return True
     
     def _on_frame_captured(self, frame, timestamp: float, camera_id: str):
-        """Detect people (face or person), crop, send each crop to gRPC server."""
+        """Detect people (face or person), crop, publish each crop to Kafka."""
         if not self.running:
             return
         if self.detection_type == 'person':
@@ -253,11 +291,6 @@ class MainAgent:
             return
         for crop_img in crops:
             self.sender_agent.send_snapshot(crop_img, timestamp, camera_id)
-            if hasattr(self.sender_agent, 'service_unimplemented') and self.sender_agent.service_unimplemented:
-                if not hasattr(self, '_service_error_logged'):
-                    print("[Main Agent] ✗ Service not implemented. Stopping.")
-                    self._service_error_logged = True
-                return
     
     def stop(self):
         """Stop all agents"""
