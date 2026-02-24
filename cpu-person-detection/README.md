@@ -7,9 +7,8 @@ Person-only detection on CPU using **YOLOv8n ONNX**. Main code is C++; Python sc
 - **models/** — Put `person_detection_model.onnx` here (export from Python once: `python_for_reference/scripts/export_onnx.py` if needed; then rename the output to this name).
 - **src/** — C++ source (`main.cpp`, `detector.cpp`, `draw.cpp`).
 - **include/** — Headers (`detector.hpp`, `draw.hpp`).
-- **input/** — Input images.
+- **input/** — Input images (optional, for manual testing).
 - **output/** — Output images (boxes drawn).
-- **python_for_reference/** — Legacy Python scripts (ignored by git).
 
 ## Build
 
@@ -67,26 +66,13 @@ Optional: confidence and IoU at the end (default 0.4, 0.5):
 ./detect_main ../models/person_detection_model.onnx ../input/in.jpg --draw ../output/out.jpg 0.5 0.5
 ```
 
-**Batch (all images in input/, with --draw):**
-
-```bash
-chmod +x ../run_all_test_images.sh
-../run_all_test_images.sh
-```
-
-The script uses `--draw` so output is images. Optional args: `../run_all_test_images.sh [model_path] [input_dir] [output_dir]`.
-
-**Benchmark (FPS)** — run on all images in a folder (no drawing), report images per second:
+**Benchmark (FPS)** — run on a folder of images (no drawing):
 
 ```bash
 ./detect_main ../models/person_detection_model.onnx --benchmark /path/to/images
 ```
 
-Example with ~1500 images: `./detect_main ../models/person_detection_model.onnx --benchmark /mnt/d/Cradle/Retail/DataSet/valid/valid`
-
-Output: `[benchmark] images=1500 time=... s FPS=...`
-
-Optional: `../run_benchmark.sh [images_dir]` (defaults to `../input` if no arg).
+Output: `[benchmark] images=... time=... s FPS=...`
 
 ## Packaging (run on any Linux CPU)
 

@@ -63,9 +63,7 @@ Sender_Crop/
 │   ├── face_crop.py            # Детекция лиц (Haar) + crop
 │   ├── person_crop.py          # Детекция людей (person_detect binary) + crop
 │   ├── kafka_sender_agent.py   # Публикация crop в Kafka
-│   ├── camera_manager.py       # Камеры из cameras.yaml
-│   ├── scan_ip_cameras.py      # Утилита добавления камер
-│   ├── cameras.yaml
+│   ├── camera_manager.py       # Камеры из cameras.yaml или backend
 │   └── cameras.yaml.example
 ├── .env.example    # образец для .env (Kafka, MinIO, RTSP, FPS)
 ├── docker-compose.yml
