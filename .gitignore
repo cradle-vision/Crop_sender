@@ -24,3 +24,4 @@ ENV/
 .venv
 .env
 cameras.yaml
+backend_cameras.json

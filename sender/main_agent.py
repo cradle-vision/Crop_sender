@@ -1,17 +1,18 @@
 """
 Main Coordinator Agent
 Camera → detect people (face or person) → crop → [MinIO] → Kafka → backend → Triton.
+Configuration: only .env (no config.yaml).
 """
 
 import os
-import yaml
+import json
 import time
 import signal
 import sys
+from urllib.parse import urlparse, urlunparse
 from typing import Dict
 try:
     from dotenv import load_dotenv
-    # Load .env from project root (parent of sender/)
     _root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     load_dotenv(os.path.join(_root, ".env"))
 except ImportError:
@@ -23,85 +24,115 @@ from face_crop import detect_faces, crop_faces
 from person_crop import detect_persons, crop_persons
 
 
+def _env(key: str, default: str = "") -> str:
+    v = os.getenv(key)
+    return v.strip() if v else default
+
+
+def _env_bool(key: str, default: bool = False) -> bool:
+    v = os.getenv(key)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes")
+
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        v = os.getenv(key)
+        return float(v) if v else default
+    except (ValueError, TypeError):
+        return default
+
+
 class MainAgent:
-    """Main coordinator agent"""
-    
-    def __init__(self, config_path: str = "config.yaml", cameras_config_path: str = None):
-        """
-        Initialize main agent
-        
-        Args:
-            config_path: Path to config file
-            cameras_config_path: Path to cameras config file (if None, uses cameras.yaml)
-        """
-        self.config = self._load_config(config_path)
+    """Main coordinator agent. Configuration from .env only."""
+
+    def __init__(self, cameras_config_path: str = None):
         self.running = False
-        
-        # Camera manager: from backend API (on startup fetch → save to cameras.yaml) or from file
-        backend_cameras_url = os.getenv('BACKEND_CAMERAS_URL') or self.config.get('backend', {}).get('cameras_url')
-        cameras_config = os.getenv('CAMERAS_CONFIG_PATH') or cameras_config_path or self.config.get('cameras_config', 'cameras.yaml')
+        backend_timeout = _env_float('BACKEND_CAMERAS_TIMEOUT', 10.0)
+
+        # Camera manager: from backend API or from file
+        backend_cameras_url = _env('BACKEND_CAMERAS_URL')
+        cameras_config = _env('CAMERAS_CONFIG_PATH') or cameras_config_path or 'cameras.yaml'
         cameras_config = self._resolve_path(cameras_config)
         self.camera_manager = CameraManager(config_file=cameras_config if not backend_cameras_url else "", auto_save=False)
         if backend_cameras_url:
-            backend_cfg = self.config.get('backend', {})
-            token = os.getenv('BACKEND_CAMERAS_TOKEN') or backend_cfg.get('cameras_token')
-            data = CameraManager.fetch_cameras_from_backend(
-                backend_cameras_url,
-                timeout=float(backend_cfg.get('cameras_timeout', 10)),
-                token=token,
-            )
-            if data:
+            token = _env('BACKEND_CAMERAS_TOKEN')
+            if not token:
+                username = _env('BACKEND_CAMERAS_USERNAME')
+                password = _env('BACKEND_CAMERAS_PASSWORD')
+                if username and password:
+                    parsed = urlparse(backend_cameras_url)
+                    token_url = _env('BACKEND_TOKEN_URL') or urlunparse((parsed.scheme, parsed.netloc, '/token', '', '', ''))
+                    if token_url:
+                        token = CameraManager.fetch_backend_token(
+                            token_url, username.strip(), password.strip(),
+                            timeout=backend_timeout,
+                            scope=_env('BACKEND_TOKEN_SCOPE') or 'camera:read',
+                        )
+            raw = CameraManager._fetch_cameras_from_backend_raw(backend_cameras_url, backend_timeout, token or None)
+            if raw is not None:
+                _cameras_dir = os.path.dirname(cameras_config)
+                _raw_path = os.path.join(_cameras_dir, 'backend_cameras.json') if _cameras_dir else 'backend_cameras.json'
+                try:
+                    with open(_raw_path, 'w', encoding='utf-8') as f:
+                        json.dump(raw, f, ensure_ascii=False, indent=2)
+                    print(f"[Main Agent] Raw backend response saved to {_raw_path}")
+                except Exception as e:
+                    print(f"[Main Agent] Could not save raw JSON to {_raw_path}: {e}")
+                data = CameraManager._normalize_backend_response(raw)
                 self.camera_manager.load_cameras_from_data(data)
                 self.camera_manager.config_file = cameras_config
+                n = len(self.camera_manager.cameras)
                 if self.camera_manager.save_cameras():
-                    print(f"[Main Agent] Cameras fetched from backend and saved to {cameras_config}")
+                    print(f"[Main Agent] OK: {n} camera(s) from backend saved to {cameras_config}")
                 else:
-                    print(f"[Main Agent] Cameras loaded from backend: {backend_cameras_url}")
+                    print(f"[Main Agent] Cameras loaded from backend ({n}), save to {cameras_config} failed")
             else:
-                print(f"[Main Agent] Backend cameras failed, falling back to file: {cameras_config}")
-                fallback_path = cameras_config
-                if cameras_config and os.path.isdir(cameras_config):
-                    fallback_path = os.path.normpath(os.path.join(os.path.dirname(cameras_config), 'config', 'cameras.yaml'))
+                print(f"[Main Agent] Backend request failed (no response). Check URL and token.")
+                fallback_path = os.path.normpath(os.path.join(os.path.dirname(cameras_config), 'config', 'cameras.yaml')) if cameras_config and os.path.isdir(cameras_config) else cameras_config
                 if fallback_path and os.path.isfile(fallback_path):
                     self.camera_manager.config_file = fallback_path
                     self.camera_manager.load_cameras()
-        
-        kafka_config = self.config.get('kafka', {})
-        self.agent_config = self.config.get('agent', {})
-        rtsp_config = self.config.get('rtsp', {})
-        # RTSP: use FFmpeg pipe (env overrides config)
-        _env_ffmpeg = os.getenv("RTSP_USE_FFMPEG_PIPE", "").strip().lower() in ("1", "true", "yes")
-        self.rtsp_use_ffmpeg_pipe = _env_ffmpeg if os.getenv("RTSP_USE_FFMPEG_PIPE") is not None else rtsp_config.get('use_ffmpeg_pipe', False)
-        bootstrap_servers = os.getenv('KAFKA_BOOTSTRAP_SERVERS') or kafka_config.get('bootstrap_servers', 'localhost:9092')
+
+        # Kafka — только из .env
+        bootstrap_servers = _env('KAFKA_BOOTSTRAP_SERVERS') or 'localhost:9092'
         bootstrap_servers = str(bootstrap_servers).replace('http://', '').replace('https://', '').rstrip('/')
-        topic = os.getenv('KAFKA_TOPIC') or kafka_config.get('topic', 'snapshots')
+        if bootstrap_servers.strip() == 'kafka:9092':
+            bootstrap_servers = 'localhost:9092'
+            print(f"[Main Agent] Kafka env was kafka:9092, using: {bootstrap_servers}")
+        topic = _env('KAFKA_TOPIC') or 'snapshots'
+        jpeg_quality = int(_env_float('KAFKA_JPEG_QUALITY', 85))
         print(f"[Main Agent] Kafka: {bootstrap_servers}, topic={topic}")
 
-        # MinIO (optional): env overrides config
-        minio_config = dict(self.config.get('minio', {}))
-        if os.getenv('MINIO_ENABLED') is not None:
-            minio_config['enabled'] = os.getenv('MINIO_ENABLED', '').strip().lower() in ('1', 'true', 'yes')
-        for key, env_key in (('endpoint', 'MINIO_ENDPOINT'), ('bucket', 'MINIO_BUCKET'),
-                             ('access_key', 'MINIO_ACCESS_KEY'), ('secret_key', 'MINIO_SECRET_KEY')):
-            if os.getenv(env_key):
-                minio_config[key] = os.getenv(env_key)
-        if os.getenv('MINIO_SECURE') is not None:
-            minio_config['secure'] = os.getenv('MINIO_SECURE', '').strip().lower() in ('1', 'true', 'yes')
+        # MinIO — только из .env
+        minio_enabled = _env_bool('MINIO_ENABLED', True)
+        minio_config = {
+            'enabled': minio_enabled,
+            'endpoint': _env('MINIO_ENDPOINT') or 'localhost:9000',
+            'bucket': _env('MINIO_BUCKET') or 'crops',
+            'access_key': _env('MINIO_ACCESS_KEY') or 'minioadmin',
+            'secret_key': _env('MINIO_SECRET_KEY') or 'minioadmin',
+            'secure': _env_bool('MINIO_SECURE', False),
+        }
+        for key, env_key in (('endpoint', 'MINIO_ENDPOINT'), ('bucket', 'MINIO_BUCKET'), ('access_key', 'MINIO_ACCESS_KEY'), ('secret_key', 'MINIO_SECRET_KEY')):
+            if _env(env_key):
+                minio_config[key] = _env(env_key)
+        minio_config['endpoint'] = str(minio_config['endpoint']).replace('http://', '').replace('https://', '').rstrip('/')
 
-        # Kafka sender: publishes crops to topic (optionally upload to MinIO first)
         self.sender_agent = KafkaSenderAgent(
             bootstrap_servers=bootstrap_servers,
             topic=topic,
-            jpeg_quality=kafka_config.get('jpeg_quality', 85),
+            jpeg_quality=jpeg_quality,
             minio_config=minio_config if minio_config.get('enabled') else None,
         )
-        
-        # Detection: face (Haar) or person (cpu-person-detection binary)
-        det_config = self.config.get('detection', {})
-        self.detection_type = (os.getenv('DETECTION_TYPE') or det_config.get('type', 'person')).lower()
-        self.person_conf = float(det_config.get('person_conf', 0.4))
-        self.person_iou = float(det_config.get('person_iou', 0.5))
-        self.person_model_path = os.getenv('PERSON_MODEL_PATH') or det_config.get('person_model_path')
+
+        # Detection — только из .env
+        self.detection_type = (_env('DETECTION_TYPE') or 'person').lower()
+        self.person_conf = _env_float('PERSON_CONF', 0.4)
+        self.person_iou = _env_float('PERSON_IOU', 0.5)
+        self.person_model_path = _env('PERSON_MODEL_PATH') or None
+        self.rtsp_use_ffmpeg_pipe = _env_bool('RTSP_USE_FFMPEG_PIPE', True)
         if self.detection_type == 'person':
             from person_crop import is_available
             if not is_available():
@@ -123,38 +154,10 @@ class MainAgent:
         signal.signal(signal.SIGTERM, self._signal_handler)
     
     def _init_cameras(self):
-        """Initialize all cameras from configuration"""
-        # First try to load from CameraManager
+        """Initialize all cameras from CameraManager (cameras.yaml or backend)."""
         cameras = self.camera_manager.get_enabled_cameras()
-        
-        # If cameras not found in CameraManager, use old configuration
         if not cameras:
-            cameras_config = self.config.get('cameras', [])
-            
-            # Don't create default camera - user must configure IP cameras
-            if not cameras_config:
-                print("[Main Agent] WARNING: No cameras. Create cameras.yaml from cameras.yaml.example")
-                cameras_config = []
-            
-            # Convert old configuration to CameraInfo
-            from camera_manager import CameraInfo
-            cameras = []
-            for cam_config in cameras_config:
-                if cam_config.get('enabled', True):
-                    source = cam_config.get('source', len(cameras))
-                    cam_type = cam_config.get('type', 'usb')
-                    
-                    camera = CameraInfo(
-                        camera_id=cam_config.get('camera_id', f"camera_{len(cameras)}"),
-                        name=cam_config.get('name', cam_config.get('camera_id', '')),
-                        source=source,
-                        type=cam_type,
-                        fps=cam_config.get('fps', 10.0),
-                        width=cam_config.get('width', 640),
-                        height=cam_config.get('height', 480),
-                        enabled=True
-                    )
-                    cameras.append(camera)
+            print("[Main Agent] WARNING: No cameras. Set CAMERAS_CONFIG_PATH or BACKEND_CAMERAS_URL and cameras.yaml")
         
         # Initialize capture agents
         for camera in cameras:
@@ -168,32 +171,28 @@ class MainAgent:
             else:
                 source = camera.source
             
-            # Override FPS priority: 1) Camera-specific env var, 2) DEFAULT_FPS env, 3) config.yaml default_fps, 4) cameras.yaml
+            # Skip capture for cameras without URL (saved in cameras.yaml; will work when backend adds ddns_rtsp_url/ddns_stream_url)
+            if not source or (isinstance(source, str) and not source.strip()):
+                print(f"[Main Agent] Camera {camera.camera_id} has no stream URL, skipping capture (add ddns_rtsp_url/ddns_stream_url in backend)")
+                continue
+            
+            # FPS: camera-specific env (e.g. CAM1_FPS), then DEFAULT_FPS, then cameras.yaml
             fps = camera.fps
             env_fps_key = f"{camera.camera_id.upper()}_FPS"
             default_fps_key = "DEFAULT_FPS"
             
-            # Check camera-specific environment variable first
             if os.getenv(env_fps_key):
                 try:
                     fps = float(os.getenv(env_fps_key))
-                    print(f"[Main Agent] FPS for {camera.camera_id} overridden from env {env_fps_key}: {fps}")
+                    print(f"[Main Agent] FPS for {camera.camera_id} from env {env_fps_key}: {fps}")
                 except ValueError:
-                    print(f"[Main Agent] Invalid FPS value in {env_fps_key}, using config: {camera.fps}")
-            # Check DEFAULT_FPS environment variable
+                    pass
             elif os.getenv(default_fps_key):
                 try:
                     fps = float(os.getenv(default_fps_key))
-                    print(f"[Main Agent] Using default FPS from env {default_fps_key}: {fps}")
+                    print(f"[Main Agent] Default FPS from env {default_fps_key}: {fps}")
                 except ValueError:
-                    print(f"[Main Agent] Invalid FPS value in {default_fps_key}, using config: {camera.fps}")
-            # Check config.yaml default_fps
-            elif self.agent_config.get('default_fps') is not None:
-                try:
-                    fps = float(self.agent_config.get('default_fps'))
-                    print(f"[Main Agent] Using default FPS from config.yaml: {fps}")
-                except (ValueError, TypeError):
-                    print(f"[Main Agent] Invalid FPS value in config.yaml, using cameras.yaml: {camera.fps}")
+                    pass
             
             use_ffmpeg_pipe = self.rtsp_use_ffmpeg_pipe if camera.type == 'rtsp' else None
             capture_agent = SnapshotCaptureAgent(
@@ -222,18 +221,6 @@ class MainAgent:
             return fallback
         return path
 
-    def _load_config(self, config_path: str) -> dict:
-        """Load configuration from YAML file"""
-        config_path = self._resolve_path(config_path)
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f)
-            print(f"[Main Agent] Configuration loaded from {config_path}")
-            return config
-        except Exception as e:
-            print(f"[Main Agent] Configuration load error: {e}")
-            return {}
-    
     def _signal_handler(self, signum, frame):
         """Signal handler for graceful shutdown"""
         print("\n[Main Agent] Received shutdown signal...")

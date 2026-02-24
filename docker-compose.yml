@@ -1,5 +1,3 @@
-# Sender-crop: камеры → детекция → crop → Kafka (опционально MinIO). network_mode: host для доступа к камерам и Kafka.
-
 services:
   sender-crop:
     build: .
@@ -7,15 +5,10 @@ services:
     restart: unless-stopped
     volumes:
       - ./config:/app/config:rw
-      - ./config.yaml:/app/config.yaml:ro
     env_file:
       - .env
     environment:
-      - CONFIG_PATH=/app/config.yaml
       - CAMERAS_CONFIG_PATH=/app/config/cameras.yaml
-      - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS:-localhost:9092}
-      - KAFKA_TOPIC=${KAFKA_TOPIC:-snapshots}
-      - DEFAULT_FPS=${DEFAULT_FPS:-}
     network_mode: host
     deploy:
       resources:

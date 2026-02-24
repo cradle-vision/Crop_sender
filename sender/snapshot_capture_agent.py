@@ -87,7 +87,7 @@ class SnapshotCaptureAgent:
                 self._capture_url = url.split("?")[0].split("&")[0]  # clean URL for ffmpeg
             else:
                 if self.camera_type == 'rtsp':
-                    print(f"[Capture Agent {self.camera_id}] RTSP via OpenCV (RTP/decoding errors? set rtsp.use_ffmpeg_pipe: true in config.yaml)")
+                    print(f"[Capture Agent {self.camera_id}] RTSP via OpenCV (RTP/decoding errors? set RTSP_USE_FFMPEG_PIPE=true in .env)")
                 old_opts = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS", "")
                 if self.camera_type == 'rtsp':
                     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = _FFMPEG_RTSP_OPTS

@@ -9,6 +9,7 @@ import os
 import json
 import ssl
 import urllib.request
+import urllib.parse
 from typing import List, Dict, Optional, Union
 from dataclasses import dataclass, asdict, fields
 
@@ -61,7 +62,7 @@ class CameraManager:
             else:
                 cameras_list = data if isinstance(data, list) else []
         valid_keys = {f.name for f in fields(CameraInfo)}
-        # Map common API field names to CameraInfo (snake_case and camelCase); backend uses ddns_rtsp_url, ddns_stream_url, device_id
+        # Map backend format (backend_cameras.json: device_id, device_ip, login, password, ddns_rtsp_url, ...) to cameras.yaml (camera_id, source, ip_address, username, password, ...)
         def normalize(c: dict) -> dict:
             out = dict(c)
             # camelCase -> snake_case
@@ -69,46 +70,68 @@ class CameraManager:
                                  ('ipAddress', 'ip_address'), ('rtspPath', 'rtsp_path')]:
                 if camel in out and snake not in out:
                     out[snake] = out[camel]
+            # camera_id: backend uses device_id or id
             if 'id' in out and 'camera_id' not in out:
                 out['camera_id'] = str(out['id'])
             elif 'device_id' in out and 'camera_id' not in out:
                 out['camera_id'] = str(out['device_id'])
-            # source: prefer RTSP, then stream URL (backend: ddns_rtsp_url, ddns_stream_url)
+            # ip_address: backend uses device_ip
+            if 'device_ip' in out and out.get('device_ip') and not out.get('ip_address'):
+                out['ip_address'] = str(out['device_ip']).strip()
+            # username / password: backend uses login / password
+            if 'login' in out and out.get('login') and not out.get('username'):
+                out['username'] = str(out['login']).strip()
+            if 'password' in out:
+                out['password'] = str(out['password']) if out['password'] is not None else ''
+            # source: prefer full URL from backend (ddns_rtsp_url, ddns_stream_url), else build from device_ip + login + password
             if 'ddns_rtsp_url' in out and out.get('ddns_rtsp_url'):
                 out['source'] = out['ddns_rtsp_url']
             elif 'ddns_stream_url' in out and out.get('ddns_stream_url'):
                 out['source'] = out['ddns_stream_url']
-            elif 'stream_url' in out and 'source' not in out:
+            elif 'stream_url' in out and out.get('stream_url'):
                 out['source'] = out['stream_url']
-            elif 'streamUrl' in out and 'source' not in out:
+            elif 'streamUrl' in out and out.get('streamUrl'):
                 out['source'] = out['streamUrl']
-            elif 'url' in out and 'source' not in out:
+            elif 'url' in out and out.get('url'):
                 out['source'] = out['url']
-            elif 'rtsp_url' in out and 'source' not in out:
+            elif 'rtsp_url' in out and out.get('rtsp_url'):
                 out['source'] = out['rtsp_url']
-            elif 'rtspUrl' in out and 'source' not in out:
+            elif 'rtspUrl' in out and out.get('rtspUrl'):
                 out['source'] = out['rtspUrl']
-            if 'camera_type' in out and 'type' not in out:
+            else:
+                # Build RTSP URL from device_ip (ip_address), login (username), password, port 554
+                ip = out.get('ip_address') or out.get('device_ip')
+                login = out.get('username') or out.get('login') or ''
+                pwd = out.get('password') or ''
+                port = out.get('port') or 554
+                path = (out.get('rtsp_path') or '/').strip()
+                if not path.startswith('/'):
+                    path = '/' + path
+                if ip:
+                    if login and pwd:
+                        out['source'] = f"rtsp://{login}:{pwd}@{ip}:{port}{path}"
+                    else:
+                        out['source'] = f"rtsp://{ip}:{port}{path}"
+                    if 'port' not in out or out.get('port') is None:
+                        out['port'] = port
+                else:
+                    out['source'] = ''
+            # type
+            if 'camera_type' in out and out.get('camera_type') and 'type' not in out:
                 out['type'] = out['camera_type']
             elif 'cameraType' in out and 'type' not in out:
                 out['type'] = out['cameraType']
             elif 'kind' in out and 'type' not in out:
                 out['type'] = out['kind']
-            if 'label' in out and 'name' not in out:
-                out['name'] = out['label']
-            if 'device_name' in out and (not out.get('name') or out.get('name') == 'camera'):
-                out['name'] = out['device_name']
-            if 'name' not in out:
-                out['name'] = out.get('camera_id') or out.get('cameraId') or 'camera'
-            if 'source' not in out:
-                out['source'] = (out.get('ddns_rtsp_url') or out.get('ddns_stream_url') or out.get('stream_url') or
-                                 out.get('streamUrl') or out.get('url') or out.get('rtsp_url') or out.get('rtspUrl') or '')
             if 'type' not in out:
                 out['type'] = 'rtsp' if 'rtsp' in str(out.get('source', '')).lower() else 'http'
-            if 'login' in out and out.get('login') and 'username' not in out:
-                out['username'] = out['login']
-            if 'password' in out and 'password' in [f.name for f in fields(CameraInfo)]:
-                pass  # already there
+            # name
+            if 'label' in out and out.get('label'):
+                out['name'] = out['label']
+            if 'device_name' in out and (not out.get('name') or out.get('name') == 'camera'):
+                out['name'] = (out['device_name'] or out.get('name') or '').strip() or out.get('camera_id') or 'camera'
+            if not out.get('name'):
+                out['name'] = out.get('camera_id') or out.get('cameraId') or 'camera'
             return out
         for cam_data in cameras_list:
             if not isinstance(cam_data, dict):
@@ -120,11 +143,19 @@ class CameraManager:
                     continue
                 cam_data = {**cam_data, 'camera_id': camera_id}
             filtered = {k: v for k, v in cam_data.items() if k in valid_keys}
-            if not filtered.get('camera_id') or not filtered.get('source') or not filtered.get('type'):
+            if not filtered.get('camera_id'):
                 continue
+            # Allow camera with only id/name (source can be empty until backend provides ddns_rtsp_url/ddns_stream_url)
+            if not filtered.get('source'):
+                filtered['source'] = ''
+            if not filtered.get('type'):
+                filtered['type'] = 'rtsp'
+            if not filtered.get('name'):
+                filtered['name'] = filtered.get('camera_id') or 'camera'
             try:
                 camera = CameraInfo(**filtered)
                 self.cameras[camera.camera_id] = camera
+                print(f"[Camera Manager] Mapped backend camera: id={camera.camera_id}, name={camera.name}, source={repr(camera.source)[:60]}")
             except Exception as e:
                 print(f"[Camera Manager] Skip camera {cam_data.get('camera_id', '?')}: {e}")
         if len(self.cameras) == 0 and cameras_list:
@@ -140,47 +171,108 @@ class CameraManager:
     def fetch_cameras_from_backend(url: str, timeout: float = 10.0, token: Optional[str] = None) -> Optional[dict]:
         """
         GET url, expect JSON { 'cameras': [ ... ] } or { 'items': [ ... ] }.
+        Returns normalized dict for load_cameras_from_data; raw response is in the tuple from fetch_cameras_from_backend_raw.
         Optional Bearer token: Authorization: Bearer <token>.
         """
+        raw = CameraManager._fetch_cameras_from_backend_raw(url, timeout, token)
+        if raw is None:
+            return None
+        return CameraManager._normalize_backend_response(raw)
+
+    @staticmethod
+    def _fetch_cameras_from_backend_raw(url: str, timeout: float, token: Optional[str]) -> Optional[dict]:
+        """GET and return raw JSON (for saving to backend_cameras.json)."""
         try:
             req = urllib.request.Request(url, method='GET')
             req.add_header('Accept', 'application/json')
             if token:
-                req.add_header('Authorization', f'Bearer {token.strip()}')
+                t = str(token).strip()
+                req.add_header('Authorization', f'Bearer {t}')
+                print(f"[Camera Manager] Requesting cameras with Bearer token ({len(t)} chars)")
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
                 body = resp.read().decode('utf-8')
-            data = json.loads(body)
-            if not isinstance(data, dict):
-                return {'cameras': data if isinstance(data, list) else []}
-            # Log what backend returned (to fix mapping if 0 cameras)
-            keys = list(data.keys())
-            if 'cameras' in data and isinstance(data['cameras'], list):
-                print(f"[Camera Manager] Backend response keys: {keys}, using 'cameras' list len={len(data['cameras'])}")
-                return data
-            if 'items' in data and isinstance(data['items'], list):
-                print(f"[Camera Manager] Backend response keys: {keys}, using 'items' list len={len(data['items'])}")
-                return {'cameras': data['items']}
-            for key in ('data', 'results', 'content', 'records'):
-                if key in data and isinstance(data[key], list):
-                    print(f"[Camera Manager] Backend response keys: {keys}, using '{key}' list len={len(data[key])}")
-                    return {'cameras': data[key]}
-            # Nested: data.items, data.content (Spring Page)
-            if 'data' in data and isinstance(data['data'], dict):
-                inner = data['data']
-                if 'items' in inner and isinstance(inner['items'], list):
-                    print(f"[Camera Manager] Backend response keys: {keys}, using 'data.items' list len={len(inner['items'])}")
-                    return {'cameras': inner['items']}
-                if 'content' in inner and isinstance(inner['content'], list):
-                    print(f"[Camera Manager] Backend response keys: {keys}, using 'data.content' list len={len(inner['content'])}")
-                    return {'cameras': inner['content']}
-            print(f"[Camera Manager] Backend response keys: {keys}, no known list found")
-            return data
+            return json.loads(body)
         except Exception as e:
             print(f"[Camera Manager] Backend fetch error: {e}")
             return None
+
+    @staticmethod
+    def fetch_backend_token(
+        token_url: str,
+        username: str,
+        password: str,
+        timeout: float = 10.0,
+        scope: str = 'camera:read',
+    ) -> Optional[str]:
+        """
+        POST token_url with application/x-www-form-urlencoded:
+        grant_type=&username=...&password=...&scope=camera:read&client_id=&client_secret=
+        Returns access_token from JSON response (OAuth2-style).
+        """
+        try:
+            data = urllib.parse.urlencode({
+                'grant_type': '',
+                'username': username,
+                'password': password,
+                'scope': scope or '',
+                'client_id': '',
+                'client_secret': '',
+            }).encode('utf-8')
+            req = urllib.request.Request(token_url, data=data, method='POST')
+            req.add_header('Accept', 'application/json')
+            req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                body = resp.read().decode('utf-8')
+            out = json.loads(body)
+            token = None
+            if isinstance(out, str):
+                token = out.strip() or None
+            elif isinstance(out, dict):
+                token = out.get('access_token') or out.get('token')
+                if token is None and isinstance(out.get('data'), dict):
+                    token = out['data'].get('access_token') or out['data'].get('token')
+            if token:
+                token = str(token).strip()
+                print(f"[Camera Manager] Backend token obtained via username/password")
+            else:
+                print(f"[Camera Manager] Token response missing access_token. Keys: {list(out.keys()) if isinstance(out, dict) else 'not dict'}")
+            return token
+        except Exception as e:
+            print(f"[Camera Manager] Token fetch error: {e}")
+            return None
+
+    @staticmethod
+    def _normalize_backend_response(data: dict) -> Optional[dict]:
+        """Convert backend response to { 'cameras': [ ... ] } for load_cameras_from_data."""
+        if not isinstance(data, dict):
+            return {'cameras': data if isinstance(data, list) else []}
+        keys = list(data.keys())
+        if 'cameras' in data and isinstance(data['cameras'], list):
+            print(f"[Camera Manager] Backend response keys: {keys}, using 'cameras' list len={len(data['cameras'])}")
+            return data
+        if 'items' in data and isinstance(data['items'], list):
+            print(f"[Camera Manager] Backend response keys: {keys}, using 'items' list len={len(data['items'])}")
+            return {'cameras': data['items']}
+        for key in ('data', 'results', 'content', 'records'):
+            if key in data and isinstance(data[key], list):
+                print(f"[Camera Manager] Backend response keys: {keys}, using '{key}' list len={len(data[key])}")
+                return {'cameras': data[key]}
+        if 'data' in data and isinstance(data['data'], dict):
+            inner = data['data']
+            if 'items' in inner and isinstance(inner['items'], list):
+                print(f"[Camera Manager] Backend response keys: {keys}, using 'data.items' list len={len(inner['items'])}")
+                return {'cameras': inner['items']}
+            if 'content' in inner and isinstance(inner['content'], list):
+                print(f"[Camera Manager] Backend response keys: {keys}, using 'data.content' list len={len(inner['content'])}")
+                return {'cameras': inner['content']}
+        print(f"[Camera Manager] Backend response keys: {keys}, no known list found")
+        return data
     
     def load_cameras(self):
         """Load cameras from config file. If path is a directory (e.g. Docker mount), use ../config/cameras.yaml."""

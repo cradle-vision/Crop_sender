@@ -26,8 +26,7 @@ RUN chmod +x /app/cpu-person-detection/person_detection_linux_x64/person_detect 
 RUN mkdir -p /app/config
 
 ENV PYTHONUNBUFFERED=1
-ENV CONFIG_PATH=/app/config.yaml
-ENV CAMERAS_CONFIG_PATH=/app/cameras.yaml
+ENV CAMERAS_CONFIG_PATH=/app/config/cameras.yaml
 
 WORKDIR /app
 CMD ["python3", "sender/main_agent.py"]

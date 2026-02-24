@@ -17,11 +17,10 @@
 
 ## Конфигурация
 
-- **config.yaml** — `kafka.*`, `minio.*` (опционально), `backend.cameras_url` (опционально), `rtsp.use_ffmpeg_pipe`, `detection.type`, `detection.person_conf`, `agent.default_fps`
-- **.env** — переменные окружения (копия `.env.example` → `.env`). При запуске загружаются через `python-dotenv` и переопределяют config.yaml. Не коммитить `.env` (секреты).
-- **cameras.yaml** — список камер. Если задан **BACKEND_CAMERAS_URL**, при старте список **один раз** запрашивается с backend и **сохраняется** в `cameras.yaml`; при следующем запуске или при ошибке запроса используется уже сохранённый файл.
+- **.env** — единственный источник конфигурации (копия `.env.example` → `.env`). Не коммитить `.env` (секреты).
+- **cameras.yaml** — список камер (путь в `CAMERAS_CONFIG_PATH`). Если задан **BACKEND_CAMERAS_URL**, при старте список запрашивается с backend и сохраняется в `cameras.yaml`.
 
-Переменные окружения (см. `.env.example`): `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_TOPIC`, `BACKEND_CAMERAS_URL` (опционально), `CAMERAS_CONFIG_PATH`, `MINIO_*`, `RTSP_USE_FFMPEG_PIPE`, `DETECTION_TYPE`, `PERSON_MODEL_PATH`, `DEFAULT_FPS`, `CAM1_FPS` и т.д.
+Переменные окружения (см. `.env.example`): `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_TOPIC`, `KAFKA_JPEG_QUALITY`, `MINIO_*`, `BACKEND_CAMERAS_URL`, `CAMERAS_CONFIG_PATH`, `RTSP_USE_FFMPEG_PIPE`, `DETECTION_TYPE`, `PERSON_MODEL_PATH`, `PERSON_CONF`, `PERSON_IOU`, `DEFAULT_FPS`, `CAM1_FPS` и т.д.
 
 Для **person** нужны: бинарник `cpu-person-detection/person_detection_linux_x64/person_detect` и модель `cpu-person-detection/models/person_detection_model.onnx` (собрать пакет: `cd cpu-person-detection && ./create_linux_package.sh`).
 
@@ -39,19 +38,19 @@ Docker (sender + person_detect в одном образе):
 docker-compose build && docker-compose up -d
 ```
 
-В образ копируются `cpu-person-detection/` (бинарник `person_detect`, `lib/`, модель). Нужны `config.yaml` и `cameras.yaml` в каталоге сборки (монтируются в контейнер).
+В образ копируются `cpu-person-detection/` (бинарник `person_detect`, `lib/`, модель). Конфиг — только из `.env`; камеры — `config/cameras.yaml` (монтируется в контейнер).
 
 ## Типы камер
 
 - **RTSP**: `rtsp://[user:pass@]ip:port/path`
 - **HTTP/MJPEG**: `http://ip:port/path`
 
-При "RTP: bad cseq" и "error while decoding MB": включите **захват через FFmpeg** — в `config.yaml` задайте `rtsp.use_ffmpeg_pipe: true` (или env `RTSP_USE_FFMPEG_PIPE=1`). В коде также включены TCP, таймаут и авто-переподключение для OpenCV. Если ошибки остаются — переключитесь на **субпоток** камеры (Hikvision: `/Streaming/Channels/102` вместо `101`; у других — `/stream2`) — меньше битрейт, стабильнее по сети.
+При "RTP: bad cseq" и "error while decoding MB": включите **захват через FFmpeg** — в `.env` задайте `RTSP_USE_FFMPEG_PIPE=true`. В коде также включены TCP, таймаут и авто-переподключение для OpenCV. Если ошибки остаются — переключитесь на **субпоток** камеры (Hikvision: `/Streaming/Channels/102` вместо `101`; у других — `/stream2`) — меньше битрейт, стабильнее по сети.
 
 ### Откуда берутся ошибки RTP / decoding MB
 
 - Сообщения **идут из FFmpeg** при декодировании RTSP (OpenCV внутри использует FFmpeg). В коде RTSP открывается только в **snapshot_capture_agent** (основной захват) и в **camera_manager.test_camera** (разовый тест). Остальные модули (person_crop, kafka_sender_agent) камеру не открывают.
-- При **OpenCV-захвате** (`rtsp.use_ffmpeg_pipe: false`) stderr FFmpeg попадает в консоль — в логах видны "RTP: PT=60: bad cseq" и "h264 ... error while decoding MB". При **захвате через FFmpeg pipe** (`rtsp.use_ffmpeg_pipe: true`) декодирование делает отдельный процесс `ffmpeg -rtsp_transport tcp`; его stderr не выводится — эти сообщения в логах не появятся.
+- При **OpenCV-захвате** (`RTSP_USE_FFMPEG_PIPE=false`) stderr FFmpeg попадает в консоль. При **захвате через FFmpeg pipe** (`RTSP_USE_FFMPEG_PIPE=true`) декодирование делает отдельный процесс `ffmpeg -rtsp_transport tcp`; его stderr не выводится.
 - Другие причины: нестабильная сеть или Wi‑Fi, несколько клиентов на один поток (cseq путается), прошивка камеры. Решение: один клиент, по возможности провод, субпоток вместо основного.
 
 ## Структура проекта
@@ -68,7 +67,6 @@ Sender_Crop/
 │   ├── scan_ip_cameras.py      # Утилита добавления камер
 │   ├── cameras.yaml
 │   └── cameras.yaml.example
-├── config.yaml
 ├── .env.example    # образец для .env (Kafka, MinIO, RTSP, FPS)
 ├── docker-compose.yml
 ├── Dockerfile
