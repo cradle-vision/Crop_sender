@@ -1,9 +1,3 @@
-"""
-Main Coordinator Agent
-Camera → detect people (face or person) → crop → [MinIO] → Kafka → backend → Triton.
-Configuration: only .env (no config.yaml).
-"""
-
 import os
 import json
 import time
@@ -95,12 +89,10 @@ class MainAgent:
                     self.camera_manager.config_file = fallback_path
                     self.camera_manager.load_cameras()
 
-        # Kafka — только из .env
+        # Kafka — приоритет: SENDER_KAFKA_* (из docker-compose/.env), затем KAFKA_*
         bootstrap_servers = _env('KAFKA_BOOTSTRAP_SERVERS') or 'localhost:9092'
         bootstrap_servers = str(bootstrap_servers).replace('http://', '').replace('https://', '').rstrip('/')
-        if bootstrap_servers.strip() == 'kafka:9092':
-            bootstrap_servers = 'localhost:9092'
-            print(f"[Main Agent] Kafka env was kafka:9092, using: {bootstrap_servers}")
+
         topic = _env('KAFKA_TOPIC') or 'snapshots'
         jpeg_quality = int(_env_float('KAFKA_JPEG_QUALITY', 85))
         print(f"[Main Agent] Kafka: {bootstrap_servers}, topic={topic}")
@@ -109,13 +101,13 @@ class MainAgent:
         minio_enabled = _env_bool('MINIO_ENABLED', True)
         minio_config = {
             'enabled': minio_enabled,
-            'endpoint': _env('MINIO_ENDPOINT') or 'localhost:9000',
+            'endpoint': _env('SENDER_MINIO_ENDPOINT') or _env('MINIO_ENDPOINT') or 'localhost:9000',
             'bucket': _env('MINIO_BUCKET') or 'crops',
             'access_key': _env('MINIO_ACCESS_KEY') or 'minioadmin',
             'secret_key': _env('MINIO_SECRET_KEY') or 'minioadmin',
             'secure': _env_bool('MINIO_SECURE', False),
         }
-        for key, env_key in (('endpoint', 'MINIO_ENDPOINT'), ('bucket', 'MINIO_BUCKET'), ('access_key', 'MINIO_ACCESS_KEY'), ('secret_key', 'MINIO_SECRET_KEY')):
+        for key, env_key in (('bucket', 'MINIO_BUCKET'), ('access_key', 'MINIO_ACCESS_KEY'), ('secret_key', 'MINIO_SECRET_KEY')):
             if _env(env_key):
                 minio_config[key] = _env(env_key)
         minio_config['endpoint'] = str(minio_config['endpoint']).replace('http://', '').replace('https://', '').rstrip('/')

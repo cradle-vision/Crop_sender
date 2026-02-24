@@ -1,11 +1,6 @@
-"""
-Kafka Sender Agent
-Flow: Camera → Detection (crop) → JPEG encode → MinIO.put_object() → Kafka.send(metadata + object_key).
-Uploads crop to MinIO, then publishes only metadata (bucket, object_key) to Kafka. Backend consumes and sends to Triton.
-"""
-
 import json
 import uuid
+import io
 import cv2
 import numpy as np
 from typing import Optional, Dict, Any
@@ -109,10 +104,11 @@ class KafkaSenderAgent:
 
             # 2. MinIO.put_object()
             object_name = f"crops/{camera_id}/{ts_ms}_{uuid.uuid4().hex[:8]}.jpg"
+            data_stream = io.BytesIO(data)
             self._minio_client.put_object(
                 self._minio_bucket,
                 object_name,
-                data=data,
+                data=data_stream,
                 length=len(data),
                 content_type="image/jpeg",
             )
