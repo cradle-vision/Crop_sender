@@ -1,8 +1,3 @@
-"""
-Camera Manager - camera configuration (cameras.yaml or backend API)
-Supports IP cameras RTSP/HTTP and USB.
-"""
-
 import cv2
 import yaml
 import os
@@ -26,11 +21,16 @@ class CameraInfo:
     username: Optional[str] = None
     password: Optional[str] = None
     rtsp_path: Optional[str] = None
-    fps: float = 10.0
-    width: int = 640
-    height: int = 480
+    fps: float = 3.0
+    width: int = 1920
+    height: int = 1080
     enabled: bool = True
     description: str = ""
+    # Optional metadata for MinIO pathing and backend
+    company_id: Optional[str] = None
+    building_id: Optional[str] = None
+    company_name: Optional[str] = None
+    building_name: Optional[str] = None
 
 
 class CameraManager:
@@ -62,12 +62,17 @@ class CameraManager:
             else:
                 cameras_list = data if isinstance(data, list) else []
         valid_keys = {f.name for f in fields(CameraInfo)}
-        # Map backend format (backend_cameras.json: device_id, device_ip, login, password, ddns_rtsp_url, ...) to cameras.yaml (camera_id, source, ip_address, username, password, ...)
+        # Map backend format (backend_cameras.json: device_id, device_ip, login, password, ddns_rtsp_url, companyId, buildingId, companyName, buildingName, ...) to cameras.yaml (camera_id, source, ip_address, username, password, company_id, building_id, company_name, building_name, ...)
         def normalize(c: dict) -> dict:
             out = dict(c)
             # camelCase -> snake_case
             for camel, snake in [('cameraId', 'camera_id'), ('streamUrl', 'stream_url'), ('rtspUrl', 'rtsp_url'),
                                  ('ipAddress', 'ip_address'), ('rtspPath', 'rtsp_path')]:
+                if camel in out and snake not in out:
+                    out[snake] = out[camel]
+            # company/building ids/names from backend (companyId/buildingId -> company_id/building_id, companyName/buildingName -> company_name/building_name)
+            for camel, snake in [('companyId', 'company_id'), ('buildingId', 'building_id'),
+                                 ('companyName', 'company_name'), ('buildingName', 'building_name')]:
                 if camel in out and snake not in out:
                     out[snake] = out[camel]
             # camera_id: backend uses device_id or id

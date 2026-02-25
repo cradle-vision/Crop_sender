@@ -84,14 +84,46 @@ class KafkaSenderAgent:
         self._connected = False
         print("[Kafka Sender Agent] Disconnected")
 
-    def send_snapshot(self, frame: np.ndarray, timestamp: float, camera_id: str = "camera_0") -> bool:
+    def send_snapshot(
+        self,
+        frame: np.ndarray,
+        timestamp: float,
+        camera_id: str = "camera_0",
+        company_id: Optional[str] = None,
+        building_id: Optional[str] = None,
+        company_name: Optional[str] = None,
+        building_name: Optional[str] = None,
+        camera_name: Optional[str] = None,
+    ) -> bool:
         """
         Flow: JPEG encode → MinIO.put_object() → Kafka.send(metadata + object_key).
+        company_id/building_id are optional and used only for MinIO path / metadata if provided.
         """
         if not self._connected or not self._producer or not self._minio_client:
             return False
-        camera_id = str(camera_id or "unknown").strip()
-        camera_id = "".join(c for c in camera_id if c.isprintable() or c.isspace()).strip() or "unknown"
+
+        def _sanitize(value: Optional[str]) -> Optional[str]:
+            if value is None:
+                return None
+            value = str(value or "").strip()
+            value = "".join(c for c in value if c.isprintable() or c.isspace()).strip()
+            return value or None
+
+        def _slug(value: Optional[str]) -> Optional[str]:
+            """Create filesystem-friendly slug from name (lowercase, spaces->-, alnum/_/- only)."""
+            value = _sanitize(value)
+            if value is None:
+                return None
+            value = value.lower().replace(" ", "-")
+            value = "".join(c for c in value if c.isalnum() or c in "-_")
+            return value or None
+
+        camera_id = _sanitize(camera_id) or "unknown"
+        company_id = _sanitize(company_id)
+        building_id = _sanitize(building_id)
+        company_name = _sanitize(company_name)
+        building_name = _sanitize(building_name)
+        camera_name = _sanitize(camera_name)
         try:
             # 1. JPEG encode
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
@@ -103,7 +135,24 @@ class KafkaSenderAgent:
             ts_ms = int(timestamp * 1000)
 
             # 2. MinIO.put_object()
-            object_name = f"crops/{camera_id}/{ts_ms}_{uuid.uuid4().hex[:8]}.jpg"
+            # Path pattern (по твоему запросу):
+            #   crops/<camera_name>/<building_id>/<camera_id>/<timestamp_uuid>.jpg
+            # company_* остаются только в метаданных Kafka.
+            path_parts = ["crops"]
+
+            # 1) camera_name (slug, если есть)
+            cam_name_slug = _slug(camera_name)
+            if cam_name_slug:
+                path_parts.append(cam_name_slug)
+
+            # 2) building_id (как строка), если есть
+            if building_id:
+                path_parts.append(str(building_id))
+
+            # 3) camera_id (обязательный сегмент)
+            path_parts.append(camera_id)
+            prefix = "/".join(path_parts)
+            object_name = f"{prefix}/{ts_ms}_{uuid.uuid4().hex[:8]}.jpg"
             data_stream = io.BytesIO(data)
             self._minio_client.put_object(
                 self._minio_bucket,
@@ -121,6 +170,14 @@ class KafkaSenderAgent:
                 "bucket": self._minio_bucket,
                 "object_key": object_name,
             }
+            if company_id:
+                payload["company_id"] = company_id
+            if building_id:
+                payload["building_id"] = building_id
+            if company_name:
+                payload["company_name"] = company_name
+            if building_name:
+                payload["building_name"] = building_name
             value = json.dumps(payload).encode("utf-8")
             self._producer.produce(self.topic, value=value, key=camera_id.encode("utf-8"))
             self._producer.poll(0)

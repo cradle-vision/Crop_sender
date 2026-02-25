@@ -14,8 +14,7 @@ except ImportError:
 from snapshot_capture_agent import SnapshotCaptureAgent
 from kafka_sender_agent import KafkaSenderAgent
 from camera_manager import CameraManager
-from face_crop import detect_faces, crop_faces
-from person_crop import detect_persons, crop_persons
+from person_crop import detect_persons, crop_persons, is_available as person_detector_available
 
 
 def _env(key: str, default: str = "") -> str:
@@ -94,7 +93,7 @@ class MainAgent:
         bootstrap_servers = str(bootstrap_servers).replace('http://', '').replace('https://', '').rstrip('/')
 
         topic = _env('KAFKA_TOPIC') or 'snapshots'
-        jpeg_quality = int(_env_float('KAFKA_JPEG_QUALITY', 85))
+        jpeg_quality = int(_env_float('KAFKA_JPEG_QUALITY', 95))
         print(f"[Main Agent] Kafka: {bootstrap_servers}, topic={topic}")
 
         # MinIO — только из .env
@@ -119,21 +118,17 @@ class MainAgent:
             minio_config=minio_config if minio_config.get('enabled') else None,
         )
 
-        # Detection — только из .env
-        self.detection_type = (_env('DETECTION_TYPE') or 'person').lower()
+        # Detection: CPU person detection only (person_detect binary)
         self.person_conf = _env_float('PERSON_CONF', 0.4)
         self.person_iou = _env_float('PERSON_IOU', 0.5)
         self.person_model_path = _env('PERSON_MODEL_PATH') or None
         self.rtsp_use_ffmpeg_pipe = _env_bool('RTSP_USE_FFMPEG_PIPE', True)
-        if self.detection_type == 'person':
-            from person_crop import is_available
-            if not is_available():
-                print("[Main Agent] Person detector (person_detect binary) not found, falling back to face detection")
-                self.detection_type = 'face'
-            else:
-                print("[Main Agent] Using person detection (cpu-person-detection binary)")
-        if self.detection_type == 'face':
-            print("[Main Agent] Using face detection (OpenCV Haar)")
+        if not person_detector_available():
+            raise RuntimeError(
+                "Person detector (person_detect binary + model) not found. "
+                "See cpu-person-detection/ and PERSON_MODEL_PATH."
+            )
+        print("[Main Agent] Using person detection (cpu-person-detection binary)")
         if self.rtsp_use_ffmpeg_pipe:
             print("[Main Agent] RTSP capture: using FFmpeg pipe (avoids RTP/decoding errors)")
         
@@ -259,24 +254,38 @@ class MainAgent:
         return True
     
     def _on_frame_captured(self, frame, timestamp: float, camera_id: str):
-        """Detect people (face or person), crop, publish each crop to Kafka."""
+        """Detect persons, crop, publish each crop to Kafka (CPU person detection only)."""
         if not self.running:
             return
-        if self.detection_type == 'person':
-            rects = detect_persons(
-                frame,
-                model_path=self.person_model_path,
-                conf_threshold=self.person_conf,
-                iou_threshold=self.person_iou,
-            )
-            crops = crop_persons(frame, rects)
-        else:
-            rects = detect_faces(frame)
-            crops = crop_faces(frame, rects)
+        rects = detect_persons(
+            frame,
+            model_path=self.person_model_path,
+            conf_threshold=self.person_conf,
+            iou_threshold=self.person_iou,
+        )
+        crops = crop_persons(frame, rects)
+
+        # Optional company/building/camera metadata for MinIO path and Kafka payload
+        camera = self.camera_manager.get_camera(camera_id) if hasattr(self, "camera_manager") else None
+        company_id = getattr(camera, "company_id", None) if camera else None
+        building_id = getattr(camera, "building_id", None) if camera else None
+        company_name = getattr(camera, "company_name", None) if camera else None
+        building_name = getattr(camera, "building_name", None) if camera else None
+        camera_name = getattr(camera, "name", None) if camera else None
+
         if not crops:
             return
         for crop_img in crops:
-            self.sender_agent.send_snapshot(crop_img, timestamp, camera_id)
+            self.sender_agent.send_snapshot(
+                crop_img,
+                timestamp,
+                camera_id,
+                company_id,
+                building_id,
+                company_name,
+                building_name,
+                camera_name,
+            )
     
     def stop(self):
         """Stop all agents"""

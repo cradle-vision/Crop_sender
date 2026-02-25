@@ -1,11 +1,11 @@
 # Sender Crop
 
-Камера → детекция (лица или люди) → обрезка (crop) → публикация в Kafka → backend → Triton.
+Камера → детекция людей (CPU person_detect) → обрезка (crop) → публикация в Kafka → backend → Triton.
 
 ## Схема
 
 - **Камера(ы)** — захват кадров (RTSP/HTTP/USB), FPS из `cameras.yaml`
-- **Детекция** — **person** (бинарник `person_detect` из `cpu-person-detection/`) или **face** (OpenCV Haar)
+- **Детекция** — **person** (бинарник `person_detect` из `cpu-person-detection/`)
 - **Обрезка** — crop по найденным областям
 - **Kafka** — каждый crop публикуется в топик. Без MinIO: JSON с `image_base64`. С MinIO: crop загружается в бакет, в Kafka только `camera_id`, `timestamp`, `format`, `bucket`, `object_key`. Backend потребляет и отправляет в Triton.
 
@@ -20,7 +20,7 @@
 - **.env** — единственный источник конфигурации (копия `.env.example` → `.env`). Не коммитить `.env` (секреты).
 - **cameras.yaml** — список камер (путь в `CAMERAS_CONFIG_PATH`). Если задан **BACKEND_CAMERAS_URL**, при старте список запрашивается с backend и сохраняется в `cameras.yaml`.
 
-Переменные окружения (см. `.env.example`): `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_TOPIC`, `KAFKA_JPEG_QUALITY`, `MINIO_*`, `BACKEND_CAMERAS_URL`, `CAMERAS_CONFIG_PATH`, `RTSP_USE_FFMPEG_PIPE`, `DETECTION_TYPE`, `PERSON_MODEL_PATH`, `PERSON_CONF`, `PERSON_IOU`, `DEFAULT_FPS`, `CAM1_FPS` и т.д.
+Переменные окружения (см. `.env.example`): `KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_TOPIC`, `KAFKA_JPEG_QUALITY`, `MINIO_*`, `BACKEND_CAMERAS_URL`, `CAMERAS_CONFIG_PATH`, `RTSP_USE_FFMPEG_PIPE`, `PERSON_MODEL_PATH`, `PERSON_CONF`, `PERSON_IOU`, `DEFAULT_FPS`, `CAM1_FPS` и т.д.
 
 Для **person** нужны: бинарник `cpu-person-detection/person_detection_linux_x64/person_detect` и модель `cpu-person-detection/models/person_detection_model.onnx` (собрать пакет: `cd cpu-person-detection && ./create_linux_package.sh`).
 
@@ -60,7 +60,6 @@ Sender_Crop/
 ├── sender/
 │   ├── main_agent.py           # Оркестратор: кадр → detect → crop → Kafka
 │   ├── snapshot_capture_agent.py # Захват с камер
-│   ├── face_crop.py            # Детекция лиц (Haar) + crop
 │   ├── person_crop.py          # Детекция людей (person_detect binary) + crop
 │   ├── kafka_sender_agent.py   # Публикация crop в Kafka
 │   ├── camera_manager.py       # Камеры из cameras.yaml или backend
