@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# Install system dependencies for OpenCV and gRPC
+# Install system dependencies for OpenCV
 RUN apt-get update && apt-get install -y \
     libopencv-dev \
     python3-opencv \
@@ -17,12 +17,16 @@ COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
 COPY . .
-RUN python3 -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. snapshot_service.proto
+
+# Person detection: ensure binary is executable and model is present
+RUN chmod +x /app/cpu-person-detection/person_detection_linux_x64/person_detect 2>/dev/null || true \
+    && chmod +x /app/cpu-person-detection/person_detection_linux_x64/bin/detect_main 2>/dev/null || true \
+    && test -f /app/cpu-person-detection/models/person_detection_model.onnx || echo "WARN: person_detection_model.onnx not found"
 
 RUN mkdir -p /app/config
 
 ENV PYTHONUNBUFFERED=1
-ENV CONFIG_PATH=/app/config.yaml
-ENV CAMERAS_CONFIG_PATH=/app/cameras.yaml
+ENV CAMERAS_CONFIG_PATH=/app/config/cameras.yaml
 
-CMD ["python3", "main_agent.py"]
+WORKDIR /app
+CMD ["python3", "sender/main_agent.py"]

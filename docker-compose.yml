@@ -1,34 +1,23 @@
-version: '3.8'
-
 services:
   sender-crop:
     build: .
     container_name: sender-crop
     restart: unless-stopped
-    
     volumes:
-      - ./config:/app/config:ro
-      - ./cameras.yaml:/app/cameras.yaml:rw
-      - ./config.yaml:/app/config.yaml:ro
-    
+      - ./config:/app/config:rw
+    env_file:
+      - .env
     environment:
-      - CONFIG_PATH=/app/config.yaml
-      - CAMERAS_CONFIG_PATH=/app/cameras.yaml
-      - GRPC_SERVER_ADDRESS=${GRPC_SERVER_ADDRESS:-localhost:50051}
-      - BACKEND_URL=${BACKEND_URL:-}
-      - CAMERAS_ENDPOINT=${CAMERAS_ENDPOINT:-/api/cameras}
-      - CROP_ENABLED=${CROP_ENABLED:-false}
-      - CROP_DESTINATION_URL=${CROP_DESTINATION_URL:-}
-      - DEFAULT_FPS=${DEFAULT_FPS:-}
-      # Camera-specific FPS: use CAMERA_ID_FPS (e.g., CAM1_FPS=15.0)
-    
+      - CAMERAS_CONFIG_PATH=/app/config/cameras.yaml
+      - SENDER_KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS:-localhost:9092}
+      - SENDER_MINIO_ENDPOINT=${MINIO_ENDPOINT:-localhost:9000}
     network_mode: host
-    
     deploy:
       resources:
         limits:
-          cpus: '2'
+          cpus: "2"
           memory: 2G
         reservations:
-          cpus: '0.5'
+          cpus: "0.5"
           memory: 512M
+

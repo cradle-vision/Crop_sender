@@ -5,13 +5,11 @@
 echo "Installing dependencies..."
 pip3 install -r requirements.txt
 
-echo "Generating gRPC code from proto file..."
-python3 -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. snapshot_service.proto
-
 if [ $? -eq 0 ]; then
     echo "Setup completed successfully!"
-    echo "Run with: python3 main_agent.py"
+    echo "Copy .env.example to .env and set Kafka (and optionally MinIO)."
+    echo "Run with: ./run.sh or python3 sender/main_agent.py"
 else
-    echo "Error generating gRPC code"
+    echo "Error installing dependencies"
     exit 1
 fi

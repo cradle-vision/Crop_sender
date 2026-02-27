@@ -1,6 +1,6 @@
-grpcio
-grpcio-tools
-protobuf
+confluent-kafka
+minio
+python-dotenv
 opencv-python
 opencv-contrib-python
 numpy
