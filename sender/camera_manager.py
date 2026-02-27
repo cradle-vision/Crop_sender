@@ -75,8 +75,9 @@ class CameraManager:
                                  ('companyName', 'company_name'), ('buildingName', 'building_name')]:
                 if camel in out and snake not in out:
                     out[snake] = out[camel]
-            # camera_id: backend uses device_id or id
-            if 'id' in out and 'camera_id' not in out:
+            # camera_id: БЕРЁМ ИМЕННО id из backend (основной ключ камеры),
+            # а device_id используем только как fallback, если id нет.
+            if 'id' in out:
                 out['camera_id'] = str(out['id'])
             elif 'device_id' in out and 'camera_id' not in out:
                 out['camera_id'] = str(out['device_id'])
