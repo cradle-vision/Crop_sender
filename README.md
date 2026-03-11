@@ -76,3 +76,15 @@ Sender_Crop/
 
 - **Без MinIO:** сообщение в топике (JSON): `camera_id`, `timestamp` (ms), `format` ("jpeg"), `image_base64`. Backend декодирует base64 → JPEG и отправляет в Triton.
 - **С MinIO** (`minio.enabled: true` или `MINIO_ENABLED=true`): crop загружается в бакет MinIO, в Kafka только метаданные: `camera_id`, `timestamp`, `format`, `bucket`, `object_key`. Backend по `object_key` скачивает объект из MinIO и отправляет в Triton (меньше трафика в Kafka).
+
+## Отправка snapshot на SmartCamera
+
+При старте для каждой камеры один раз отправляется **исходный кадр** на бэкенд; бэкенд сохраняет его в MinIO и обновляет поле `snapshot_url` у смарт-камеры. Далее, при наличии ROI/детекции, могут отправляться дополнительные кадры (кропы) той же камеры.
+
+- **Эндпоинт:** `POST /company/{company_id}/smartcamera/{smartcamera_id}/snapshot`
+- **Авторизация:** `Authorization: Bearer <token>` — используется тот же токен, что и для `BACKEND_CAMERAS_URL` (через `BACKEND_CAMERAS_TOKEN` или `BACKEND_CAMERAS_USERNAME`/`BACKEND_CAMERAS_PASSWORD` + `BACKEND_TOKEN_URL`).
+- **Тело:** `multipart/form-data`, поле `file` — файл изображения (JPEG).
+
+Отправка выполняется только если задан **BACKEND_CAMERAS_URL** и у камеры в конфиге есть **company_id** (из ответа backend или из `cameras.yaml`). При успешном ответе 200 в лог выводится возвращённый `snapshot_url`. При 401 выводится сообщение о неверном или отсутствующем bearer‑токене; в этом случае отправка будет повторена при следующем кадре.
+
+Конфигурация ROI по смарт-камерам может запрашиваться отдельно по API `POST /company/{company_id}/smartcamera/config` (см. документацию API).
