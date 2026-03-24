@@ -238,6 +238,11 @@ class MainAgent:
         """Start all agents"""
         print("[Main Agent] Starting snapshot sending system...")
         
+        # Connect to Kafka (create producer) for ROI crops
+        if not self.sender_agent.connect():
+            print("[Main Agent] Failed to connect to Kafka")
+            return False
+        
         # Start capture for all cameras
         for camera_id, capture_agent in self.capture_agents.items():
             try:
@@ -269,7 +274,7 @@ class MainAgent:
         return True
     
     def _on_frame_captured(self, frame, timestamp: float, camera_id: str):
-        """Detect persons, crop, publish each crop to Kafka (CPU person detection only)."""
+        """Detect persons, crop, publish each crop to Kafka (CPU person detection only), plus one-time initial snapshot to backend."""
         if not self.running:
             return
         camera = self.camera_manager.get_camera(camera_id) if hasattr(self, "camera_manager") else None
@@ -283,13 +288,32 @@ class MainAgent:
                     self._snapshot_sent.add(camera_id)
             except Exception as e:
                 print(f"[Main Agent] Initial snapshot upload error for camera {camera_id}: {e}")
+        # Apply ROI from backend (camera_roi) if present and valid
+        frame_for_detection = frame
+        if camera and hasattr(camera, "roi_x") and camera.roi_x is not None and hasattr(camera, "roi_width") and camera.roi_width is not None:
+            try:
+                h, w = frame.shape[:2]
+                x = max(0, int(camera.roi_x))
+                y = max(0, int(getattr(camera, "roi_y", 0) or 0))
+                rw = max(0, int(camera.roi_width))
+                rh = max(0, int(getattr(camera, "roi_height", 0) or 0))
+                if rw > 0 and rh > 0:
+                    x1 = min(x, w - 1)
+                    y1 = min(y, h - 1)
+                    x2 = min(x + rw, w)
+                    y2 = min(y + rh, h)
+                    if x2 > x1 and y2 > y1:
+                        frame_for_detection = frame[y1:y2, x1:x2]
+            except Exception as e:
+                print(f"[Main Agent] ROI compute error for camera {camera_id}: {e}")
+
         rects = detect_persons(
-            frame,
+            frame_for_detection,
             model_path=self.person_model_path,
             conf_threshold=self.person_conf,
             iou_threshold=self.person_iou,
         )
-        crops = crop_persons(frame, rects)
+        crops = crop_persons(frame_for_detection, rects)
 
         # Optional company/building/camera metadata for MinIO path and Kafka payload
         company_id = getattr(camera, "company_id", None) if camera else None
@@ -301,10 +325,16 @@ class MainAgent:
         if not crops:
             return
         for crop_img in crops:
-            try:
-                self._send_roi_snapshot(crop_img, timestamp, camera_id, camera)
-            except Exception as e:
-                print(f"[Main Agent] ROI snapshot upload error for camera {camera_id}: {e}")
+            self.sender_agent.send_snapshot(
+                crop_img,
+                timestamp,
+                camera_id,
+                company_id,
+                building_id,
+                company_name,
+                building_name,
+                camera_name,
+            )
     
     def _send_initial_snapshot(self, frame, timestamp: float, camera_id: str, camera) -> bool:
         """Send one original snapshot per camera to backend /company/{company_id}/smartcamera/{smartcamera_id}/snapshot.
@@ -377,53 +407,6 @@ class MainAgent:
             print(f"[Main Agent] Request error while uploading initial snapshot for camera {camera_id}: {e}")
             return False
     
-    def _send_roi_snapshot(self, frame, timestamp: float, camera_id: str, camera) -> None:
-        """Send processed ROI snapshot (crop) directly to backend /company/{company_id}/smartcamera/{smartcamera_id}/snapshot.
-        Unlike _send_initial_snapshot, this can be called many times per camera."""
-        if not HAS_REQUESTS:
-            print("[Main Agent] Python package 'requests' not installed; skip ROI snapshot upload")
-            return
-        if not self.backend_snapshot_base_url:
-            print("[Main Agent] backend_snapshot_base_url is not set; skip ROI snapshot upload")
-            return
-        company_id = getattr(camera, "company_id", None)
-        smartcamera_id = getattr(camera, "camera_id", None) or camera_id
-        if not company_id or not smartcamera_id:
-            print(f"[Main Agent] Missing company_id or smartcamera_id for camera {camera_id}; skip ROI snapshot upload")
-            return
-        try:
-            company_id_str = str(company_id).strip()
-            smartcamera_id_str = str(smartcamera_id).strip()
-        except Exception:
-            return
-        if not company_id_str or not smartcamera_id_str:
-            print(f"[Main Agent] Empty company_id or smartcamera_id after str() for camera {camera_id}; skip ROI snapshot upload")
-            return
-        url = (
-            self.backend_snapshot_base_url.rstrip("/")
-            + f"/company/{company_id_str}/smartcamera/{smartcamera_id_str}/snapshot"
-        )
-        if not self._backend_bearer_token:
-            print(f"[Main Agent] No backend bearer token; sending ROI snapshot for camera {camera_id} without Authorization header")
-        else:
-            print(f"[Main Agent] Sending ROI snapshot for camera {camera_id} -> {url} with bearer token")
-        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), self.sender_agent.jpeg_quality if hasattr(self, "sender_agent") and hasattr(self.sender_agent, "jpeg_quality") else 90]
-        success, buf = cv2.imencode(".jpg", frame, encode_param)
-        if not success:
-            return
-        data = buf.tobytes()
-        headers = None
-        if self._backend_bearer_token:
-            headers = {"Authorization": f"Bearer {self._backend_bearer_token}"}
-        files = {
-            "file": ("roi.jpg", data, "image/jpeg"),
-        }
-        try:
-            resp = requests.post(url, headers=headers, files=files, timeout=5)
-            if resp.status_code != 200:
-                return
-        except Exception:
-            return
     
     def stop(self):
         """Stop all agents"""
@@ -436,6 +419,8 @@ class MainAgent:
                 capture_agent.stop()
             except Exception as e:
                 print(f"[Main Agent] Error stopping camera {camera_id}: {e}")
+        
+        self.sender_agent.disconnect()
         
         print("[Main Agent] System stopped")
     

@@ -1,9 +1,18 @@
 import argparse
+import os
 import time
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 
 import cv2
 import yaml
+
+try:
+    import requests
+
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
 
 
 def load_camera_from_yaml(cfg_path: str, camera_id: str | None = None) -> dict:
@@ -48,6 +57,54 @@ def build_source_url(cam: dict) -> str:
         return f"rtsp://{username}:{password}@{ip}:{port}{path}"
     else:
         return f"rtsp://{ip}:{port}{path}"
+
+
+def _env(key: str, default: str = "") -> str:
+    v = os.getenv(key)
+    return v.strip() if v else default
+
+
+def _fetch_backend_token(token_url: str, username: str, password: str, timeout: float = 10.0) -> str | None:
+    """Получить bearer-токен так же, как это делает backend (OAuth2-style)."""
+    if not HAS_REQUESTS:
+        return None
+    try:
+        data = {
+            "grant_type": "",
+            "username": username,
+            "password": password,
+            "scope": "camera:read",
+            "client_id": "",
+            "client_secret": "",
+        }
+        resp = requests.post(token_url, data=data, timeout=timeout)
+        resp.raise_for_status()
+        out = resp.json()
+        if isinstance(out, str):
+            token = out.strip() or None
+        elif isinstance(out, dict):
+            token = out.get("access_token") or out.get("token")
+            if token is None and isinstance(out.get("data"), dict):
+                token = out["data"].get("access_token") or out["data"].get("token")
+        else:
+            token = None
+        return str(token).strip() if token else None
+    except Exception:
+        return None
+
+
+def _backend_base_url_from_env() -> str | None:
+    """Из BACKEND_CAMERAS_URL берём только scheme+host для snapshot-эндпоинта."""
+    raw = _env("BACKEND_CAMERAS_URL")
+    if not raw:
+        return None
+    try:
+        parsed = urlparse(raw)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
+    except Exception:
+        return None
+    return None
 
 
 def main() -> None:
@@ -98,6 +155,53 @@ def main() -> None:
     # save with max JPEG quality to see "as is"
     cv2.imwrite(str(out_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
     print(f"[Grab] Saved frame to {out_path}, shape={frame.shape}")
+
+    # Дополнительно: отправить этот кадр как snapshot на backend (один раз, вручную, без Kafka/MinIO).
+    # Используются company_id и camera_id из cameras.yaml + BACKEND_CAMERAS_URL/BACKEND_TOKEN_URL/логин/пароль.
+    company_id = cam_cfg.get("company_id")
+    if not company_id:
+        print("[Grab] company_id not set in cameras.yaml; skip backend snapshot upload")
+        return
+    base_url = _backend_base_url_from_env()
+    if not base_url:
+        print("[Grab] BACKEND_CAMERAS_URL is not set or invalid; skip backend snapshot upload")
+        return
+    if not HAS_REQUESTS:
+        print("[Grab] Python package 'requests' not installed; skip backend snapshot upload")
+        return
+
+    company_id_str = str(company_id).strip()
+    smartcamera_id_str = str(cam_id).strip()
+    if not company_id_str or not smartcamera_id_str:
+        print("[Grab] Empty company_id or camera_id; skip backend snapshot upload")
+        return
+
+    url = base_url.rstrip("/") + f"/company/{company_id_str}/smartcamera/{smartcamera_id_str}/snapshot"
+
+    # Bearer-токен: BACKEND_CAMERAS_TOKEN или получаем через BACKEND_TOKEN_URL + BACKEND_CAMERAS_USERNAME/PASSWORD.
+    token = _env("BACKEND_CAMERAS_TOKEN")
+    if not token:
+        username = _env("BACKEND_CAMERAS_USERNAME")
+        password = _env("BACKEND_CAMERAS_PASSWORD")
+        token_url = _env("BACKEND_TOKEN_URL")
+        if username and password and token_url:
+            token = _fetch_backend_token(token_url, username, password) or ""
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    ok_enc, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    if not ok_enc:
+        print("[Grab] Failed to encode frame as JPEG; skip backend snapshot upload")
+        return
+    data = buf.tobytes()
+    files = {"file": ("snapshot.jpg", data, "image/jpeg")}
+    try:
+        print(f"[Grab] Sending snapshot to backend: {url}")
+        resp = requests.post(url, headers=headers or None, files=files, timeout=10)
+        print(f"[Grab] Backend response: {resp.status_code} {resp.text[:200]!r}")
+    except Exception as e:
+        print(f"[Grab] Error sending snapshot to backend: {e}")
 
 
 if __name__ == "__main__":

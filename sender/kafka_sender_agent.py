@@ -125,8 +125,8 @@ class KafkaSenderAgent:
         building_name = _sanitize(building_name)
         camera_name = _sanitize(camera_name)
         try:
-            # 1. JPEG encode
-            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
+            # 1. JPEG encode (фиксированное максимальное качество; не зависит от KAFKA_JPEG_QUALITY)
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 100]
             success, buf = cv2.imencode(".jpg", frame, encode_param)
             if not success:
                 print("[Kafka Sender Agent] Image encode error")
