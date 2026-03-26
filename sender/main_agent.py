@@ -238,7 +238,7 @@ class MainAgent:
         """Start all agents"""
         print("[Main Agent] Starting snapshot sending system...")
         
-        # Connect to Kafka (create producer) for ROI crops
+        # Connect to Kafka (create producer) for person crops
         if not self.sender_agent.connect():
             print("[Main Agent] Failed to connect to Kafka")
             return False
@@ -288,32 +288,30 @@ class MainAgent:
                     self._snapshot_sent.add(camera_id)
             except Exception as e:
                 print(f"[Main Agent] Initial snapshot upload error for camera {camera_id}: {e}")
-        # Apply ROI from backend (camera_roi) if present and valid
-        frame_for_detection = frame
-        if camera and hasattr(camera, "roi_x") and camera.roi_x is not None and hasattr(camera, "roi_width") and camera.roi_width is not None:
+        line_params = None
+        if camera:
             try:
-                h, w = frame.shape[:2]
-                x = max(0, int(camera.roi_x))
-                y = max(0, int(getattr(camera, "roi_y", 0) or 0))
-                rw = max(0, int(camera.roi_width))
-                rh = max(0, int(getattr(camera, "roi_height", 0) or 0))
-                if rw > 0 and rh > 0:
-                    x1 = min(x, w - 1)
-                    y1 = min(y, h - 1)
-                    x2 = min(x + rw, w)
-                    y2 = min(y + rh, h)
-                    if x2 > x1 and y2 > y1:
-                        frame_for_detection = frame[y1:y2, x1:x2]
+                vals = (
+                    getattr(camera, "line_x1", None),
+                    getattr(camera, "line_y1", None),
+                    getattr(camera, "line_x2", None),
+                    getattr(camera, "line_y2", None),
+                    getattr(camera, "inside_x", None),
+                    getattr(camera, "inside_y", None),
+                )
+                is_active = getattr(camera, "line_active", True)
+                if is_active and all(v is not None for v in vals):
+                    line_params = tuple(int(v) for v in vals)
             except Exception as e:
-                print(f"[Main Agent] ROI compute error for camera {camera_id}: {e}")
-
+                print(f"[Main Agent] Line config parse error for camera {camera_id}: {e}")
         rects = detect_persons(
-            frame_for_detection,
+            frame,
             model_path=self.person_model_path,
             conf_threshold=self.person_conf,
             iou_threshold=self.person_iou,
+            line_params=line_params,
         )
-        crops = crop_persons(frame_for_detection, rects)
+        crops = crop_persons(frame, rects)
 
         # Optional company/building/camera metadata for MinIO path and Kafka payload
         company_id = getattr(camera, "company_id", None) if camera else None

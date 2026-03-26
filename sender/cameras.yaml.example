@@ -17,6 +17,14 @@ cameras:
     height: 720
     enabled: true
     description: "Камера на входной двери"
+    # Optional tripwire line for person_detect (--line + --inside_point)
+    line_x1: 0
+    line_y1: 200
+    line_x2: 1280
+    line_y2: 200
+    inside_x: 640
+    inside_y: 150
+    line_active: true
   
   # RTSP камера без аутентификации
   - camera_id: "ip_camera_2"

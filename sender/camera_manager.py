@@ -31,12 +31,14 @@ class CameraInfo:
     building_id: Optional[str] = None
     company_name: Optional[str] = None
     building_name: Optional[str] = None
-    # Optional ROI rectangle from backend (camera_roi)
-    roi_x: Optional[int] = None
-    roi_y: Optional[int] = None
-    roi_width: Optional[int] = None
-    roi_height: Optional[int] = None
-    roi_active: Optional[bool] = None
+    # Optional tripwire line config (from cameras.yaml/backend)
+    line_x1: Optional[int] = None
+    line_y1: Optional[int] = None
+    line_x2: Optional[int] = None
+    line_y2: Optional[int] = None
+    inside_x: Optional[int] = None
+    inside_y: Optional[int] = None
+    line_active: Optional[bool] = None
 
 
 class CameraManager:
@@ -81,24 +83,28 @@ class CameraManager:
                                  ('companyName', 'company_name'), ('buildingName', 'building_name')]:
                 if camel in out and snake not in out:
                     out[snake] = out[camel]
-            # camera_roi: optional ROI rectangle
-            roi = out.get('camera_roi')
-            if isinstance(roi, dict):
+            # camera_line: optional line filter config
+            line = out.get('camera_line')
+            if isinstance(line, dict):
                 try:
-                    rx = int(roi.get('roi_x')) if roi.get('roi_x') is not None else None
-                    ry = int(roi.get('roi_y')) if roi.get('roi_y') is not None else None
-                    rw = int(roi.get('roi_width')) if roi.get('roi_width') is not None else None
-                    rh = int(roi.get('roi_height')) if roi.get('roi_height') is not None else None
+                    x1 = int(line.get('line_x1')) if line.get('line_x1') is not None else None
+                    y1 = int(line.get('line_y1')) if line.get('line_y1') is not None else None
+                    x2 = int(line.get('line_x2')) if line.get('line_x2') is not None else None
+                    y2 = int(line.get('line_y2')) if line.get('line_y2') is not None else None
+                    ix = int(line.get('inside_x')) if line.get('inside_x') is not None else None
+                    iy = int(line.get('inside_y')) if line.get('inside_y') is not None else None
                 except (TypeError, ValueError):
-                    rx = ry = rw = rh = None
-                is_active = roi.get('is_active')
-                if rx is not None and ry is not None and rw is not None and rh is not None and rw > 0 and rh > 0:
-                    out.setdefault('roi_x', rx)
-                    out.setdefault('roi_y', ry)
-                    out.setdefault('roi_width', rw)
-                    out.setdefault('roi_height', rh)
-                    if 'roi_active' not in out and is_active is not None:
-                        out['roi_active'] = bool(is_active)
+                    x1 = y1 = x2 = y2 = ix = iy = None
+                is_active = line.get('is_active')
+                if None not in (x1, y1, x2, y2, ix, iy):
+                    out.setdefault('line_x1', x1)
+                    out.setdefault('line_y1', y1)
+                    out.setdefault('line_x2', x2)
+                    out.setdefault('line_y2', y2)
+                    out.setdefault('inside_x', ix)
+                    out.setdefault('inside_y', iy)
+                    if 'line_active' not in out and is_active is not None:
+                        out['line_active'] = bool(is_active)
             # camera_id: БЕРЁМ ИМЕННО id из backend (основной ключ камеры),
             # а device_id используем только как fallback, если id нет.
             if 'id' in out:
