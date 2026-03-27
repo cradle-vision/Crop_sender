@@ -1,0 +1,43 @@
+# Streaming Agent — скопируйте в config/streaming-agent.yaml (или укажите STREAMING_AGENT_CONFIG).
+# Секреты: STREAMING_AGENT_TOKEN в .env (не коммитить).
+
+agent_id: shop-12
+
+backend_url: ws://127.0.0.1:8000/ws/agent
+
+auth_token: ""
+
+heartbeat_interval_sec: 15.0
+reconnect_backoff_initial_sec: 2.0
+reconnect_backoff_max_sec: 60.0
+idle_grace_sec: 10.0
+
+# true: при viewer_leave с нулём зрителей — отложенная остановка. false: только stop_stream с backend.
+viewer_idle_stop: false
+
+# Режим доставки:
+# - local_webrtc — только MediaMTX на объекте (WHEP).
+# - upstream_rtmp — пуш на центральный RTMP (NAT на объекте не нужен; 200+ агентов).
+# - both — оба (две вытяжки с камеры).
+delivery: local_webrtc
+
+# Центральный ingest (заполнять при delivery: upstream_rtmp или both)
+upstream:
+  # Пример: rtmp://USER:PASS@ingest.example.com:1935/live/{stream_key}
+  # stream_key = agent_id + "_" + camera_id (см. код make_stream_key)
+  rtmp_url_template: ""
+  # URL для фронта после транскодинга на сервере (шаблон)
+  playback_url_template: ""
+  ffmpeg_path: ffmpeg
+  ffmpeg_extra_args: []
+
+mediamtx:
+  api_url: http://127.0.0.1:9997
+  public_webrtc_base: http://127.0.0.1:8889
+  rtsp_transport: tcp
+
+cameras:
+  - id: cam1
+    rtsp_url: rtsp://user:pass@192.168.1.10/stream1
+  - id: cam2
+    rtsp_url: rtsp://user:pass@192.168.1.11/stream1

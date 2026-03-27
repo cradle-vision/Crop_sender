@@ -40,6 +40,63 @@ docker-compose build && docker-compose up -d
 
 В образ копируются `cpu-person-detection/` (бинарник `person_detect`, `lib/`, модель). Конфиг — только из `.env`; камеры — `config/cameras.yaml` (монтируется в контейнер).
 
+## Streaming Agent (RTSP → MediaMTX → WebRTC)
+
+Отдельный edge-режим: **не** использует Kafka/person_detect. Агент подключается к центральному backend по **WebSocket** (команды, heartbeat). Два варианта доставки видео на фронт — см. `delivery` в конфиге:
+
+| `delivery` | Смысл |
+|------------|--------|
+| `local_webrtc` | Только **MediaMTX** на объекте, браузер — **WHEP** (нужен доступ к порту 8889 с клиента). |
+| `upstream_rtmp` | Пуш **RTSP → RTMP** на **ваш центральный сервер** через FFmpeg (исходящее соединение с объекта — **без белого IP** на магазине). Фронт смотрит уже **HLS/WebRTC с центра** (как настроите ingest). |
+| `both` | И WHEP локально, и пуш на центр (две вытяжки с камеры). |
+
+### Много объектов (например 200 агентов)
+
+- На **каждом** объекте — свой `agent_id` и свой `upstream.rtmp_url_template` (часто один шаблон и общий ingest-хост; различие — в **`stream_key`** = `{agent_id}_{camera_id}`).
+- **Backend** по WebSocket по-прежнему только управляет; **видео** идёт на центральный ingest по RTMP, дальше — ваша схема (nginx-rtmp, MediaMTX, SRS, облако): транскод, HLS, выдача фронту по HTTPS.
+- В `stream_status` агент присылает `stream_key`, опционально **`playback_url`** (если задан `upstream.playback_url_template`) — фронт может открыть плеер по этому URL.
+- Нагрузка: с каждого объекта вверх уходит ~2–4 Мбит/с на активную камеру; 200 объектов × N камер нужно закладывать в **пропускную способность ingest** и шардировать ingest по регионам/хостам при необходимости.
+
+### Конфигурация
+
+- Пример: [`streaming_agent/streaming-agent.yaml.example`](streaming_agent/streaming-agent.yaml.example) — скопируйте в `config/streaming-agent.yaml` или правьте example (в `docker-compose` по умолчанию смонтирован example).
+- Переменные: `STREAMING_AGENT_CONFIG`, `STREAMING_AGENT_ID`, `STREAMING_BACKEND_URL`, `STREAMING_AGENT_TOKEN`, `STREAMING_DELIVERY`, `STREAMING_UPSTREAM_RTMP_URL_TEMPLATE`, `STREAMING_UPSTREAM_PLAYBACK_URL_TEMPLATE`, `MEDIAMTX_API_URL`, `MEDIAMTX_PUBLIC_WEBRTC_BASE`, `STREAMING_HEARTBEAT_INTERVAL_SEC`, `STREAMING_IDLE_GRACE_SEC` (см. `.env.example`).
+
+### Запуск локально
+
+```bash
+# зависимости: websockets, psutil (уже в requirements.txt)
+python3 -m streaming_agent.main --config streaming_agent/streaming-agent.yaml.example
+```
+
+### Запуск Docker (MediaMTX + агент)
+
+```bash
+docker compose up -d mediamtx streaming-agent
+```
+
+- API MediaMTX: `http://127.0.0.1:9997`
+- WHEP/WebRTC HTTP: `http://127.0.0.1:8889` — в конфиге агента `mediamtx.public_webrtc_base` должен быть **доступен браузеру** (часто `http://<хост>:8889`).
+- Агент ходит в MediaMTX по `http://mediamtx:9997` из контейнера.
+
+### Протокол WebSocket (MVP)
+
+Исходящие: `register`, `heartbeat`, `stream_status` (при старте/ошибке/остановке потока).
+
+Входящие: `start_stream`, `stop_stream`, `viewer_join`, `viewer_leave`, `webrtc_signal` (зарезервировано), `ping` → `pong`.
+
+После `start_stream` в `stream_status` приходят, в зависимости от режима: `whep_url` (локальный WebRTC), `stream_key`, `playback_url` (центральный просмотр), поле `delivery`.
+
+### Smoke-проверка без backend
+
+1. Поднять только MediaMTX: `docker compose up -d mediamtx`.
+2. Добавить путь вручную:  
+   `curl -s -X POST http://127.0.0.1:9997/v3/config/paths/add/cam1 -H 'Content-Type: application/json' -d '{"source":"rtsp://..."}'`  
+   (или запустить агент с тестовым backend — см. ниже).
+3. Проверить список путей: `curl -s http://127.0.0.1:9997/v3/paths/list`.
+
+Для полного цикла нужен backend с WebSocket, принимающим `register` и шлющим `start_stream`.
+
 ## Типы камер
 
 - **RTSP**: `rtsp://[user:pass@]ip:port/path`
@@ -64,6 +121,15 @@ Sender_Crop/
 │   ├── kafka_sender_agent.py   # Публикация crop в Kafka
 │   ├── camera_manager.py       # Камеры из cameras.yaml или backend
 │   └── cameras.yaml.example
+├── streaming_agent/            # RTSP → MediaMTX, WS control
+│   ├── main.py
+│   ├── config.py
+│   ├── signaling_client.py
+│   ├── stream_manager.py
+│   ├── mediamtx_client.py
+│   ├── health_monitor.py
+│   └── streaming-agent.yaml.example
+├── mediamtx.yml                # конфиг MediaMTX для docker-compose
 ├── .env.example    # образец для .env (Kafka, MinIO, RTSP, FPS)
 ├── docker-compose.yml
 ├── Dockerfile
