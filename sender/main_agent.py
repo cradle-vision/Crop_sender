@@ -108,7 +108,6 @@ class MainAgent:
                     self.camera_manager.config_file = fallback_path
                     self.camera_manager.load_cameras()
 
-        # Kafka — приоритет: SENDER_KAFKA_* (из docker-compose/.env), затем KAFKA_*
         bootstrap_servers = _env('KAFKA_BOOTSTRAP_SERVERS') or 'localhost:9092'
         bootstrap_servers = str(bootstrap_servers).replace('http://', '').replace('https://', '').rstrip('/')
 
@@ -116,7 +115,6 @@ class MainAgent:
         jpeg_quality = int(_env_float('KAFKA_JPEG_QUALITY', 95))
         print(f"[Main Agent] Kafka: {bootstrap_servers}, topic={topic}")
 
-        # MinIO — только из .env
         minio_enabled = _env_bool('MINIO_ENABLED', True)
         minio_config = {
             'enabled': minio_enabled,

@@ -156,8 +156,6 @@ def main() -> None:
     cv2.imwrite(str(out_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
     print(f"[Grab] Saved frame to {out_path}, shape={frame.shape}")
 
-    # Дополнительно: отправить этот кадр как snapshot на backend (один раз, вручную, без Kafka/MinIO).
-    # Используются company_id и camera_id из cameras.yaml + BACKEND_CAMERAS_URL/BACKEND_TOKEN_URL/логин/пароль.
     company_id = cam_cfg.get("company_id")
     if not company_id:
         print("[Grab] company_id not set in cameras.yaml; skip backend snapshot upload")

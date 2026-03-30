@@ -41,14 +41,14 @@ services:
     depends_on:
       - mediamtx
     volumes:
-      # Скопируйте пример в config/streaming-agent.yaml и смонтируйте его, либо правьте example ниже.
       - ./streaming_agent/streaming-agent.yaml.example:/app/config/streaming-agent.yaml:ro
     env_file:
       - .env
     environment:
       - STREAMING_AGENT_CONFIG=/app/config/streaming-agent.yaml
       - MEDIAMTX_API_URL=http://mediamtx:9997
-      # Браузер на хосте: открывайте WHEP по адресу хоста (не имени контейнера)
+      # reuse sender-crop camera list
+      - CAMERAS_CONFIG_PATH=/app/config/cameras.yaml
       - MEDIAMTX_PUBLIC_WEBRTC_BASE=${MEDIAMTX_PUBLIC_WEBRTC_BASE:-http://127.0.0.1:8889}
       - STREAMING_BACKEND_URL=${STREAMING_BACKEND_URL:-ws://host.docker.internal:8000/ws/agent}
     command: ["python3", "-m", "streaming_agent.main", "-c", "/app/config/streaming-agent.yaml"]

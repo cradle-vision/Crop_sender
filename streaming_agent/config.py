@@ -99,6 +99,77 @@ def _parse_camera(obj: dict[str, Any]) -> CameraEntry | None:
     return CameraEntry(id=cid, rtsp_url=str(url).strip())
 
 
+def _build_rtsp_url_from_camera_yaml(cam: dict[str, Any]) -> str:
+    """
+    Best-effort RTSP URL builder for sender's `config/cameras.yaml`.
+    If `source` is already present and looks like a URL, it is used as-is.
+    """
+    src = cam.get("source")
+    if isinstance(src, str) and "://" in src and src.strip():
+        return src.strip()
+
+    # Sender-crop fields:
+    ip = cam.get("ip_address") or cam.get("device_ip") or ""
+    username = cam.get("username") or cam.get("login") or ""
+    password = cam.get("password") or ""
+    port = cam.get("port") or 554
+
+    rtsp_path = cam.get("rtsp_path") or "/"
+    if rtsp_path is None:
+        rtsp_path = "/"
+    rtsp_path = str(rtsp_path).strip()
+    if not rtsp_path.startswith("/"):
+        rtsp_path = "/" + rtsp_path
+
+    if not ip:
+        return ""
+
+    if username and password:
+        return f"rtsp://{username}:{password}@{ip}:{port}{rtsp_path}"
+    return f"rtsp://{ip}:{port}{rtsp_path}"
+
+
+def _load_cameras_from_sender_cameras_yaml(path: str | Path) -> list[CameraEntry]:
+    p = Path(path)
+    if not p.is_file():
+        # Support relative config paths from project root.
+        root = Path(__file__).resolve().parent.parent
+        alt = root / p
+        if alt.is_file():
+            p = alt
+        else:
+            raise FileNotFoundError(f"sender cameras.yaml not found: {path}")
+
+    with open(p, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    cams = data.get("cameras") or []
+    if not isinstance(cams, list):
+        return []
+
+    out: list[CameraEntry] = []
+    for item in cams:
+        if not isinstance(item, dict):
+            continue
+        enabled = item.get("enabled", True)
+        if enabled is False:
+            continue
+
+        cid = item.get("camera_id") or item.get("id")
+        if cid is None:
+            continue
+        cid_str = str(cid).strip()
+        if not cid_str:
+            continue
+
+        rtsp_url = _build_rtsp_url_from_camera_yaml(item)
+        if not rtsp_url:
+            continue
+
+        out.append(CameraEntry(id=cid_str, rtsp_url=rtsp_url))
+    return out
+
+
 def load_config(path: str | Path | None = None) -> AgentConfig:
     """
     Load YAML or JSON. Path: STREAMING_AGENT_CONFIG or arg or default
@@ -146,11 +217,17 @@ def load_config(path: str | Path | None = None) -> AgentConfig:
         delivery = "local_webrtc"
 
     cameras: list[CameraEntry] = []
-    for item in data.get("cameras") or []:
+    raw_cams = data.get("cameras") or []
+    for item in raw_cams:
         if isinstance(item, dict):
             c = _parse_camera(item)
             if c:
                 cameras.append(c)
+
+    # If cameras[] missing/empty in streaming-agent config, reuse sender's config/cameras.yaml.
+    if not cameras:
+        sender_cameras_path = _env("CAMERAS_CONFIG_PATH", "config/cameras.yaml")
+        cameras = _load_cameras_from_sender_cameras_yaml(sender_cameras_path)
 
     cfg = AgentConfig(
         agent_id=str(data.get("agent_id") or _env("STREAMING_AGENT_ID") or "edge-1"),

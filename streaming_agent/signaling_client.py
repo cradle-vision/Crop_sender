@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 try:
     import websockets
+    from websockets.exceptions import ConnectionClosed
 except ImportError as e:
     raise ImportError("Install package 'websockets' for Streaming Agent") from e
 
@@ -39,7 +40,12 @@ class SignalingClient:
         headers: list[tuple[str, str]] = []
         if self.cfg.auth_token:
             headers.append(("Authorization", f"Bearer {self.cfg.auth_token}"))
-        kwargs: dict[str, Any] = {}
+        kwargs: dict[str, Any] = {
+            "ping_interval": None,
+            "ping_timeout": 60,
+            "close_timeout": 10,
+            "open_timeout": 30,
+        }
         if headers:
             # websockets >= 10
             kwargs["additional_headers"] = headers
@@ -135,12 +141,18 @@ class SignalingClient:
                 kwargs = self._connect_kwargs()
                 async with connect_fn(uri, **kwargs) as ws:
                     self._ws = ws
+                    cams = self.stream_manager.camera_ids()
                     await self.send_json(
                         {
                             "type": "register",
                             "agent_id": self.cfg.agent_id,
-                            "cameras": self.stream_manager.camera_ids(),
+                            "cameras": cams,
                         }
+                    )
+                    logger.info(
+                        "WS connected, register sent: agent_id=%s cameras=%s",
+                        self.cfg.agent_id,
+                        cams,
                     )
                     self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
                     attempt = 0
@@ -160,12 +172,31 @@ class SignalingClient:
                             self._heartbeat_task = None
             except asyncio.CancelledError:
                 raise
+            except ConnectionClosed as e:
+                if self._stopped.is_set():
+                    break
+                delay = self._next_backoff_sec(attempt)
+                attempt += 1
+                logger.warning(
+                    "WebSocket closed: attempt=%s code=%s reason=%r (retry in %ss)",
+                    attempt,
+                    getattr(e, "code", None),
+                    getattr(e, "reason", "") or "",
+                    delay,
+                )
+                await asyncio.sleep(delay)
             except Exception as e:
                 if self._stopped.is_set():
                     break
                 delay = self._next_backoff_sec(attempt)
                 attempt += 1
-                logger.warning("%s WebSocket error: %s (retry in %ss)", attempt, e, delay)
+                logger.warning(
+                    "%s WebSocket error: %s: %s (retry in %ss)",
+                    attempt,
+                    type(e).__name__,
+                    e,
+                    delay,
+                )
                 await asyncio.sleep(delay)
 
     def stop(self) -> None:

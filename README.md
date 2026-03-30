@@ -62,6 +62,16 @@ docker-compose build && docker-compose up -d
 - Пример: [`streaming_agent/streaming-agent.yaml.example`](streaming_agent/streaming-agent.yaml.example) — скопируйте в `config/streaming-agent.yaml` или правьте example (в `docker-compose` по умолчанию смонтирован example).
 - Переменные: `STREAMING_AGENT_CONFIG`, `STREAMING_AGENT_ID`, `STREAMING_BACKEND_URL`, `STREAMING_AGENT_TOKEN`, `STREAMING_DELIVERY`, `STREAMING_UPSTREAM_RTMP_URL_TEMPLATE`, `STREAMING_UPSTREAM_PLAYBACK_URL_TEMPLATE`, `MEDIAMTX_API_URL`, `MEDIAMTX_PUBLIC_WEBRTC_BASE`, `STREAMING_HEARTBEAT_INTERVAL_SEC`, `STREAMING_IDLE_GRACE_SEC` (см. `.env.example`).
 
+### Авторизация WebSocket
+
+- Ключ: **`POST /api/stream/agents`** (пользователь с scope **`stream:write`**) → в ответе **`api_key`** → в агенте **`STREAMING_AGENT_TOKEN`** / `auth_token` и заголовок **`Authorization: Bearer <api_key>`** при подключении.
+- Агент в БД должен быть **активен**, **`agent_id`** совпадать. Ротация ключа = обновить конфиг и перезапуск. **403** = обычно неверный/устаревший ключ или неактивный агент (не путать с `ws`/`wss`). Подробно: [`docs/streaming_agent_auth.md`](docs/streaming_agent_auth.md).
+
+### Источник камер (без дубликатов)
+
+- `streaming-agent` читает камеры из вашего уже существующего [`config/cameras.yaml`](config/cameras.yaml) (через env `CAMERAS_CONFIG_PATH`).
+- Поэтому в `streaming-agent.yaml` секция `cameras:` не обязательна.
+
 ### Запуск локально
 
 ```bash
@@ -130,6 +140,9 @@ Sender_Crop/
 │   ├── health_monitor.py
 │   └── streaming-agent.yaml.example
 ├── mediamtx.yml                # конфиг MediaMTX для docker-compose
+├── docs/
+│   ├── streaming_backend_frontend_plan.md
+│   └── streaming_agent_auth.md  # api_key, Bearer, 403
 ├── .env.example    # образец для .env (Kafka, MinIO, RTSP, FPS)
 ├── docker-compose.yml
 ├── Dockerfile

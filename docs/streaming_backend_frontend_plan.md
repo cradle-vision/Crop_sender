@@ -20,8 +20,10 @@
 
 ### Подключение
 
-- **WSS** в проде (`wss://api.example.com/ws/agents`).
-- Заголовок **`Authorization: Bearer <token>`** — выдаёте агенту при регистрации объекта (долгоживущий API key / JWT).
+- **WSS** в проде (например `wss://api.example.com/ws/agents` — путь как в вашем API).
+- Заголовок **`Authorization: Bearer <api_key>`** — **plain ключ** из **`POST /api/stream/agents`** (пользователь с scope **`stream:write`**). Не путать с JWT пользователя фронта или токенами других сервисов.
+- В БД: **`is_active == true`**, **`agent_id`** в сообщении `register` совпадает с записью ключа. Ротация ключа через тот же endpoint инвалидирует старый — на edge обновить `STREAMING_AGENT_TOKEN` и перезапустить агента.
+- **403** при WS чаще всего = неверный/протухший ключ или неактивный агент (не путать с ошибками TLS/порта). Подробнее: [`streaming_agent_auth.md`](streaming_agent_auth.md).
 
 ### Входящие сообщения от агента (уже есть в агенте)
 

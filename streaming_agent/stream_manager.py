@@ -270,7 +270,6 @@ class StreamManager:
             st.viewers = max(0, st.viewers - 1)
             v = st.viewers
 
-            # Не гасить поток от «лишнего» viewer_leave, если не было viewer_join (сценарий только start/stop с backend).
             if (
                 self.cfg.viewer_idle_stop
                 and prev > 0
