@@ -65,6 +65,8 @@ class UpstreamConfig:
     playback_url_template: str = ""
     ffmpeg_path: str = "ffmpeg"
     ffmpeg_extra_args: list[str] = field(default_factory=list)
+    # True: libx264 вместо copy — новые монотонные PTS/DTS (камеры с «ломаными» таймстампами / RTP cseq).
+    transcode: bool = False
 
 
 @dataclass
@@ -276,6 +278,10 @@ def load_config(path: str | Path | None = None) -> AgentConfig:
             ),
             ffmpeg_path=str(up.get("ffmpeg_path") or _env("STREAMING_FFMPEG_PATH") or "ffmpeg"),
             ffmpeg_extra_args=list(up.get("ffmpeg_extra_args") or []),
+            transcode=_env_bool(
+                "STREAMING_UPSTREAM_TRANSCODE",
+                bool(up.get("transcode", False)),
+            ),
         ),
         cameras=cameras,
     )

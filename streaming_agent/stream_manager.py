@@ -50,6 +50,7 @@ class StreamManager:
                 cfg.upstream.rtmp_url_template,
                 rtsp_transport=cfg.mediamtx.rtsp_transport,
                 extra_args=cfg.upstream.ffmpeg_extra_args,
+                transcode=cfg.upstream.transcode,
             )
 
     def camera_ids(self) -> list[str]:

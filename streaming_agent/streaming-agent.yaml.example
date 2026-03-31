@@ -36,6 +36,8 @@ upstream:
   playback_url_template: ""
   ffmpeg_path: ffmpeg
   ffmpeg_extra_args: []
+  # true — libx264 вместо copy (выше CPU), если в логах PTS/DTS invalid / RTP bad cseq при -c copy
+  transcode: false
 
 mediamtx:
   api_url: http://127.0.0.1:9997

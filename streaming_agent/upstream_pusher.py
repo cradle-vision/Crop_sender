@@ -34,12 +34,58 @@ class UpstreamPusher:
         rtmp_url_template: str,
         rtsp_transport: str = "tcp",
         extra_args: list[str] | None = None,
+        transcode: bool = False,
     ):
         self.ffmpeg_path = ffmpeg_path
         self.rtmp_url_template = rtmp_url_template
         self.rtsp_transport = rtsp_transport
         self.extra_args = extra_args or []
+        self.transcode = transcode
         self._procs: dict[str, asyncio.subprocess.Process] = {}
+
+    def _ffmpeg_args(self, rtsp_url: str, rtmp: str) -> list[str]:
+        """RTSP → FLV/RTMP. Default: copy + genpts; optional transcode for broken PTS/DTS (Hikvision, etc.)."""
+        ffmpeg = shutil.which(self.ffmpeg_path) or self.ffmpeg_path
+        # Перед -i: смягчение битых пакетов / дыр в PTS (полностью не лечит bad cseq по UDP).
+        head: list[str] = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-fflags",
+            "+genpts+discardcorrupt",
+            "-max_delay",
+            "5000000",
+            "-rtsp_transport",
+            self.rtsp_transport,
+            "-i",
+            rtsp_url,
+            "-map",
+            "0:v:0",
+        ]
+        if self.transcode:
+            mid: list[str] = [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-tune",
+                "zerolatency",
+                "-pix_fmt",
+                "yuv420p",
+                "-g",
+                "50",
+                "-keyint_min",
+                "50",
+                "-bf",
+                "0",
+                "-an",
+                "-f",
+                "flv",
+            ]
+        else:
+            mid = ["-c", "copy", "-f", "flv"]
+        return head + mid + self.extra_args + [rtmp]
 
     def active_count(self) -> int:
         return sum(1 for p in self._procs.values() if p.returncode is None)
@@ -67,7 +113,6 @@ class UpstreamPusher:
         if not self.rtmp_url_template.strip():
             return False, "upstream_rtmp_url_template_empty", {}
 
-        ffmpeg = shutil.which(self.ffmpeg_path) or self.ffmpeg_path
         sk = make_stream_key(agent_id, camera_id)
         rtmp = format_template(
             self.rtmp_url_template,
@@ -76,22 +121,12 @@ class UpstreamPusher:
             camera_id=camera_id,
         )
 
-        args = [
-            ffmpeg,
-            "-hide_banner",
-            "-loglevel",
-            "warning",
-            "-rtsp_transport",
-            self.rtsp_transport,
-            "-i",
-            rtsp_url,
-            "-c",
-            "copy",
-            "-f",
-            "flv",
-        ]
-        args.extend(self.extra_args)
-        args.append(rtmp)
+        args = self._ffmpeg_args(rtsp_url, rtmp)
+        if self.transcode:
+            logger.info(
+                "upstream transcode=libx264 (stable timestamps; higher CPU) camera=%s",
+                camera_id,
+            )
 
         try:
             proc = await asyncio.create_subprocess_exec(
