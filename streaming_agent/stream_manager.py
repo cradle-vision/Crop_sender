@@ -26,6 +26,7 @@ class _StreamState:
     rtsp_url: str
     viewers: int = 0
     active: bool = False
+    session_id: str | None = None
     stop_task: asyncio.Task[None] | None = None
 
 
@@ -69,19 +70,26 @@ class StreamManager:
             camera_id=camera_id,
         )
 
-    async def start_stream(self, camera_id: str) -> dict[str, Any]:
+    async def start_stream(
+        self, camera_id: str, session_id: str | None = None
+    ) -> dict[str, Any]:
         d = self.cfg.delivery
         if camera_id not in self._cameras:
-            return {
+            payload = {
                 "ok": False,
                 "error": f"unknown_camera:{camera_id}",
                 "camera_id": camera_id,
             }
+            if session_id:
+                payload["session_id"] = session_id
+            return payload
 
         if d in ("upstream_rtmp", "both") and not self.cfg.upstream.rtmp_url_template.strip():
             err = "upstream_rtmp_url_template_missing"
             logger.error(err)
             payload = {"ok": False, "error": err, "camera_id": camera_id}
+            if session_id:
+                payload["session_id"] = session_id
             await self._emit_status(camera_id, "error", payload)
             return payload
 
@@ -92,6 +100,8 @@ class StreamManager:
             if st is None:
                 st = _StreamState(path_name=path_name, rtsp_url=rtsp_url)
                 self._streams[camera_id] = st
+            if session_id:
+                st.session_id = session_id
 
             if st.stop_task and not st.stop_task.done():
                 st.stop_task.cancel()
@@ -102,7 +112,11 @@ class StreamManager:
                 st.stop_task = None
 
             if st.active:
-                return await self._already_running_payload(camera_id, path_name, st)
+                payload = self._already_running_payload(
+                    camera_id, path_name, st, session_id=session_id
+                )
+                await self._emit_status(camera_id, "stream_ready", payload)
+                return payload
 
         # upstream
         up_meta: dict[str, Any] = {}
@@ -117,6 +131,8 @@ class StreamManager:
                     "camera_id": camera_id,
                     "delivery": d,
                 }
+                if session_id:
+                    payload["session_id"] = session_id
                 await self._emit_status(camera_id, "error", payload)
                 return payload
 
@@ -138,6 +154,8 @@ class StreamManager:
                     "camera_id": camera_id,
                     "delivery": d,
                 }
+                if session_id:
+                    payload["session_id"] = session_id
                 await self._emit_status(camera_id, "error", payload)
                 return payload
 
@@ -157,6 +175,10 @@ class StreamManager:
             "stream_key": sk,
             "viewers": st.viewers if st else 0,
         }
+        if session_id:
+            payload["session_id"] = session_id
+        elif st and st.session_id:
+            payload["session_id"] = st.session_id
         if d in ("upstream_rtmp", "both"):
             payload.update(up_meta)
             pb = self._playback_url(camera_id)
@@ -168,10 +190,16 @@ class StreamManager:
         await self._emit_status(camera_id, "stream_ready", payload)
         return payload
 
-    async def _already_running_payload(
-        self, camera_id: str, path_name: str, st: _StreamState
+    def _already_running_payload(
+        self,
+        camera_id: str,
+        path_name: str,
+        st: _StreamState,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         d = self.cfg.delivery
+        if session_id:
+            st.session_id = session_id
         sk = make_stream_key(self.cfg.agent_id, camera_id)
         payload: dict[str, Any] = {
             "ok": True,
@@ -183,6 +211,8 @@ class StreamManager:
             "viewers": st.viewers,
             "note": "already_running",
         }
+        if st.session_id:
+            payload["session_id"] = st.session_id
         pb = self._playback_url(camera_id)
         if pb:
             payload["playback_url"] = pb
@@ -190,20 +220,30 @@ class StreamManager:
             payload["whep_url"] = self._whep_url(path_name)
         return payload
 
-    async def stop_stream(self, camera_id: str, force: bool = False) -> dict[str, Any]:
+    async def stop_stream(
+        self, camera_id: str, force: bool = False, session_id: str | None = None
+    ) -> dict[str, Any]:
         d = self.cfg.delivery
         async with self._lock:
             st = self._streams.get(camera_id)
             if not st:
-                return {"ok": True, "camera_id": camera_id, "note": "not_running"}
+                payload = {"ok": True, "camera_id": camera_id, "note": "not_running"}
+                if session_id:
+                    payload["session_id"] = session_id
+                return payload
+            if session_id:
+                st.session_id = session_id
 
             if not force and st.viewers > 0:
-                return {
+                payload = {
                     "ok": False,
                     "error": "has_viewers",
                     "camera_id": camera_id,
                     "viewers": st.viewers,
                 }
+                if st.session_id:
+                    payload["session_id"] = st.session_id
+                return payload
 
             if st.stop_task and not st.stop_task.done():
                 st.stop_task.cancel()
@@ -228,6 +268,8 @@ class StreamManager:
             "delivery": d,
             "error": mtx_err,
         }
+        if st.session_id:
+            payload["session_id"] = st.session_id
         await self._emit_status(camera_id, "stream_stopped", payload)
         return payload
 

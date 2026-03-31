@@ -79,15 +79,13 @@ docker-compose build && docker-compose up -d
 python3 -m streaming_agent.main --config streaming_agent/streaming-agent.yaml.example
 ```
 
-### Запуск Docker (MediaMTX + агент)
+### Запуск Docker (только агент)
 
 ```bash
-docker compose up -d mediamtx streaming-agent
+docker compose up -d streaming-agent
 ```
 
-- API MediaMTX: `http://127.0.0.1:9997`
-- WHEP/WebRTC HTTP: `http://127.0.0.1:8889` — в конфиге агента `mediamtx.public_webrtc_base` должен быть **доступен браузеру** (часто `http://<хост>:8889`).
-- Агент ходит в MediaMTX по `http://mediamtx:9997` из контейнера.
+- Локальный MediaMTX в этом compose отключён; поток отправляется на **центральный** ingest (режим `upstream_rtmp`).
 
 ### Протокол WebSocket (MVP)
 
@@ -99,13 +97,7 @@ docker compose up -d mediamtx streaming-agent
 
 ### Smoke-проверка без backend
 
-1. Поднять только MediaMTX: `docker compose up -d mediamtx`.
-2. Добавить путь вручную:  
-   `curl -s -X POST http://127.0.0.1:9997/v3/config/paths/add/cam1 -H 'Content-Type: application/json' -d '{"source":"rtsp://..."}'`  
-   (или запустить агент с тестовым backend — см. ниже).
-3. Проверить список путей: `curl -s http://127.0.0.1:9997/v3/paths/list`.
-
-Для полного цикла нужен backend с WebSocket, принимающим `register` и шлющим `start_stream`.
+Для полного цикла нужен backend с WebSocket, принимающим `register` и шлющим `start_stream`, и центральный ingest (MediaMTX/RTMP/HLS).
 
 ## Типы камер
 

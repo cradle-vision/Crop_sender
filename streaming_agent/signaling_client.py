@@ -71,7 +71,12 @@ class SignalingClient:
                 break
             except asyncio.TimeoutError:
                 pass
-            m = collect_metrics(self.mtx, self.stream_manager.streams_active_count())
+            mtx_for_metrics = (
+                None if self.cfg.delivery == "upstream_rtmp" else self.mtx
+            )
+            m = collect_metrics(
+                mtx_for_metrics, self.stream_manager.streams_active_count()
+            )
             await self.send_json(
                 {
                     "type": "heartbeat",
@@ -95,13 +100,19 @@ class SignalingClient:
             return
         if t == "start_stream":
             cid = msg.get("camera_id")
+            sid = msg.get("session_id")
             if cid:
-                await self.stream_manager.start_stream(str(cid))
+                await self.stream_manager.start_stream(str(cid), session_id=str(sid) if sid else None)
             return
         if t == "stop_stream":
             cid = msg.get("camera_id")
+            sid = msg.get("session_id")
             if cid:
-                await self.stream_manager.stop_stream(str(cid), force=True)
+                await self.stream_manager.stop_stream(
+                    str(cid),
+                    force=True,
+                    session_id=str(sid) if sid else None,
+                )
             return
         if t == "viewer_join":
             cid = msg.get("camera_id")

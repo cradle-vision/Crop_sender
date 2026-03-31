@@ -21,32 +21,16 @@ services:
           cpus: "0.5"
           memory: 512M
 
-  # RTSP → WebRTC (MediaMTX) + edge Streaming Agent (WebSocket control)
-  mediamtx:
-    image: bluenviron/mediamtx:1.17.0
-    container_name: mediamtx
-    restart: unless-stopped
-    volumes:
-      - ./mediamtx.yml:/mediamtx.yml:ro
-    ports:
-      - "9997:9997"
-      - "8889:8889"
-      - "8554:8554"
-      - "8189:8189/udp"
-
   streaming-agent:
     build: .
     container_name: streaming-agent
     restart: unless-stopped
-    depends_on:
-      - mediamtx
     volumes:
       - ./streaming_agent/streaming-agent.yaml.example:/app/config/streaming-agent.yaml:ro
     env_file:
       - .env
     environment:
       - STREAMING_AGENT_CONFIG=/app/config/streaming-agent.yaml
-      - MEDIAMTX_API_URL=http://mediamtx:9997
       # reuse sender-crop camera list
       - CAMERAS_CONFIG_PATH=/app/config/cameras.yaml
       - MEDIAMTX_PUBLIC_WEBRTC_BASE=${MEDIAMTX_PUBLIC_WEBRTC_BASE:-http://127.0.0.1:8889}
