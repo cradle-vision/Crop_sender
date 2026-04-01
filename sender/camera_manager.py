@@ -31,6 +31,14 @@ class CameraInfo:
     building_id: Optional[str] = None
     company_name: Optional[str] = None
     building_name: Optional[str] = None
+    # Optional tripwire line config (from cameras.yaml/backend)
+    line_x1: Optional[int] = None
+    line_y1: Optional[int] = None
+    line_x2: Optional[int] = None
+    line_y2: Optional[int] = None
+    inside_x: Optional[int] = None
+    inside_y: Optional[int] = None
+    line_active: Optional[bool] = None
 
 
 class CameraManager:
@@ -62,6 +70,46 @@ class CameraManager:
             else:
                 cameras_list = data if isinstance(data, list) else []
         valid_keys = {f.name for f in fields(CameraInfo)}
+        def _parse_bool(value):
+            if isinstance(value, bool):
+                return value
+            if value is None:
+                return None
+            if isinstance(value, (int, float)):
+                return bool(value)
+            if isinstance(value, str):
+                s = value.strip().lower()
+                if s in ("1", "true", "yes", "y", "on"):
+                    return True
+                if s in ("0", "false", "no", "n", "off"):
+                    return False
+            return None
+
+        def _to_int(value):
+            if value is None:
+                return None
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _pick(src: dict, keys):
+            for k in keys:
+                if k in src and src.get(k) is not None:
+                    return src.get(k)
+            return None
+
+        def _extract_line_config(src: dict) -> dict:
+            line = {}
+            line["line_x1"] = _to_int(_pick(src, ("line_x1", "lineX1", "x1", "start_x")))
+            line["line_y1"] = _to_int(_pick(src, ("line_y1", "lineY1", "y1", "start_y")))
+            line["line_x2"] = _to_int(_pick(src, ("line_x2", "lineX2", "x2", "end_x")))
+            line["line_y2"] = _to_int(_pick(src, ("line_y2", "lineY2", "y2", "end_y")))
+            line["inside_x"] = _to_int(_pick(src, ("inside_x", "insideX", "inside_point_x", "insidePointX", "ix")))
+            line["inside_y"] = _to_int(_pick(src, ("inside_y", "insideY", "inside_point_y", "insidePointY", "iy")))
+            line["line_active"] = _parse_bool(_pick(src, ("line_active", "lineActive", "is_active", "isActive", "active", "enabled")))
+            return line
+
         # Map backend format (backend_cameras.json: device_id, device_ip, login, password, ddns_rtsp_url, companyId, buildingId, companyName, buildingName, ...) to cameras.yaml (camera_id, source, ip_address, username, password, company_id, building_id, company_name, building_name, ...)
         def normalize(c: dict) -> dict:
             out = dict(c)
@@ -75,6 +123,31 @@ class CameraManager:
                                  ('companyName', 'company_name'), ('buildingName', 'building_name')]:
                 if camel in out and snake not in out:
                     out[snake] = out[camel]
+            # Optional line filter config:
+            # - preferred: camera_line or line
+            # - backend DB compatibility: camera_roi may also contain line_* fields
+            top_line = _extract_line_config(out)
+            line_obj = out.get('camera_line') or out.get('line') or out.get('camera_roi')
+            nested_line = _extract_line_config(line_obj) if isinstance(line_obj, dict) else {}
+            merged_line = {}
+            for key in ("line_x1", "line_y1", "line_x2", "line_y2", "inside_x", "inside_y", "line_active"):
+                merged_line[key] = top_line.get(key) if top_line.get(key) is not None else nested_line.get(key)
+            if None not in (
+                merged_line.get("line_x1"),
+                merged_line.get("line_y1"),
+                merged_line.get("line_x2"),
+                merged_line.get("line_y2"),
+                merged_line.get("inside_x"),
+                merged_line.get("inside_y"),
+            ):
+                out.setdefault("line_x1", merged_line["line_x1"])
+                out.setdefault("line_y1", merged_line["line_y1"])
+                out.setdefault("line_x2", merged_line["line_x2"])
+                out.setdefault("line_y2", merged_line["line_y2"])
+                out.setdefault("inside_x", merged_line["inside_x"])
+                out.setdefault("inside_y", merged_line["inside_y"])
+                if "line_active" not in out and merged_line.get("line_active") is not None:
+                    out["line_active"] = merged_line["line_active"]
             # camera_id: БЕРЁМ ИМЕННО id из backend (основной ключ камеры),
             # а device_id используем только как fallback, если id нет.
             if 'id' in out:

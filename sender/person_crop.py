@@ -43,6 +43,7 @@ def detect_persons(
     model_path: Optional[str] = None,
     conf_threshold: float = 0.4,
     iou_threshold: float = 0.5,
+    line_params: Optional[Tuple[int, int, int, int, int, int]] = None,
 ) -> List[Tuple[int, int, int, int]]:
     """
     Detect persons using person_detect binary.
@@ -67,9 +68,22 @@ def detect_persons(
             str(binary),
             str(model),
             tmp_path,
-            str(conf_threshold),
-            str(iou_threshold),
         ]
+        if line_params is not None:
+            x1, y1, x2, y2, ix, iy = line_params
+            cmd.extend(
+                [
+                    "--line",
+                    str(int(x1)),
+                    str(int(y1)),
+                    str(int(x2)),
+                    str(int(y2)),
+                    "--inside_point",
+                    str(int(ix)),
+                    str(int(iy)),
+                ]
+            )
+        cmd.extend([str(conf_threshold), str(iou_threshold)])
         out = subprocess.run(
             cmd,
             capture_output=True,

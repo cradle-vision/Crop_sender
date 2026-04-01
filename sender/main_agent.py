@@ -5,6 +5,15 @@ import signal
 import sys
 from urllib.parse import urlparse, urlunparse
 from typing import Dict
+
+import cv2
+
+try:
+    import requests
+
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
 try:
     from dotenv import load_dotenv
     _root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -42,6 +51,9 @@ class MainAgent:
 
     def __init__(self, cameras_config_path: str = None):
         self.running = False
+        self._snapshot_sent = set()
+        self._backend_bearer_token = None
+        self.backend_snapshot_base_url = None
         backend_timeout = _env_float('BACKEND_CAMERAS_TIMEOUT', 10.0)
 
         # Camera manager: from backend API or from file
@@ -63,7 +75,15 @@ class MainAgent:
                             timeout=backend_timeout,
                             scope=_env('BACKEND_TOKEN_SCOPE') or 'camera:read',
                         )
+            if token:
+                self._backend_bearer_token = str(token).strip()
             raw = CameraManager._fetch_cameras_from_backend_raw(backend_cameras_url, backend_timeout, token or None)
+            try:
+                parsed_for_snapshot = urlparse(backend_cameras_url)
+                if parsed_for_snapshot.scheme and parsed_for_snapshot.netloc:
+                    self.backend_snapshot_base_url = f"{parsed_for_snapshot.scheme}://{parsed_for_snapshot.netloc}"
+            except Exception:
+                self.backend_snapshot_base_url = None
             if raw is not None:
                 _cameras_dir = os.path.dirname(cameras_config)
                 _raw_path = os.path.join(_cameras_dir, 'backend_cameras.json') if _cameras_dir else 'backend_cameras.json'
@@ -88,7 +108,6 @@ class MainAgent:
                     self.camera_manager.config_file = fallback_path
                     self.camera_manager.load_cameras()
 
-        # Kafka — приоритет: SENDER_KAFKA_* (из docker-compose/.env), затем KAFKA_*
         bootstrap_servers = _env('KAFKA_BOOTSTRAP_SERVERS') or 'localhost:9092'
         bootstrap_servers = str(bootstrap_servers).replace('http://', '').replace('https://', '').rstrip('/')
 
@@ -96,7 +115,6 @@ class MainAgent:
         jpeg_quality = int(_env_float('KAFKA_JPEG_QUALITY', 95))
         print(f"[Main Agent] Kafka: {bootstrap_servers}, topic={topic}")
 
-        # MinIO — только из .env
         minio_enabled = _env_bool('MINIO_ENABLED', True)
         minio_config = {
             'enabled': minio_enabled,
@@ -218,7 +236,7 @@ class MainAgent:
         """Start all agents"""
         print("[Main Agent] Starting snapshot sending system...")
         
-        # Connect to Kafka (create producer)
+        # Connect to Kafka (create producer) for person crops
         if not self.sender_agent.connect():
             print("[Main Agent] Failed to connect to Kafka")
             return False
@@ -254,19 +272,46 @@ class MainAgent:
         return True
     
     def _on_frame_captured(self, frame, timestamp: float, camera_id: str):
-        """Detect persons, crop, publish each crop to Kafka (CPU person detection only)."""
+        """Detect persons, crop, publish each crop to Kafka (CPU person detection only), plus one-time initial snapshot to backend."""
         if not self.running:
             return
+        camera = self.camera_manager.get_camera(camera_id) if hasattr(self, "camera_manager") else None
+        if (
+            camera
+            and getattr(camera, "company_id", None)
+            and camera_id not in self._snapshot_sent
+        ):
+            try:
+                if self._send_initial_snapshot(frame, timestamp, camera_id, camera):
+                    self._snapshot_sent.add(camera_id)
+            except Exception as e:
+                print(f"[Main Agent] Initial snapshot upload error for camera {camera_id}: {e}")
+        line_params = None
+        if camera:
+            try:
+                vals = (
+                    getattr(camera, "line_x1", None),
+                    getattr(camera, "line_y1", None),
+                    getattr(camera, "line_x2", None),
+                    getattr(camera, "line_y2", None),
+                    getattr(camera, "inside_x", None),
+                    getattr(camera, "inside_y", None),
+                )
+                is_active = getattr(camera, "line_active", True)
+                if is_active and all(v is not None for v in vals):
+                    line_params = tuple(int(v) for v in vals)
+            except Exception as e:
+                print(f"[Main Agent] Line config parse error for camera {camera_id}: {e}")
         rects = detect_persons(
             frame,
             model_path=self.person_model_path,
             conf_threshold=self.person_conf,
             iou_threshold=self.person_iou,
+            line_params=line_params,
         )
         crops = crop_persons(frame, rects)
 
         # Optional company/building/camera metadata for MinIO path and Kafka payload
-        camera = self.camera_manager.get_camera(camera_id) if hasattr(self, "camera_manager") else None
         company_id = getattr(camera, "company_id", None) if camera else None
         building_id = getattr(camera, "building_id", None) if camera else None
         company_name = getattr(camera, "company_name", None) if camera else None
@@ -286,6 +331,78 @@ class MainAgent:
                 building_name,
                 camera_name,
             )
+    
+    def _send_initial_snapshot(self, frame, timestamp: float, camera_id: str, camera) -> bool:
+        """Send one original snapshot per camera to backend /company/{company_id}/smartcamera/{smartcamera_id}/snapshot.
+        Returns True only on 200 OK (so caller can add to _snapshot_sent and skip retries)."""
+        if not HAS_REQUESTS:
+            print("[Main Agent] Python package 'requests' not installed; skip initial snapshot upload")
+            return False
+        if not self.backend_snapshot_base_url:
+            print("[Main Agent] backend_snapshot_base_url is not set; skip initial snapshot upload")
+            return False
+        company_id = getattr(camera, "company_id", None)
+        smartcamera_id = getattr(camera, "camera_id", None) or camera_id
+        if not company_id or not smartcamera_id:
+            print(f"[Main Agent] Missing company_id or smartcamera_id for camera {camera_id}; skip initial snapshot upload")
+            return False
+        try:
+            company_id_str = str(company_id).strip()
+            smartcamera_id_str = str(smartcamera_id).strip()
+        except Exception:
+            return False
+        if not company_id_str or not smartcamera_id_str:
+            print(f"[Main Agent] Empty company_id or smartcamera_id after str() for camera {camera_id}; skip initial snapshot upload")
+            return False
+        url = (
+            self.backend_snapshot_base_url.rstrip("/")
+            + f"/company/{company_id_str}/smartcamera/{smartcamera_id_str}/snapshot"
+        )
+        if not self._backend_bearer_token:
+            print(f"[Main Agent] No backend bearer token; sending initial snapshot for camera {camera_id} without Authorization header")
+        else:
+            print(f"[Main Agent] Sending initial snapshot for camera {camera_id} -> {url} with bearer token")
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 95]
+        success, buf = cv2.imencode(".jpg", frame, encode_param)
+        if not success:
+            print(f"[Main Agent] Failed to encode initial snapshot for camera {camera_id}")
+            return False
+        data = buf.tobytes()
+        headers = None
+        if self._backend_bearer_token:
+            headers = {"Authorization": f"Bearer {self._backend_bearer_token}"}
+        files = {
+            "file": ("snapshot.jpg", data, "image/jpeg"),
+        }
+        try:
+            resp = requests.post(url, headers=headers, files=files, timeout=5)
+            if resp.status_code == 200:
+                snapshot_url = None
+                try:
+                    body = resp.json()
+                    if isinstance(body, dict) and body.get("snapshot_url"):
+                        snapshot_url = body["snapshot_url"]
+                except Exception:
+                    pass
+                if snapshot_url:
+                    print(f"[Main Agent] Initial snapshot uploaded for camera {camera_id}. Snapshot URL: {snapshot_url}")
+                else:
+                    print(f"[Main Agent] Initial snapshot uploaded for camera {camera_id} -> {url}")
+                return True
+            if resp.status_code == 401:
+                print(f"[Main Agent] Unauthorized (401) for initial snapshot camera {camera_id}: invalid or missing bearer token (check BACKEND_CAMERAS_TOKEN / BACKEND_CAMERAS_USERNAME/PASSWORD)")
+                return False
+            txt = ""
+            try:
+                txt = resp.text[:200]
+            except Exception:
+                pass
+            print(f"[Main Agent] Initial snapshot upload failed for camera {camera_id}: {resp.status_code} {txt}")
+            return False
+        except Exception as e:
+            print(f"[Main Agent] Request error while uploading initial snapshot for camera {camera_id}: {e}")
+            return False
+    
     
     def stop(self):
         """Stop all agents"""

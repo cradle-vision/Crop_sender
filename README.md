@@ -40,6 +40,65 @@ docker-compose build && docker-compose up -d
 
 В образ копируются `cpu-person-detection/` (бинарник `person_detect`, `lib/`, модель). Конфиг — только из `.env`; камеры — `config/cameras.yaml` (монтируется в контейнер).
 
+## Streaming Agent (RTSP → MediaMTX → WebRTC)
+
+Отдельный edge-режим: **не** использует Kafka/person_detect. Агент подключается к центральному backend по **WebSocket** (команды, heartbeat). Два варианта доставки видео на фронт — см. `delivery` в конфиге:
+
+| `delivery` | Смысл |
+|------------|--------|
+| `local_webrtc` | Только **MediaMTX** на объекте, браузер — **WHEP** (нужен доступ к порту 8889 с клиента). |
+| `upstream_rtmp` | Пуш **RTSP → RTMP** на **ваш центральный сервер** через FFmpeg (исходящее соединение с объекта — **без белого IP** на магазине). Фронт смотрит уже **HLS/WebRTC с центра** (как настроите ingest). |
+| `both` | И WHEP локально, и пуш на центр (две вытяжки с камеры). |
+
+### Много объектов (например 200 агентов)
+
+- На **каждом** объекте — свой `agent_id` и свой `upstream.rtmp_url_template` (часто один шаблон и общий ingest-хост; различие — в **`stream_key`** = `{agent_id}_{camera_id}`).
+- **Backend** по WebSocket по-прежнему только управляет; **видео** идёт на центральный ingest по RTMP, дальше — ваша схема (nginx-rtmp, MediaMTX, SRS, облако): транскод, HLS, выдача фронту по HTTPS.
+- В `stream_status` агент присылает `stream_key`, опционально **`playback_url`** (если задан `upstream.playback_url_template`) — фронт может открыть плеер по этому URL.
+- Нагрузка: с каждого объекта вверх уходит ~2–4 Мбит/с на активную камеру; 200 объектов × N камер нужно закладывать в **пропускную способность ingest** и шардировать ingest по регионам/хостам при необходимости.
+
+### Конфигурация
+
+- Пример: [`streaming_agent/streaming-agent.yaml.example`](streaming_agent/streaming-agent.yaml.example) — скопируйте в `config/streaming-agent.yaml` или правьте example (в `docker-compose` по умолчанию смонтирован example).
+- Переменные: `STREAMING_AGENT_CONFIG`, `STREAMING_AGENT_ID`, `STREAMING_BACKEND_URL`, `STREAMING_AGENT_TOKEN`, `STREAMING_DELIVERY`, `STREAMING_UPSTREAM_RTMP_URL_TEMPLATE`, `STREAMING_UPSTREAM_PLAYBACK_URL_TEMPLATE`, `MEDIAMTX_API_URL`, `MEDIAMTX_PUBLIC_WEBRTC_BASE`, `STREAMING_HEARTBEAT_INTERVAL_SEC`, `STREAMING_IDLE_GRACE_SEC` (см. `.env.example`).
+
+### Авторизация WebSocket
+
+- Ключ: **`POST /api/stream/agents`** (пользователь с scope **`stream:write`**) → в ответе **`api_key`** → в агенте **`STREAMING_AGENT_TOKEN`** / `auth_token` и заголовок **`Authorization: Bearer <api_key>`** при подключении.
+- Агент в БД должен быть **активен**, **`agent_id`** совпадать. Ротация ключа = обновить конфиг и перезапуск. **403** = обычно неверный/устаревший ключ или неактивный агент (не путать с `ws`/`wss`). Подробно: [`docs/streaming_agent_auth.md`](docs/streaming_agent_auth.md).
+
+### Источник камер (без дубликатов)
+
+- `streaming-agent` читает камеры из вашего уже существующего [`config/cameras.yaml`](config/cameras.yaml) (через env `CAMERAS_CONFIG_PATH`).
+- Поэтому в `streaming-agent.yaml` секция `cameras:` не обязательна.
+
+### Запуск локально
+
+```bash
+# зависимости: websockets, psutil (уже в requirements.txt)
+python3 -m streaming_agent.main --config streaming_agent/streaming-agent.yaml.example
+```
+
+### Запуск Docker (только агент)
+
+```bash
+docker compose up -d streaming-agent
+```
+
+- Локальный MediaMTX в этом compose отключён; поток отправляется на **центральный** ingest (режим `upstream_rtmp`).
+
+### Протокол WebSocket (MVP)
+
+Исходящие: `register`, `heartbeat`, `stream_status` (при старте/ошибке/остановке потока).
+
+Входящие: `start_stream`, `stop_stream`, `viewer_join`, `viewer_leave`, `webrtc_signal` (зарезервировано), `ping` → `pong`.
+
+После `start_stream` в `stream_status` приходят, в зависимости от режима: `whep_url` (локальный WebRTC), `stream_key`, `playback_url` (центральный просмотр), поле `delivery`.
+
+### Smoke-проверка без backend
+
+Для полного цикла нужен backend с WebSocket, принимающим `register` и шлющим `start_stream`, и центральный ingest (MediaMTX/RTMP/HLS).
+
 ## Типы камер
 
 - **RTSP**: `rtsp://[user:pass@]ip:port/path`
@@ -64,6 +123,18 @@ Sender_Crop/
 │   ├── kafka_sender_agent.py   # Публикация crop в Kafka
 │   ├── camera_manager.py       # Камеры из cameras.yaml или backend
 │   └── cameras.yaml.example
+├── streaming_agent/            # RTSP → MediaMTX, WS control
+│   ├── main.py
+│   ├── config.py
+│   ├── signaling_client.py
+│   ├── stream_manager.py
+│   ├── mediamtx_client.py
+│   ├── health_monitor.py
+│   └── streaming-agent.yaml.example
+├── mediamtx.yml                # конфиг MediaMTX для docker-compose
+├── docs/
+│   ├── streaming_backend_frontend_plan.md
+│   └── streaming_agent_auth.md  # api_key, Bearer, 403
 ├── .env.example    # образец для .env (Kafka, MinIO, RTSP, FPS)
 ├── docker-compose.yml
 ├── Dockerfile
@@ -76,3 +147,17 @@ Sender_Crop/
 
 - **Без MinIO:** сообщение в топике (JSON): `camera_id`, `timestamp` (ms), `format` ("jpeg"), `image_base64`. Backend декодирует base64 → JPEG и отправляет в Triton.
 - **С MinIO** (`minio.enabled: true` или `MINIO_ENABLED=true`): crop загружается в бакет MinIO, в Kafka только метаданные: `camera_id`, `timestamp`, `format`, `bucket`, `object_key`. Backend по `object_key` скачивает объект из MinIO и отправляет в Triton (меньше трафика в Kafka).
+
+## Отправка snapshot на SmartCamera
+
+При старте для каждой камеры один раз отправляется **исходный кадр** на бэкенд; бэкенд сохраняет его в MinIO и обновляет поле `snapshot_url` у смарт-камеры. Далее, при наличии детекции, могут отправляться дополнительные кадры (кропы) той же камеры.
+
+- **Эндпоинт:** `POST /company/{company_id}/smartcamera/{smartcamera_id}/snapshot`
+- **Авторизация:** `Authorization: Bearer <token>` — используется тот же токен, что и для `BACKEND_CAMERAS_URL` (через `BACKEND_CAMERAS_TOKEN` или `BACKEND_CAMERAS_USERNAME`/`BACKEND_CAMERAS_PASSWORD` + `BACKEND_TOKEN_URL`).
+- **Тело:** `multipart/form-data`, поле `file` — файл изображения (JPEG).
+
+Отправка выполняется только если задан **BACKEND_CAMERAS_URL** и у камеры в конфиге есть **company_id** (из ответа backend или из `cameras.yaml`). При успешном ответе 200 в лог выводится возвращённый `snapshot_url`. При 401 выводится сообщение о неверном или отсутствующем bearer‑токене; в этом случае отправка будет повторена при следующем кадре.
+
+Для фильтрации по зоне используйте **линию** в `cameras.yaml` (или через backend, если поля прокидываются в конфиг камеры):
+`line_x1`, `line_y1`, `line_x2`, `line_y2`, `inside_x`, `inside_y`, `line_active`.
+В этом режиме sender передаёт эти параметры в `person_detect` как `--line ... --inside_point ...`; при отсутствии линии детекция выполняется по всему кадру.
