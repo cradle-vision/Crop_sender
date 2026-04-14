@@ -3,6 +3,8 @@ services:
     build: .
     container_name: sender-crop
     restart: unless-stopped
+    shm_size: "512m"
+    pids_limit: 8192
     volumes:
       - ./config:/app/config:rw
     env_file:
@@ -12,27 +14,20 @@ services:
       - SENDER_KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS:-localhost:9092}
       - SENDER_MINIO_ENDPOINT=${MINIO_ENDPOINT:-localhost:9000}
     network_mode: host
-    deploy:
-      resources:
-        limits:
-          cpus: "2"
-          memory: 2G
-        reservations:
-          cpus: "0.5"
-          memory: 512M
-
+    
   streaming-agent:
     build: .
     container_name: streaming-agent
     restart: unless-stopped
+    pids_limit: 4096
     volumes:
       - ./streaming_agent/streaming-agent.yaml.example:/app/config/streaming-agent.yaml:ro
     env_file:
       - .env
     environment:
       - STREAMING_AGENT_CONFIG=/app/config/streaming-agent.yaml
-      # reuse sender-crop camera list
       - CAMERAS_CONFIG_PATH=/app/config/cameras.yaml
+      - STREAMING_UPSTREAM_TRANSCODE=${STREAMING_UPSTREAM_TRANSCODE:-true}
       - MEDIAMTX_PUBLIC_WEBRTC_BASE=${MEDIAMTX_PUBLIC_WEBRTC_BASE:-http://127.0.0.1:8889}
       - STREAMING_BACKEND_URL=${STREAMING_BACKEND_URL:-ws://host.docker.internal:8000/ws/agent}
     command: ["python3", "-m", "streaming_agent.main", "-c", "/app/config/streaming-agent.yaml"]

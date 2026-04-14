@@ -1,95 +1,95 @@
-# Авторизация Streaming Agent (WebSocket)
+# Streaming Agent Authentication (WebSocket)
 
-Агент подключается к listener по **WSS/WS** и передаёт ключ в заголовке:
+The agent connects to a listener over **WSS/WS** and sends the key in the header:
 
 ```http
 Authorization: Bearer <api_key>
 ```
 
-В коде это поле `auth_token` в YAML или переменная окружения **`STREAMING_AGENT_TOKEN`** — подставляется **как есть** (plain `api_key`, без префиксов `Bearer ` в значении env).
+In code, this value comes from `auth_token` in YAML or from env var **`STREAMING_AGENT_TOKEN`** and is used **as-is** (plain `api_key`, without `Bearer ` prefix in env value).
 
 ---
 
-## 1. Получить ключ через API (один раз на агента / при ротации)
+## 1. Get an API key (once per agent / on rotation)
 
-**Запрос:** с авторизованным пользователем и scope **`stream:write`**
+**Request:** by an authorized user with scope **`stream:write`**
 
 ```http
 POST /api/stream/agents
 Authorization: Bearer <user_jwt_or_session>
 ```
 
-**Ответ:** в теле будет **`api_key`** — его и кладём в конфиг агента.
+**Response:** contains **`api_key`**. Put this key into agent config.
 
-- Используйте **только** ключ из этого ответа для данного окружения (dev/stage/prod).
-- Не подставляйте старые токены от других сервисов (Kafka, snapshot upload и т.д.) — listener проверяет именно **stream agent key**.
-
----
-
-## 2. Условия на стороне сервера
-
-- В БД у записи агента **`is_active == true`**.
-- **`agent_id`** в конфиге агента (`agent_id` в YAML / `STREAMING_AGENT_ID`) **совпадает** с тем, под которым агент зарегистрирован на backend.
-- При несовпадении или неактивном агенте listener отклонит соединение.
+- Use only the key issued for the current environment (dev/stage/prod).
+- Do not reuse old tokens from other services (Kafka, snapshot upload, etc.). Listener validates a dedicated **stream agent key**.
 
 ---
 
-## 3. Ротация ключа
+## 2. Server-side requirements
 
-Если ключ перевыпустили через **тот же** `POST /api/stream/agents` (или аналог ротации на вашем API):
-
-- **Старый `api_key` перестаёт действовать.**
-- Нужно **обновить** `STREAMING_AGENT_TOKEN` / `auth_token` в `.env` или YAML и **перезапустить** процесс/контейнер `streaming-agent`.
-
----
-
-## 4. Ошибка 403
-
-**HTTP 403** при установке WebSocket = **не проблема выбора `ws` vs `wss`**, а обычно:
-
-- неверный или **устаревший** Bearer-токен;
-- агент **неактивен** (`is_active != true`);
-- неверный **`agent_id`** относительно записи ключа.
-
-Проверьте TLS/порт отдельно (другие ошибки: SSL handshake, connection refused). После успешного TLS, **403** смотрите по списку выше.
+- Agent record in DB has **`is_active == true`**.
+- Agent config **`agent_id`** (`agent_id` in YAML / `STREAMING_AGENT_ID`) matches the backend record for this key.
+- If `agent_id` mismatches or agent is inactive, listener rejects connection.
 
 ---
 
-## 5. Пример `.env` (фрагмент)
+## 3. Key rotation
+
+If key is reissued via the same `POST /api/stream/agents` (or your API's rotation endpoint):
+
+- The old `api_key` stops working.
+- Update `STREAMING_AGENT_TOKEN` / `auth_token` in `.env` or YAML and restart `streaming-agent`.
+
+---
+
+## 4. HTTP 403 on WebSocket connect
+
+**HTTP 403** during WS handshake is usually **not** `ws` vs `wss` selection issue. Typical causes:
+
+- invalid or expired Bearer token;
+- inactive agent (`is_active != true`);
+- wrong `agent_id` for the provided key.
+
+Check TLS/port separately (SSL handshake, connection refused, etc.). If TLS is fine and you get 403, inspect the list above.
+
+---
+
+## 5. `.env` example (fragment)
 
 ```env
 STREAMING_AGENT_ID=shop-12
 STREAMING_BACKEND_URL=wss://your-api.example.com/ws/agents
-STREAMING_AGENT_TOKEN=<api_key из POST /api/stream/agents>
+STREAMING_AGENT_TOKEN=<api_key from POST /api/stream/agents>
 ```
 
 ---
 
-## 6. Связь с кодом агента
+## 6. Code reference
 
-Заголовок формируется в [`streaming_agent/signaling_client.py`](../streaming_agent/signaling_client.py): при непустом `auth_token` добавляется `Authorization: Bearer …`.
-
----
-
-## 7. После `register` сразу обрыв, в логе `code=1006`
-
-**1006** — «abnormal closure»: соединение закрыто без нормального WebSocket close (часто **сервер рвёт TCP** после своей проверки).
-
-Если в логах видно `WS connected, register sent: agent_id=… cameras=…` и через ~0.3–1 с снова коннект — почти всегда **отклонён `register`** на backend:
-
-- **`agent_id`** не совпадает с тем, что привязан к выданному **`api_key`** (другой магазин / опечатка).
-- **`cameras`** — id камер должны быть **как в вашей БД/API**.
-  Теперь список камер берётся из вашего `config/cameras.yaml` (через env `CAMERAS_CONFIG_PATH`), а не вручную из `streaming-agent.yaml`.
-  Например, если в backend камера с id **`1`**, то в `config/cameras.yaml` поле `camera_id` должно быть `"1"`, и в `register` уйдёт `"cameras": ["1"]` (строки).
-
-Перезапустите агента и смотрите логи **listener** на сервере в момент `register` (проверьте `agent_id` и `config/cameras.yaml`).
+Header is formed in [`streaming_agent/signaling_client.py`](../streaming_agent/signaling_client.py): when `auth_token` is set, `Authorization: Bearer ...` is attached.
 
 ---
 
-## 8. Docker: с хоста `websocat` ок, в контейнере «no close frame»
+## 7. Immediate disconnect after `register`, log shows `code=1006`
 
-Если **тот же** `ws://…` и **тот же** Bearer в `docker compose exec … env` совпадают с рабочим `websocat`, а в логах агента обрыв без close frame:
+**1006** means abnormal closure: socket was closed without a normal WS close frame (often server closes TCP after validation).
 
-1. **Сеть Docker (bridge)** — попробуйте для сервиса `streaming-agent` **`network_mode: host`** (как у `sender-crop`), а `MEDIAMTX_API_URL=http://127.0.0.1:9997`, пока MediaMTX публикует порты на хост. Тогда исходящий путь к backend совпадёт с машиной, где `websocat` уже работает.
-2. **Камеры** — агент берёт их из `config/cameras.yaml` (через env `CAMERAS_CONFIG_PATH`). Убедитесь, что `camera_id` совпадает с тем, что ожидает backend (в логах `WS connected, register sent: ... cameras=[...]`).
-3. Логи **listener** на сервере в момент коннекта с IP контейнера (см. раздел **7** про **1006** после `register`).
+If logs show `WS connected, register sent: agent_id=... cameras=...` and reconnect happens in ~0.3-1s, backend usually rejected `register`:
+
+- `agent_id` does not match the one bound to this `api_key` (wrong site/store, typo).
+- `cameras` IDs must match backend DB/API IDs.
+  Agent now loads cameras from `config/cameras.yaml` via `CAMERAS_CONFIG_PATH`, not manually from `streaming-agent.yaml`.
+  Example: if backend camera id is `1`, then `camera_id` in `config/cameras.yaml` must be `"1"`, so register sends `"cameras": ["1"]` (strings).
+
+Restart agent and check listener logs at register time (`agent_id`, `config/cameras.yaml` values).
+
+---
+
+## 8. Docker case: `websocat` works on host, container shows `no close frame`
+
+If the same `ws://...` and same Bearer token (verified via `docker compose exec ... env`) work with host `websocat`, but agent inside container disconnects without close frame:
+
+1. **Docker network (bridge):** try `network_mode: host` for `streaming-agent` (as for `sender-crop`), and keep `MEDIAMTX_API_URL=http://127.0.0.1:9997` while MediaMTX ports are published on host.
+2. **Cameras:** agent reads camera list from `config/cameras.yaml` (`CAMERAS_CONFIG_PATH`). Verify `camera_id` values match backend expectations (`WS connected, register sent: ... cameras=[...]`).
+3. Check listener logs on server for container source IP at connect time (see section 7 on `1006` right after `register`).

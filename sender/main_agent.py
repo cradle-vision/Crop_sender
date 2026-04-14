@@ -6,8 +6,6 @@ import sys
 from urllib.parse import urlparse, urlunparse
 from typing import Dict
 
-import cv2
-
 try:
     import requests
 
@@ -24,6 +22,7 @@ from snapshot_capture_agent import SnapshotCaptureAgent
 from kafka_sender_agent import KafkaSenderAgent
 from camera_manager import CameraManager
 from person_crop import detect_persons, crop_persons, is_available as person_detector_available
+from jpeg_utils import encode_jpeg_bgr
 
 
 def _env(key: str, default: str = "") -> str:
@@ -112,7 +111,7 @@ class MainAgent:
         bootstrap_servers = str(bootstrap_servers).replace('http://', '').replace('https://', '').rstrip('/')
 
         topic = _env('KAFKA_TOPIC') or 'snapshots'
-        jpeg_quality = int(_env_float('KAFKA_JPEG_QUALITY', 95))
+        jpeg_quality = 100
         print(f"[Main Agent] Kafka: {bootstrap_servers}, topic={topic}")
 
         minio_enabled = _env_bool('MINIO_ENABLED', True)
@@ -140,15 +139,13 @@ class MainAgent:
         self.person_conf = _env_float('PERSON_CONF', 0.4)
         self.person_iou = _env_float('PERSON_IOU', 0.5)
         self.person_model_path = _env('PERSON_MODEL_PATH') or None
-        self.rtsp_use_ffmpeg_pipe = _env_bool('RTSP_USE_FFMPEG_PIPE', True)
         if not person_detector_available():
             raise RuntimeError(
                 "Person detector (person_detect binary + model) not found. "
                 "See cpu-person-detection/ and PERSON_MODEL_PATH."
             )
         print("[Main Agent] Using person detection (cpu-person-detection binary)")
-        if self.rtsp_use_ffmpeg_pipe:
-            print("[Main Agent] RTSP capture: using FFmpeg pipe (avoids RTP/decoding errors)")
+        print("[Main Agent] RTSP capture: using FFmpeg pipe only")
         
         # Capture agents for each camera
         self.capture_agents: Dict[str, SnapshotCaptureAgent] = {}
@@ -199,7 +196,6 @@ class MainAgent:
                 except ValueError:
                     pass
             
-            use_ffmpeg_pipe = self.rtsp_use_ffmpeg_pipe if camera.type == 'rtsp' else None
             capture_agent = SnapshotCaptureAgent(
                 source=source,
                 fps=fps,
@@ -207,7 +203,6 @@ class MainAgent:
                 height=camera.height,
                 camera_id=camera.camera_id,
                 camera_type=camera.type,
-                use_ffmpeg_pipe_rtsp=use_ffmpeg_pipe
             )
             
             self.capture_agents[camera.camera_id] = capture_agent
@@ -362,12 +357,10 @@ class MainAgent:
             print(f"[Main Agent] No backend bearer token; sending initial snapshot for camera {camera_id} without Authorization header")
         else:
             print(f"[Main Agent] Sending initial snapshot for camera {camera_id} -> {url} with bearer token")
-        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 95]
-        success, buf = cv2.imencode(".jpg", frame, encode_param)
-        if not success:
+        data = encode_jpeg_bgr(frame, quality=100)
+        if data is None:
             print(f"[Main Agent] Failed to encode initial snapshot for camera {camera_id}")
             return False
-        data = buf.tobytes()
         headers = None
         if self._backend_bearer_token:
             headers = {"Authorization": f"Bearer {self._backend_bearer_token}"}
