@@ -365,7 +365,24 @@ class MainAgent:
                 except Exception:
                     pass
                 if snapshot_url:
-                    print(f"[Main Agent] Initial snapshot uploaded for camera {camera_id}. Snapshot URL: {snapshot_url}")
+                    bucket = None
+                    object_key = None
+                    try:
+                        parsed_snapshot = urlparse(str(snapshot_url))
+                        path_parts = [p for p in parsed_snapshot.path.split("/") if p]
+                        if path_parts:
+                            bucket = path_parts[0]
+                            object_key = "/".join(path_parts[1:]) if len(path_parts) > 1 else ""
+                    except Exception:
+                        bucket = None
+                        object_key = None
+                    if bucket is not None:
+                        print(
+                            f"[Main Agent] Initial snapshot uploaded for camera {camera_id}. "
+                            f"bucket={bucket}, object_key={object_key}"
+                        )
+                    else:
+                        print(f"[Main Agent] Initial snapshot uploaded for camera {camera_id}.")
                 else:
                     print(f"[Main Agent] Initial snapshot uploaded for camera {camera_id} -> {url}")
                 return True
