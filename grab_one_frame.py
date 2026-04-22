@@ -176,7 +176,6 @@ def main() -> None:
 
     url = base_url.rstrip("/") + f"/company/{company_id_str}/smartcamera/{smartcamera_id_str}/snapshot"
 
-    # Bearer-токен: BACKEND_CAMERAS_TOKEN или получаем через BACKEND_TOKEN_URL + BACKEND_CAMERAS_USERNAME/PASSWORD.
     token = _env("BACKEND_CAMERAS_TOKEN")
     if not token:
         username = _env("BACKEND_CAMERAS_USERNAME")

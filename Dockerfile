@@ -2,6 +2,7 @@ FROM python:3.11-slim
 
 # Install system dependencies for OpenCV
 RUN apt-get update && apt-get install -y \
+    libturbojpeg0 \
     libopencv-dev \
     python3-opencv \
     ffmpeg \

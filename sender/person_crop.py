@@ -1,6 +1,7 @@
 """
-Person detection via CPU person detection binary (person_detect).
-Uses cpu-person-detection/person_detection_linux_x64/person_detect: frame → temp file → subprocess → parse bbox.
+Person detection via CPU person detection binary.
+Prefers bin/detect_main + LD_LIBRARY_PATH (no bash wrapper) to avoid fork storms:
+the shell script uses process substitution 2> >(grep ...) and exhausts PID limits under load.
 """
 
 import os
@@ -8,7 +9,7 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -18,18 +19,52 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def _find_person_detect_binary() -> Optional[Path]:
-    """person_detect in cpu-person-detection/person_detection_linux_x64/ or cpu-person-detection/"""
+def _resolve_detect_executable() -> Tuple[Optional[Path], Optional[Path]]:
+    """Returns (detect_main_executable, lib_dir_for_ld_library_path)."""
     root = _project_root()
-    for rel in ["person_detection_linux_x64/person_detect", "person_detect"]:
-        p = root / "cpu-person-detection" / rel
-        if p.exists():
-            return p
-    return None
+    pkg = root / "cpu-person-detection" / "person_detection_linux_x64"
+    direct = pkg / "bin" / "detect_main"
+    if direct.is_file():
+        lib = pkg / "lib"
+        return direct, lib if lib.is_dir() else None
+    return None, None
+
+
+def _cwd_for_executable(exe: Path) -> str:
+    return str(exe.parent.parent)
+
+
+def _env_with_bundled_lib(lib_dir: Optional[Path]) -> dict:
+    env = os.environ.copy()
+    if lib_dir is not None:
+        lp = str(lib_dir)
+        old = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = f"{lp}{os.pathsep}{old}" if old else lp
+    return env
+
+
+_STDERR_FILTER = re.compile(
+    r"device_discovery|GPU device discovery failed|ReadFileContents Failed to open file"
+)
+
+
+def _filter_stderr(s: str) -> str:
+    if not s:
+        return ""
+    lines = [ln for ln in s.splitlines() if not _STDERR_FILTER.search(ln)]
+    return "\n".join(lines)
 
 
 def _find_model_path() -> Path:
     return _project_root() / "cpu-person-detection" / "models" / "person_detection_model.onnx"
+
+
+def _mkstemp_in_shm() -> tuple[int, str]:
+    """Use /dev/shm only."""
+    shm_dir = "/dev/shm"
+    if not (os.path.isdir(shm_dir) and os.access(shm_dir, os.W_OK)):
+        raise RuntimeError("/dev/shm is not writable")
+    return tempfile.mkstemp(suffix=".jpg", dir=shm_dir)
 
 
 # stdout: bbox (x1,y1,x2,y2)=(412,156,465,298) score=0.711719
@@ -46,11 +81,11 @@ def detect_persons(
     line_params: Optional[Tuple[int, int, int, int, int, int]] = None,
 ) -> List[Tuple[int, int, int, int]]:
     """
-    Detect persons using person_detect binary.
-    Writes frame to temp file, runs person_detect, parses stdout.
+    Detect persons using detect_main.
+    Writes frame to temp file, runs subprocess, parses stdout.
     Returns list of (x1, y1, x2, y2).
     """
-    binary = _find_person_detect_binary()
+    binary, lib_dir = _resolve_detect_executable()
     if not binary:
         return []
     model = Path(model_path or os.environ.get("PERSON_MODEL_PATH") or _find_model_path())
@@ -59,7 +94,11 @@ def detect_persons(
     h, w = frame.shape[:2]
     if w == 0 or h == 0:
         return []
-    fd, tmp_path = tempfile.mkstemp(suffix=".jpg")
+    try:
+        fd, tmp_path = _mkstemp_in_shm()
+    except Exception:
+        print("[PersonDetector] temp file create failed (/dev/shm required)")
+        return []
     try:
         os.close(fd)
         if not cv2.imwrite(tmp_path, frame):
@@ -89,10 +128,11 @@ def detect_persons(
             capture_output=True,
             text=True,
             timeout=30,
-            cwd=str(binary.parent),
+            cwd=_cwd_for_executable(binary),
+            env=_env_with_bundled_lib(lib_dir),
         )
         if out.returncode != 0:
-            err = (out.stderr or out.stdout or "").strip()
+            err = _filter_stderr((out.stderr or out.stdout or "").strip())
             if err:
                 print(f"[PersonDetector] person_detect failed (code {out.returncode}): {err[:500]}")
             return []
@@ -142,8 +182,6 @@ def crop_persons(
 
 
 def is_available() -> bool:
-    """Check if person_detect binary and model exist."""
-    return (
-        _find_person_detect_binary() is not None
-        and _find_model_path().exists()
-    )
+    """Check if detect binary and model exist."""
+    exe, _ = _resolve_detect_executable()
+    return exe is not None and _find_model_path().exists()

@@ -1,9 +1,9 @@
 import json
 import uuid
 import io
-import cv2
 import numpy as np
 from typing import Optional, Dict, Any
+from jpeg_utils import encode_jpeg_bgr
 
 try:
     from confluent_kafka import Producer
@@ -22,12 +22,12 @@ class KafkaSenderAgent:
     """Agent: crop → JPEG encode → MinIO.put_object() → Kafka.send(metadata + object_key)."""
 
     def __init__(self, bootstrap_servers: str = "localhost:9092", topic: str = "snapshots",
-                 jpeg_quality: int = 85, minio_config: Optional[Dict[str, Any]] = None):
+                 jpeg_quality: int = 100, minio_config: Optional[Dict[str, Any]] = None):
         """
         Args:
             bootstrap_servers: Kafka brokers (host:port; http:// is stripped automatically)
             topic: Topic name for crop messages
-            jpeg_quality: JPEG encoding quality (1-100)
+            jpeg_quality: JPEG encoding quality (fixed to 100 in current project usage)
             minio_config: Required. Upload crop to MinIO, send only bucket/object_key in Kafka.
                 Keys: enabled, endpoint, bucket, access_key, secret_key, secure (bool)
         """
@@ -125,13 +125,11 @@ class KafkaSenderAgent:
         building_name = _sanitize(building_name)
         camera_name = _sanitize(camera_name)
         try:
-            # 1. JPEG encode (фиксированное максимальное качество; не зависит от KAFKA_JPEG_QUALITY)
-            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 100]
-            success, buf = cv2.imencode(".jpg", frame, encode_param)
-            if not success:
+            # 1. JPEG encode (fixed quality=100 by project requirement)
+            data = encode_jpeg_bgr(frame, quality=self.jpeg_quality)
+            if data is None:
                 print("[Kafka Sender Agent] Image encode error")
                 return False
-            data = buf.tobytes()
             ts_ms = int(timestamp * 1000)
 
             # 2. MinIO.put_object()

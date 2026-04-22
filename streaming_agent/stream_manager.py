@@ -51,6 +51,7 @@ class StreamManager:
                 rtsp_transport=cfg.mediamtx.rtsp_transport,
                 extra_args=cfg.upstream.ffmpeg_extra_args,
                 transcode=cfg.upstream.transcode,
+                on_process_exit=self._on_upstream_ffmpeg_exit,
             )
 
     def camera_ids(self) -> list[str]:
@@ -58,6 +59,42 @@ class StreamManager:
 
     def streams_active_count(self) -> int:
         return sum(1 for s in self._streams.values() if s.active)
+
+    async def _on_upstream_ffmpeg_exit(
+        self, camera_id: str, exit_code: int, stderr_tail: str
+    ) -> None:
+        """FFmpeg завершился без нашего SIGTERM — сбрасываем active и шлём stream_error на бэкенд."""
+        await self.handle_upstream_ffmpeg_exit(camera_id, exit_code, stderr_tail)
+
+    async def handle_upstream_ffmpeg_exit(
+        self, camera_id: str, exit_code: int, stderr_tail: str
+    ) -> None:
+        async with self._lock:
+            st = self._streams.get(camera_id)
+            if not st or not st.active:
+                return
+            st.active = False
+            sid = st.session_id
+        detail = (stderr_tail or "").strip()[-1200:]
+        payload: dict[str, Any] = {
+            "ok": False,
+            "camera_id": camera_id,
+            "agent_id": self.cfg.agent_id,
+            "delivery": self.cfg.delivery,
+            "error": "upstream_ffmpeg_exited",
+            "ffmpeg_exit_code": exit_code,
+            "detail": detail,
+        }
+        if sid:
+            payload["session_id"] = sid
+        sk = make_stream_key(self.cfg.agent_id, camera_id)
+        payload["stream_key"] = sk
+        await self._emit_status(camera_id, "stream_error", payload)
+        logger.warning(
+            "stream marked inactive after ffmpeg exit camera=%s code=%s",
+            camera_id,
+            exit_code,
+        )
 
     def _playback_url(self, camera_id: str) -> str | None:
         tpl = self.cfg.upstream.playback_url_template.strip()
@@ -234,6 +271,19 @@ class StreamManager:
                 return payload
             if session_id:
                 st.session_id = session_id
+
+            if not st.active:
+                payload = {
+                    "ok": True,
+                    "camera_id": camera_id,
+                    "note": "already_stopped",
+                    "delivery": d,
+                }
+                if session_id:
+                    payload["session_id"] = session_id
+                elif st.session_id:
+                    payload["session_id"] = st.session_id
+                return payload
 
             if not force and st.viewers > 0:
                 payload = {
