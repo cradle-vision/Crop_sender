@@ -7,11 +7,9 @@ the shell script uses process substitution 2> >(grep ...) and exhausts PID limit
 import os
 import re
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-import cv2
 import numpy as np
 
 # Paths relative to project root (parent of sender/)
@@ -59,14 +57,6 @@ def _find_model_path() -> Path:
     return _project_root() / "cpu-person-detection" / "models" / "person_detection_model.onnx"
 
 
-def _mkstemp_in_shm() -> tuple[int, str]:
-    """Use /dev/shm only."""
-    shm_dir = "/dev/shm"
-    if not (os.path.isdir(shm_dir) and os.access(shm_dir, os.W_OK)):
-        raise RuntimeError("/dev/shm is not writable")
-    return tempfile.mkstemp(suffix=".jpg", dir=shm_dir)
-
-
 # stdout: bbox (x1,y1,x2,y2)=(412,156,465,298) score=0.711719
 _BBOX_PATTERN = re.compile(
     r"bbox \(x1,y1,x2,y2\)=\((\d+),(\d+),(\d+),(\d+)\) score=([\d.e+-]+)"
@@ -82,7 +72,7 @@ def detect_persons(
 ) -> List[Tuple[int, int, int, int]]:
     """
     Detect persons using detect_main.
-    Writes frame to temp file, runs subprocess, parses stdout.
+    Sends raw BGR frame through stdin to detect_main, parses stdout.
     Returns list of (x1, y1, x2, y2).
     """
     binary, lib_dir = _resolve_detect_executable()
@@ -94,66 +84,63 @@ def detect_persons(
     h, w = frame.shape[:2]
     if w == 0 or h == 0:
         return []
-    try:
-        fd, tmp_path = _mkstemp_in_shm()
-    except Exception:
-        print("[PersonDetector] temp file create failed (/dev/shm required)")
-        return []
-    try:
-        os.close(fd)
-        if not cv2.imwrite(tmp_path, frame):
-            return []
-        cmd = [
-            str(binary),
-            str(model),
-            tmp_path,
-        ]
-        if line_params is not None:
-            x1, y1, x2, y2, ix, iy = line_params
-            cmd.extend(
-                [
-                    "--line",
-                    str(int(x1)),
-                    str(int(y1)),
-                    str(int(x2)),
-                    str(int(y2)),
-                    "--inside_point",
-                    str(int(ix)),
-                    str(int(iy)),
-                ]
-            )
-        cmd.extend([str(conf_threshold), str(iou_threshold)])
-        out = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            cwd=_cwd_for_executable(binary),
-            env=_env_with_bundled_lib(lib_dir),
+    frame_input = np.ascontiguousarray(frame, dtype=np.uint8)
+    cmd = [
+        str(binary),
+        str(model),
+        "--stdin-bgr",
+        "--width",
+        str(w),
+        "--height",
+        str(h),
+    ]
+    if line_params is not None:
+        x1, y1, x2, y2, ix, iy = line_params
+        cmd.extend(
+            [
+                "--line",
+                str(int(x1)),
+                str(int(y1)),
+                str(int(x2)),
+                str(int(y2)),
+                "--inside_point",
+                str(int(ix)),
+                str(int(iy)),
+            ]
         )
-        if out.returncode != 0:
-            err = _filter_stderr((out.stderr or out.stdout or "").strip())
-            if err:
-                print(f"[PersonDetector] person_detect failed (code {out.returncode}): {err[:500]}")
-            return []
-        rects = []
-        for m in _BBOX_PATTERN.finditer(out.stdout):
-            x1, y1, x2, y2 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
-            score = float(m.group(5))
-            if score < conf_threshold:
-                continue
-            x1 = max(0, min(x1, w - 1))
-            y1 = max(0, min(y1, h - 1))
-            x2 = max(0, min(x2, w))
-            y2 = max(0, min(y2, h))
-            if x2 > x1 and y2 > y1:
-                rects.append((x1, y1, x2, y2))
-        return rects
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+    cmd.extend([str(conf_threshold), str(iou_threshold)])
+
+    out = subprocess.run(
+        cmd,
+        input=frame_input.tobytes(),
+        capture_output=True,
+        text=False,
+        timeout=30,
+        cwd=_cwd_for_executable(binary),
+        env=_env_with_bundled_lib(lib_dir),
+    )
+    if out.returncode != 0:
+        stderr_text = (out.stderr or b"").decode("utf-8", errors="replace")
+        stdout_text = (out.stdout or b"").decode("utf-8", errors="replace")
+        err = _filter_stderr((stderr_text or stdout_text).strip())
+        if err:
+            print(f"[PersonDetector] person_detect failed (code {out.returncode}): {err[:500]}")
+        return []
+
+    stdout_text = (out.stdout or b"").decode("utf-8", errors="replace")
+    rects = []
+    for m in _BBOX_PATTERN.finditer(stdout_text):
+        x1, y1, x2, y2 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+        score = float(m.group(5))
+        if score < conf_threshold:
+            continue
+        x1 = max(0, min(x1, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        x2 = max(0, min(x2, w))
+        y2 = max(0, min(y2, h))
+        if x2 > x1 and y2 > y1:
+            rects.append((x1, y1, x2, y2))
+    return rects
 
 
 def crop_persons(

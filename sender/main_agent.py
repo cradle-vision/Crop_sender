@@ -24,6 +24,8 @@ from camera_manager import CameraManager
 from person_crop import detect_persons, crop_persons, is_available as person_detector_available
 from jpeg_utils import encode_jpeg_bgr
 
+PIPELINE_FPS = 5.0
+
 
 def _env(key: str, default: str = "") -> str:
     v = os.getenv(key)
@@ -178,23 +180,8 @@ class MainAgent:
                 print(f"[Main Agent] Camera {camera.camera_id} has no stream URL, skipping capture (add ddns_rtsp_url/ddns_stream_url in backend)")
                 continue
             
-            # FPS: camera-specific env (e.g. CAM1_FPS), then DEFAULT_FPS, then cameras.yaml
-            fps = camera.fps
-            env_fps_key = f"{camera.camera_id.upper()}_FPS"
-            default_fps_key = "DEFAULT_FPS"
-            
-            if os.getenv(env_fps_key):
-                try:
-                    fps = float(os.getenv(env_fps_key))
-                    print(f"[Main Agent] FPS for {camera.camera_id} from env {env_fps_key}: {fps}")
-                except ValueError:
-                    pass
-            elif os.getenv(default_fps_key):
-                try:
-                    fps = float(os.getenv(default_fps_key))
-                    print(f"[Main Agent] Default FPS from env {default_fps_key}: {fps}")
-                except ValueError:
-                    pass
+            # Fixed pipeline FPS for stable quality/latency.
+            fps = PIPELINE_FPS
             
             capture_agent = SnapshotCaptureAgent(
                 source=source,
@@ -423,14 +410,20 @@ class MainAgent:
         """
         if camera_id:
             if camera_id in self.capture_agents:
-                print(f"[Main Agent] Updating FPS for camera {camera_id}: {new_fps}")
-                self.capture_agents[camera_id].update_fps(new_fps)
+                print(
+                    f"[Main Agent] FPS update request for {camera_id} ignored. "
+                    f"Fixed FPS: {PIPELINE_FPS}"
+                )
+                self.capture_agents[camera_id].update_fps(PIPELINE_FPS)
             else:
                 print(f"[Main Agent] Camera {camera_id} not found")
         else:
-            print(f"[Main Agent] Updating FPS for all cameras: {new_fps}")
+            print(
+                f"[Main Agent] FPS update request ({new_fps}) ignored. "
+                f"Fixed FPS for all cameras: {PIPELINE_FPS}"
+            )
             for cam_id, capture_agent in self.capture_agents.items():
-                capture_agent.update_fps(new_fps)
+                capture_agent.update_fps(PIPELINE_FPS)
 
 
 def main():

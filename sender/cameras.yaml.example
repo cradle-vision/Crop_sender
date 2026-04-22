@@ -9,7 +9,7 @@ cameras:
     rtsp_path: "/stream1"
     username: "admin"
     password: "password123"
-    fps: 15.0
+    fps: 5.0
     width: 1280
     height: 720
     enabled: true
@@ -32,7 +32,7 @@ cameras:
     rtsp_path: "/stream1"
     username: null
     password: null
-    fps: 10.0
+    fps: 5.0
     width: 640
     height: 480
     enabled: true
@@ -47,7 +47,7 @@ cameras:
     rtsp_path: "/mjpeg"
     username: null
     password: null
-    fps: 10.0
+    fps: 5.0
     width: 640
     height: 480
     enabled: true
@@ -62,7 +62,7 @@ cameras:
     rtsp_path: "/h264"
     username: "user"
     password: "pass"
-    fps: 20.0
+    fps: 5.0
     width: 1920
     height: 1080
     enabled: true
