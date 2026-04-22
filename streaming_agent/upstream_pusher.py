@@ -75,15 +75,19 @@ class UpstreamPusher:
                 "-c:v",
                 "libx264",
                 "-preset",
-                "veryfast",
+                "medium",
+                "-crf",
+                "18",
                 "-tune",
                 "zerolatency",
                 "-pix_fmt",
                 "yuv420p",
+                "-r",
+                "5",
                 "-g",
-                "50",
+                "10",
                 "-keyint_min",
-                "50",
+                "10",
                 "-bf",
                 "0",
                 "-an",
@@ -130,7 +134,7 @@ class UpstreamPusher:
         args = self._ffmpeg_args(rtsp_url, rtmp)
         if self.transcode:
             logger.info(
-                "upstream mode=transcode(libx264) camera=%s (stable timestamps; higher CPU)",
+                "upstream mode=transcode(libx264) camera=%s (use only when copy mode fails: broken timestamps/ingest incompatibility; quality loss possible)",
                 camera_id,
             )
         else:

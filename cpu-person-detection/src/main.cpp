@@ -16,6 +16,8 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <cstdlib>
+#include <limits>
 
 #include <filesystem>
 namespace fs = std::filesystem;
@@ -97,14 +99,36 @@ static int runBenchmark(const std::string& model_path, const std::string& input_
   return 0;
 }
 
+static bool parseFloatArg(const char* s, float& out) {
+  if (s == nullptr) return false;
+  char* end = nullptr;
+  float v = std::strtof(s, &end);
+  if (end == s || (end && *end != '\0')) return false;
+  out = v;
+  return true;
+}
+
+static bool parseIntArg(const char* s, int& out) {
+  if (s == nullptr) return false;
+  char* end = nullptr;
+  long v = std::strtol(s, &end, 10);
+  if (end == s || (end && *end != '\0')) return false;
+  if (v < 0 || v > std::numeric_limits<int>::max()) return false;
+  out = static_cast<int>(v);
+  return true;
+}
+
 int main(int argc, char* argv[]) {
   if (argc < 3) {
     std::cerr << "Usage: " << argv[0] << " <model.onnx> <input_image> [--draw <output_image>] [conf] [iou]\n"
+              << "       " << argv[0] << " <model.onnx> --stdin-bgr --width <W> --height <H> [--line x1 y1 x2 y2 --inside_point ix iy] [conf] [iou]\n"
               << "       " << argv[0] << " <model.onnx> --benchmark <input_dir> [conf] [iou]\n"
               << "  Default: print bbox (x1,y1,x2,y2) and score to stdout.\n"
               << "  --draw: draw boxes and save to <output_image>.\n"
+              << "  --stdin-bgr: read one raw BGR frame from stdin.\n"
               << "  --benchmark: run on all images in <input_dir>, report FPS.\n"
               << "  Example (bbox):   " << argv[0] << " ../models/person_detection_model.onnx ../input/in.jpg\n"
+              << "  Example (stdin):  " << argv[0] << " ../models/person_detection_model.onnx --stdin-bgr --width 1280 --height 720\n"
               << "  Example (draw):   " << argv[0] << " ../models/person_detection_model.onnx ../input/in.jpg --draw ../output/out.jpg\n"
               << "  Example (FPS):    " << argv[0] << " ../models/person_detection_model.onnx --benchmark /path/to/images\n";
     return 1;
@@ -113,6 +137,7 @@ int main(int argc, char* argv[]) {
   const std::string model_path = argv[1];
   const std::string arg2 = argv[2];
   bool benchmark_mode = (arg2 == "--benchmark");
+  bool stdin_bgr_mode = (arg2 == "--stdin-bgr");
   float conf = 0.4f;
   float iou = 0.5f;
 
@@ -126,6 +151,102 @@ int main(int argc, char* argv[]) {
     if (idx < argc) conf = static_cast<float>(atof(argv[idx++]));
     if (idx < argc) iou = static_cast<float>(atof(argv[idx++]));
     return runBenchmark(model_path, input_dir, conf, iou);
+  }
+
+  if (stdin_bgr_mode) {
+    int width = 0;
+    int height = 0;
+    int idx = 3;
+    while (idx < argc) {
+      const std::string flag = argv[idx];
+      if (flag == "--width") {
+        ++idx;
+        if (idx >= argc || !parseIntArg(argv[idx], width) || width <= 0) {
+          std::cerr << "[main] --width requires positive integer\n";
+          return 1;
+        }
+        ++idx;
+        continue;
+      }
+      if (flag == "--height") {
+        ++idx;
+        if (idx >= argc || !parseIntArg(argv[idx], height) || height <= 0) {
+          std::cerr << "[main] --height requires positive integer\n";
+          return 1;
+        }
+        ++idx;
+        continue;
+      }
+      if (flag == "--line") {
+        idx += 5;
+        if (idx > argc) {
+          std::cerr << "[main] --line requires 4 integers\n";
+          return 1;
+        }
+        continue;
+      }
+      if (flag == "--inside_point") {
+        idx += 3;
+        if (idx > argc) {
+          std::cerr << "[main] --inside_point requires 2 integers\n";
+          return 1;
+        }
+        continue;
+      }
+      break;
+    }
+
+    if (width <= 0 || height <= 0) {
+      std::cerr << "[main] --stdin-bgr requires --width and --height\n";
+      return 1;
+    }
+    if (idx < argc) {
+      if (!parseFloatArg(argv[idx], conf)) {
+        std::cerr << "[main] invalid conf value\n";
+        return 1;
+      }
+      ++idx;
+    }
+    if (idx < argc) {
+      if (!parseFloatArg(argv[idx], iou)) {
+        std::cerr << "[main] invalid iou value\n";
+        return 1;
+      }
+      ++idx;
+    }
+
+    const size_t frame_size = static_cast<size_t>(width) * static_cast<size_t>(height) * 3;
+    std::vector<unsigned char> buf(frame_size);
+    std::cin.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(frame_size));
+    const auto read_count = static_cast<size_t>(std::cin.gcount());
+    if (read_count != frame_size) {
+      std::cerr << "[main] Failed to read raw frame from stdin: expected "
+                << frame_size << " bytes, got " << read_count << std::endl;
+      return 1;
+    }
+
+    cv::Mat image(height, width, CV_8UC3, buf.data());
+    if (image.empty()) {
+      std::cerr << "[main] Failed to construct BGR image from stdin buffer" << std::endl;
+      return 1;
+    }
+
+    Detector detector;
+    if (!detector.load(model_path)) {
+      std::cerr << "[main] Failed to load model: " << model_path << std::endl;
+      return 1;
+    }
+    detector.setConfidenceThreshold(conf);
+    detector.setIouThreshold(iou);
+
+    std::vector<Detection> detections = detector.detect(image);
+    for (size_t i = 0; i < detections.size(); ++i) {
+      const auto& d = detections[i];
+      std::cout << "bbox (x1,y1,x2,y2)=(" << static_cast<int>(d.x1) << ","
+                << static_cast<int>(d.y1) << "," << static_cast<int>(d.x2) << ","
+                << static_cast<int>(d.y2) << ") score=" << d.score << std::endl;
+    }
+    return 0;
   }
 
   const std::string input_path = arg2;

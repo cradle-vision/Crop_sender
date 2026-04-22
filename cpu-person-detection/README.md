@@ -66,6 +66,14 @@ Optional: confidence and IoU at the end (default 0.4, 0.5):
 ./detect_main ../models/person_detection_model.onnx ../input/in.jpg --draw ../output/out.jpg 0.5 0.5
 ```
 
+**Raw frame via stdin (production path)** — no JPEG encode/decode before detection:
+
+```bash
+cat /tmp/frame.bgr | ./detect_main ../models/person_detection_model.onnx --stdin-bgr --width 1280 --height 720 0.4 0.5
+```
+
+The stdin payload must be exactly `width * height * 3` bytes in `bgr24` layout.
+
 **Benchmark (FPS)** — run on a folder of images (no drawing):
 
 ```bash
