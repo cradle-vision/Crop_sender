@@ -20,6 +20,11 @@ def _project_root() -> Path:
 def _resolve_detect_executable() -> Tuple[Optional[Path], Optional[Path]]:
     """Returns (detect_main_executable, lib_dir_for_ld_library_path)."""
     root = _project_root()
+    # Prefer local build first (usually newest binary with latest CLI options).
+    build_bin = root / "cpu-person-detection" / "build" / "detect_main"
+    if build_bin.is_file():
+        return build_bin, None
+
     pkg = root / "cpu-person-detection" / "person_detection_linux_x64"
     direct = pkg / "bin" / "detect_main"
     if direct.is_file():
@@ -61,6 +66,40 @@ def _find_model_path() -> Path:
 _BBOX_PATTERN = re.compile(
     r"bbox \(x1,y1,x2,y2\)=\((\d+),(\d+),(\d+),(\d+)\) score=([\d.e+-]+)"
 )
+_STDIN_MODE_CACHE: dict[str, bool] = {}
+_STDIN_MODE_WARNED = False
+_STDIN_MODE_ERROR: Optional[str] = None
+_TIMEOUT_SEC = float(os.environ.get("PERSON_DETECT_TIMEOUT_SEC", "120"))
+
+
+def _supports_stdin_bgr(binary: Path, lib_dir: Optional[Path]) -> bool:
+    global _STDIN_MODE_ERROR
+    cache_key = str(binary.resolve())
+    cached = _STDIN_MODE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        out = subprocess.run(
+            [str(binary)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=_cwd_for_executable(binary),
+            env=_env_with_bundled_lib(lib_dir),
+        )
+        text = f"{out.stdout}\n{out.stderr}"
+        if "error while loading shared libraries" in text:
+            _STDIN_MODE_ERROR = "shared_libs"
+        elif "--stdin-bgr" not in text:
+            _STDIN_MODE_ERROR = "unsupported"
+        else:
+            _STDIN_MODE_ERROR = None
+        supported = "--stdin-bgr" in text
+    except Exception:
+        _STDIN_MODE_ERROR = "execution_failed"
+        supported = False
+    _STDIN_MODE_CACHE[cache_key] = supported
+    return supported
 
 
 def detect_persons(
@@ -77,6 +116,26 @@ def detect_persons(
     """
     binary, lib_dir = _resolve_detect_executable()
     if not binary:
+        return []
+    if not _supports_stdin_bgr(binary, lib_dir):
+        global _STDIN_MODE_WARNED
+        if not _STDIN_MODE_WARNED:
+            if _STDIN_MODE_ERROR == "shared_libs":
+                print(
+                    "[PersonDetector] detect_main failed to start: missing shared libs. "
+                    "Check LD_LIBRARY_PATH and packaged libs in cpu-person-detection/person_detection_linux_x64/lib."
+                )
+            elif _STDIN_MODE_ERROR == "unsupported":
+                print(
+                    "[PersonDetector] detect_main does not support --stdin-bgr. "
+                    "Please rebuild cpu-person-detection and update the runtime binary."
+                )
+            else:
+                print(
+                    "[PersonDetector] detect_main check failed. "
+                    "Unable to verify --stdin-bgr support."
+                )
+            _STDIN_MODE_WARNED = True
         return []
     model = Path(model_path or os.environ.get("PERSON_MODEL_PATH") or _find_model_path())
     if not model.exists():
@@ -110,15 +169,23 @@ def detect_persons(
         )
     cmd.extend([str(conf_threshold), str(iou_threshold)])
 
-    out = subprocess.run(
-        cmd,
-        input=frame_input.tobytes(),
-        capture_output=True,
-        text=False,
-        timeout=30,
-        cwd=_cwd_for_executable(binary),
-        env=_env_with_bundled_lib(lib_dir),
-    )
+    try:
+        out = subprocess.run(
+            cmd,
+            input=frame_input.tobytes(),
+            capture_output=True,
+            text=False,
+            timeout=_TIMEOUT_SEC,
+            cwd=_cwd_for_executable(binary),
+            env=_env_with_bundled_lib(lib_dir),
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"[PersonDetector] person_detect timeout after {_TIMEOUT_SEC}s "
+            f"for frame {w}x{h}. "
+            "Set PERSON_DETECT_TIMEOUT_SEC or use lower-resolution camera stream if CPU is overloaded."
+        )
+        return []
     if out.returncode != 0:
         stderr_text = (out.stderr or b"").decode("utf-8", errors="replace")
         stdout_text = (out.stdout or b"").decode("utf-8", errors="replace")
