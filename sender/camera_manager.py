@@ -1,8 +1,8 @@
-import cv2
 import yaml
 import os
 import json
 import ssl
+import subprocess
 import urllib.request
 import urllib.parse
 from typing import List, Dict, Optional, Union
@@ -14,8 +14,8 @@ class CameraInfo:
     """Camera information"""
     camera_id: str
     name: str
-    source: Union[int, str]  # Index for USB or URL for IP
-    type: str  # 'usb', 'rtsp', 'http', 'file'
+    source: Union[int, str]  # URL/path for stream source
+    type: str  # 'rtsp', 'http', 'file'
     ip_address: Optional[str] = None
     port: Optional[int] = None
     username: Optional[str] = None
@@ -195,15 +195,16 @@ class CameraManager:
                         out['port'] = port
                 else:
                     out['source'] = ''
-            # type
-            if 'camera_type' in out and out.get('camera_type') and 'type' not in out:
-                out['type'] = out['camera_type']
-            elif 'cameraType' in out and 'type' not in out:
-                out['type'] = out['cameraType']
-            elif 'kind' in out and 'type' not in out:
-                out['type'] = out['kind']
-            if 'type' not in out:
-                out['type'] = 'rtsp' if 'rtsp' in str(out.get('source', '')).lower() else 'http'
+
+            source_lower = str(out.get('source') or '').strip().lower()
+            if source_lower.startswith('rtsp://') or source_lower.startswith('rtsps://'):
+                out['type'] = 'rtsp'
+            elif source_lower.startswith('http://') or source_lower.startswith('https://'):
+                out['type'] = 'http'
+            elif source_lower:
+                out['type'] = 'file'
+            else:
+                out['type'] = 'rtsp'
             # name
             if 'label' in out and out.get('label'):
                 out['name'] = out['label']
@@ -471,33 +472,10 @@ class CameraManager:
         return True
     
     def scan_usb_cameras(self, max_index: int = 10) -> List[int]:
-        """
-        Scan available USB cameras
-        
-        Args:
-            max_index: Maximum index to check
-            
-        Returns:
-            List of available camera indices
-        """
-        available = []
-        print(f"[Camera Manager] Scanning USB cameras (0-{max_index-1})...")
-        
-        for i in range(max_index):
-            cap = cv2.VideoCapture(i)
-            if cap.isOpened():
-                ret, _ = cap.read()
-                if ret:
-                    available.append(i)
-                    print(f"  ✓ Found camera at index {i}")
-                cap.release()
-        
-        print(f"[Camera Manager] Found {len(available)} USB cameras: {available}")
-        return available
+        """USB cameras are not supported in this project."""
+        print("[Camera Manager] USB cameras are disabled")
+        return []
     
-    # RTSP options for test_camera (same as snapshot_capture_agent to avoid RTP/decoding errors)
-    _RTSP_FFMPEG_OPTS = "rtsp_transport=tcp|rtsp_flags=prefer_tcp|fflags=nobuffer|flags=low_delay|max_delay=5000000|stimeout=5000000"
-
     def test_camera(self, camera: CameraInfo) -> bool:
         """
         Test camera connection
@@ -509,30 +487,23 @@ class CameraManager:
             True if camera is available
         """
         source = self._build_source_url(camera)
-        if camera.type == 'rtsp' and isinstance(source, str):
-            if 'rtsp_transport=' not in source:
-                source = source + ('&' if '?' in source else '?') + 'rtsp_transport=tcp'
+        timeout = 20.0
+        cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error"]
         try:
-            old_opts = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS", "")
-            if camera.type == 'rtsp':
-                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self._RTSP_FFMPEG_OPTS
-            try:
-                cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG if camera.type == 'rtsp' else 0)
-            finally:
-                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = old_opts
-            if not cap.isOpened():
-                print(f"[Camera Manager] Failed to open camera {camera.camera_id}")
-                return False
-            
-            ret, frame = cap.read()
-            cap.release()
-
-            if ret and frame is not None:
+            if camera.type == "rtsp":
+                cmd += ["-rtsp_transport", "tcp", "-i", str(source), "-frames:v", "1", "-f", "null", "-"]
+            else:
+                cmd += ["-i", str(source), "-frames:v", "1", "-f", "null", "-"]
+            r = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
+            if r.returncode == 0:
                 print(f"[Camera Manager] ✓ Camera {camera.camera_id} available")
                 return True
-            else:
-                print(f"[Camera Manager] ✗ Camera {camera.camera_id} not responding")
-                return False
+            err = (r.stderr or b"").decode(errors="replace")[:300]
+            print(f"[Camera Manager] ✗ Camera {camera.camera_id} not responding: {err or r.returncode}")
+            return False
+        except subprocess.TimeoutExpired:
+            print(f"[Camera Manager] ✗ Camera {camera.camera_id} test timed out")
+            return False
         except Exception as e:
             print(f"[Camera Manager] Camera test error {camera.camera_id}: {e}")
             return False
@@ -547,8 +518,6 @@ class CameraManager:
         Returns:
             URL or source index
         """
-        if camera.type == 'usb':
-            return camera.source if isinstance(camera.source, int) else int(camera.source)
         if camera.type in ('rtsp', 'http') and isinstance(camera.source, str) and '://' in camera.source:
             return camera.source
         elif camera.type == 'rtsp':
@@ -624,19 +593,6 @@ class CameraManager:
         )
         camera.source = self._build_source_url(camera)
         return camera
-    
-    def create_usb_camera(self, camera_id: str, name: str, source_index: int,
-                         fps: float = 10.0, width: int = 640, height: int = 480) -> CameraInfo:
-        """Create USB camera"""
-        return CameraInfo(
-            camera_id=camera_id,
-            name=name,
-            source=source_index,
-            type="usb",
-            fps=fps,
-            width=width,
-            height=height
-        )
     
     def create_file_camera(self, camera_id: str, name: str, file_path: str,
                           fps: float = 10.0, width: int = 640, height: int = 480) -> CameraInfo:

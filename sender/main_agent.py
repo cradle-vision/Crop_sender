@@ -4,7 +4,7 @@ import time
 import signal
 import sys
 from urllib.parse import urlparse, urlunparse
-from typing import Dict
+from typing import Dict, Union
 
 try:
     import requests
@@ -24,7 +24,23 @@ from camera_manager import CameraManager
 from person_crop import detect_persons, crop_persons, is_available as person_detector_available
 from jpeg_utils import encode_jpeg_bgr
 
-PIPELINE_FPS = 5.0
+PIPELINE_FPS = 3.0
+_STREAM_TYPES = frozenset({"rtsp", "http", "file"})
+
+
+def _capture_transport_type(camera_type: str, source: Union[int, str, None]) -> str:
+    """Map backend types (entry/exit) to actual capture transport."""
+    if camera_type in _STREAM_TYPES:
+        return camera_type
+    if isinstance(source, int):
+        return "rtsp"
+    src = str(source).strip() if source is not None else ""
+    low = src.lower()
+    if low.startswith("rtsp://") or low.startswith("rtsps://"):
+        return "rtsp"
+    if low.startswith("http://") or low.startswith("https://"):
+        return "http"
+    return "rtsp"
 
 
 def _env(key: str, default: str = "") -> str:
@@ -169,8 +185,8 @@ class MainAgent:
                 print(f"[Main Agent] Camera {camera.camera_id} disabled")
                 continue
             
-            # Build source URL for IP cameras
-            if camera.type in ['rtsp', 'http']:
+            transport = _capture_transport_type(camera.type, camera.source)
+            if transport in ("rtsp", "http"):
                 source = self.camera_manager._build_source_url(camera)
             else:
                 source = camera.source
@@ -189,12 +205,12 @@ class MainAgent:
                 width=camera.width,
                 height=camera.height,
                 camera_id=camera.camera_id,
-                camera_type=camera.type,
+                camera_type=_capture_transport_type(camera.type, source),
             )
             
             self.capture_agents[camera.camera_id] = capture_agent
             print(f"[Main Agent] Initialized camera: {camera.camera_id} "
-                  f"({camera.name}, type: {camera.type}, source: {source})")
+                  f"({camera.name}, type: {camera.type}, capture: {_capture_transport_type(camera.type, source)}, source: {source})")
         
     def _resolve_path(self, path: str) -> str:
         """Resolve path: if relative and not found in cwd, try project root (parent of sender/)."""
