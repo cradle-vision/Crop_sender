@@ -61,10 +61,11 @@ class UpstreamConfig:
     """
 
     rtmp_url_template: str = ""
-
+    """Шаблон URL для фронта (HLS и т.д.), тот же stream_key: https://cdn/w/{stream_key}.m3u8"""
     playback_url_template: str = ""
     ffmpeg_path: str = "ffmpeg"
     ffmpeg_extra_args: list[str] = field(default_factory=list)
+    # True: libx264 вместо copy — новые монотонные PTS/DTS (камеры с «ломаными» таймстампами / RTP cseq).
     transcode: bool = False
 
 
@@ -77,9 +78,9 @@ class AgentConfig:
     reconnect_backoff_initial_sec: float = 2.0
     reconnect_backoff_max_sec: float = 60.0
     idle_grace_sec: float = 10.0
-    
+    # viewer_idle_stop: False = гасить только по stop_stream; True = ещё auto-stop при нуле зрителей (viewer_*)
     viewer_idle_stop: bool = True
-
+    # delivery: local_webrtc | upstream_rtmp | both — см. README
     delivery: str = "local_webrtc"
     mediamtx: MediaMTXConfig = field(default_factory=MediaMTXConfig)
     upstream: UpstreamConfig = field(default_factory=UpstreamConfig)
