@@ -75,7 +75,6 @@ class StreamManager:
                 return
             st.active = False
             sid = st.session_id
-            rtsp_url = st.rtsp_url
         detail = (stderr_tail or "").strip()[-1200:]
         payload: dict[str, Any] = {
             "ok": False,
@@ -96,30 +95,6 @@ class StreamManager:
             camera_id,
             exit_code,
         )
-        # Auto-restart upstream stream on abnormal ffmpeg exit.
-        if (
-            self._upstream
-            and self.cfg.delivery in ("upstream_rtmp", "both")
-            and exit_code not in (0, -15, -9)
-        ):
-            await asyncio.sleep(1.0)
-            try:
-                ok, err, _ = await self._upstream.start(camera_id, rtsp_url, self.cfg.agent_id)
-                if ok:
-                    async with self._lock:
-                        st2 = self._streams.get(camera_id)
-                        if st2:
-                            st2.active = True
-                    logger.info("upstream auto-restarted camera=%s after exit_code=%s", camera_id, exit_code)
-                else:
-                    logger.warning(
-                        "upstream auto-restart failed camera=%s exit_code=%s err=%s",
-                        camera_id,
-                        exit_code,
-                        err,
-                    )
-            except Exception:
-                logger.exception("upstream auto-restart exception camera=%s", camera_id)
 
     def _playback_url(self, camera_id: str) -> str | None:
         tpl = self.cfg.upstream.playback_url_template.strip()

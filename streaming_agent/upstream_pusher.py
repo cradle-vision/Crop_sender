@@ -29,7 +29,7 @@ def format_template(tpl: str, *, stream_key: str, agent_id: str, camera_id: str)
 
 
 class UpstreamPusher:
-    """RTSP → RTMP: default stream copy (H.264); optional transcode to H.264 for H.265/HEVC or bad timestamps."""
+    """One FFmpeg process per camera: RTSP → RTMP (copy, no transcode when possible)."""
 
     def __init__(
         self,
@@ -49,7 +49,7 @@ class UpstreamPusher:
         self._procs: dict[str, asyncio.subprocess.Process] = {}
 
     def _ffmpeg_args(self, rtsp_url: str, rtmp: str) -> list[str]:
-        """RTSP → FLV/RTMP: copy (H.264) or libx264 transcode (H.265 / broken PTS)."""
+        """RTSP → FLV/RTMP. Default: copy + genpts; optional transcode for broken PTS/DTS (Hikvision, etc.)."""
         ffmpeg = shutil.which(self.ffmpeg_path) or self.ffmpeg_path
         head: list[str] = [
             ffmpeg,
@@ -57,75 +57,36 @@ class UpstreamPusher:
             "-loglevel",
             "warning",
             "-fflags",
-            "+genpts+discardcorrupt+igndts",
-            "-err_detect",
-            "ignore_err",
+            "+genpts+discardcorrupt",
             "-max_delay",
             "5000000",
             "-rtsp_transport",
             self.rtsp_transport,
+            "-use_wallclock_as_timestamps",
+            "1",
+            "-i",
+            rtsp_url,
+            "-map",
+            "0:v:0",
         ]
-        if not self.transcode:
-            head.extend(["-use_wallclock_as_timestamps", "1"])
-        head.extend(
-            [
-                "-i",
-                rtsp_url,
-                "-map",
-                "0:v:0",
-            ]
-        )
-        flv_live = [
-            "-muxdelay",
-            "0",
-            "-muxpreload",
-            "0",
-            "-f",
-            "flv",
-            "-flvflags",
-            "no_duration_filesize",
-        ]
+        flv_live = ["-f", "flv", "-flvflags", "no_duration_filesize"]
         if self.transcode:
             mid: list[str] = [
-                "-vf",
-                "setpts=PTS-STARTPTS,scale=1920:1080:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p,setsar=1",
-                "-fps_mode",
-                "cfr",
                 "-c:v",
                 "libx264",
                 "-preset",
                 "veryfast",
-                "-crf",
-                "23",
                 "-tune",
                 "zerolatency",
                 "-pix_fmt",
                 "yuv420p",
-                "-r",
-                "3",
                 "-g",
-                "6",
+                "50",
                 "-keyint_min",
-                "6",
-                "-sc_threshold",
-                "0",
+                "50",
                 "-bf",
                 "0",
-                "-profile:v",
-                "main",
-                "-level",
-                "4.1",
-                "-x264-params",
-                "keyint=6:min-keyint=6:scenecut=0:repeat-headers=1:aud=1",
-                "-maxrate",
-                "2M",
-                "-bufsize",
-                "4M",
                 "-an",
-                "-avoid_negative_ts",
-                "make_zero",
-                "-max_muxing_queue_size",
-                "2048",
                 *flv_live,
             ]
         else:
@@ -169,12 +130,13 @@ class UpstreamPusher:
         args = self._ffmpeg_args(rtsp_url, rtmp)
         if self.transcode:
             logger.info(
-                "upstream mode=transcode(libx264) camera=%s — H.265/HEVC or bad timestamps → H.264 for FLV/RTMP (higher CPU)",
+                "upstream mode=transcode(libx264) camera=%s (stable timestamps; higher CPU)",
                 camera_id,
             )
         else:
             logger.info(
-                "upstream mode=copy camera=%s — H.264 RTSP; for H.265 set STREAMING_UPSTREAM_TRANSCODE=true",
+                "upstream mode=copy camera=%s — при «Timestamps are unset» / обрыве RTMP задайте "
+                "STREAMING_UPSTREAM_TRANSCODE=true или transcode: true в streaming-agent.yaml",
                 camera_id,
             )
 
@@ -207,7 +169,7 @@ class UpstreamPusher:
         )
         return True, None, {"stream_key": sk, "rtmp_dest": _redact_url(rtmp)}
 
-    async def stop(self, camera_id: str, *, reason: str = "") -> None:
+    async def stop(self, camera_id: str) -> None:
         proc = self._procs.pop(camera_id, None)
         if not proc:
             return
@@ -222,10 +184,7 @@ class UpstreamPusher:
                 await proc.wait()
         except ProcessLookupError:
             pass
-        if reason:
-            logger.info("upstream stopped camera=%s reason=%s", camera_id, reason)
-        else:
-            logger.info("upstream stopped camera=%s", camera_id)
+        logger.info("upstream stopped camera=%s", camera_id)
 
     @staticmethod
     async def _read_stderr_tail(proc: asyncio.subprocess.Process) -> str:
