@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 
@@ -21,6 +22,10 @@ logger = logging.getLogger("streaming_agent.main")
 
 
 async def _run_async(config_path: str | None) -> None:
+    enabled = os.getenv("STREAMING_AGENT_ENABLED")
+    if enabled is not None and enabled.strip().lower() in ("0", "false", "no", "off"):
+        logger.info("STREAMING_AGENT_ENABLED is false; exiting (streaming disabled).")
+        return
     cfg = load_config(config_path)
     mtx = MediaMTXClient(cfg.mediamtx.api_url)
     stream_manager = StreamManager(cfg, mtx, on_status=None)

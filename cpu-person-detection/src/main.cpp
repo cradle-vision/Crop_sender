@@ -3,13 +3,17 @@
  * Uses YOLOv8 ONNX (person only), CPU.
  * Default: input image -> print bbox (x1,y1,x2,y2) and score to stdout.
  * With --draw: input image -> output image with boxes drawn.
+ * With --stdin-bgr: raw BGR frame from stdin (--width/--height required).
+ * Optional: --line x1 y1 x2 y2 --inside_point ix iy (store-front / tripwire filter).
  * With --benchmark <input_dir>: run on all images in folder, report FPS.
- * Usage: detect_main <model.onnx> <input_image> [--draw <output_image>] [conf] [iou]
+ * Usage: detect_main <model.onnx> <input_image> [--draw <out>] [--line ... --inside_point ...] [conf] [iou]
+ *        detect_main <model.onnx> --stdin-bgr --width W --height H [--line ... --inside_point ...] [conf] [iou]
  *        detect_main <model.onnx> --benchmark <input_dir> [conf] [iou]
  */
 #include "detector.hpp"
 #include "draw.hpp"
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 #include <iostream>
 #include <cstring>
 #include <chrono>
@@ -17,6 +21,7 @@
 #include <string>
 #include <algorithm>
 #include <cstdlib>
+#include <cmath>
 #include <limits>
 
 #include <filesystem>
@@ -30,6 +35,54 @@ static bool hasImageExtension(const std::string& path) {
   if (ext.empty()) return false;
   for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   return ext == "jpg" || ext == "jpeg" || ext == "png";
+}
+
+// Store-front / tripwire: line a*x + b*y + c = 0; keep bbox bottom-center on same side as inside point.
+struct LineEq {
+  float a{0}, b{0}, c{0};
+};
+
+static LineEq lineFromTwoPoints(float x1, float y1, float x2, float y2) {
+  LineEq L;
+  L.a = y1 - y2;
+  L.b = x2 - x1;
+  L.c = x1 * y2 - x2 * y1;
+  return L;
+}
+
+static float lineEval(const LineEq& L, float x, float y) {
+  return L.a * x + L.b * y + L.c;
+}
+
+static constexpr float kLineEvalEps = 1e-6f;
+
+static void applyStoreLineFilter(std::vector<Detection>& detections,
+                                 bool has_store_line,
+                                 bool has_inside_point,
+                                 const LineEq& store_line,
+                                 float inside_sign) {
+  if (!has_store_line) return;
+  if (!has_inside_point) {
+    std::cerr << "[main] Warning: --line was provided but --inside_point is missing; skipping store-front filtering.\n";
+    return;
+  }
+  if (std::fabs(inside_sign) < kLineEvalEps) {
+    std::cerr << "[main] Warning: --inside_point is exactly on the line; inside test may be unstable.\n";
+    return;
+  }
+  std::vector<Detection> filtered;
+  filtered.reserve(detections.size());
+  for (const auto& d : detections) {
+    float cx = 0.5f * (d.x1 + d.x2);
+    float cy = d.y2;
+    float s = lineEval(store_line, cx, cy);
+    if (inside_sign >= 0.0f) {
+      if (s >= -kLineEvalEps) filtered.push_back(d);
+    } else {
+      if (s <= kLineEvalEps) filtered.push_back(d);
+    }
+  }
+  detections.swap(filtered);
 }
 
 static std::vector<std::string> listImagesInDir(const std::string& dir_path) {
@@ -126,6 +179,8 @@ int main(int argc, char* argv[]) {
               << "  Default: print bbox (x1,y1,x2,y2) and score to stdout.\n"
               << "  --draw: draw boxes and save to <output_image>.\n"
               << "  --stdin-bgr: read one raw BGR frame from stdin.\n"
+              << "  Optional store-front filter (image or stdin): --line x1 y1 x2 y2 --inside_point ix iy\n"
+              << "    Keeps only persons whose bbox bottom-center is on the same side as --inside_point.\n"
               << "  --benchmark: run on all images in <input_dir>, report FPS.\n"
               << "  Example (bbox):   " << argv[0] << " ../models/person_detection_model.onnx ../input/in.jpg\n"
               << "  Example (stdin):  " << argv[0] << " ../models/person_detection_model.onnx --stdin-bgr --width 1280 --height 720\n"
@@ -156,6 +211,10 @@ int main(int argc, char* argv[]) {
   if (stdin_bgr_mode) {
     int width = 0;
     int height = 0;
+    bool has_store_line = false;
+    bool has_inside_point = false;
+    LineEq store_line;
+    float inside_sign = 0.0f;
     int idx = 3;
     while (idx < argc) {
       const std::string flag = argv[idx];
@@ -178,19 +237,33 @@ int main(int argc, char* argv[]) {
         continue;
       }
       if (flag == "--line") {
-        idx += 5;
-        if (idx > argc) {
-          std::cerr << "[main] --line requires 4 integers\n";
+        if (idx + 4 >= argc) {
+          std::cerr << "[main] --line requires: --line x1 y1 x2 y2\n";
           return 1;
         }
+        float x1 = static_cast<float>(atof(argv[idx + 1]));
+        float y1 = static_cast<float>(atof(argv[idx + 2]));
+        float x2 = static_cast<float>(atof(argv[idx + 3]));
+        float y2 = static_cast<float>(atof(argv[idx + 4]));
+        store_line = lineFromTwoPoints(x1, y1, x2, y2);
+        has_store_line = true;
+        idx += 5;
         continue;
       }
       if (flag == "--inside_point") {
-        idx += 3;
-        if (idx > argc) {
-          std::cerr << "[main] --inside_point requires 2 integers\n";
+        if (!has_store_line) {
+          std::cerr << "[main] --inside_point must be provided after --line\n";
           return 1;
         }
+        if (idx + 2 >= argc) {
+          std::cerr << "[main] --inside_point requires: --inside_point ix iy\n";
+          return 1;
+        }
+        float ix = static_cast<float>(atof(argv[idx + 1]));
+        float iy = static_cast<float>(atof(argv[idx + 2]));
+        inside_sign = lineEval(store_line, ix, iy);
+        has_inside_point = true;
+        idx += 3;
         continue;
       }
       break;
@@ -240,6 +313,7 @@ int main(int argc, char* argv[]) {
     detector.setIouThreshold(iou);
 
     std::vector<Detection> detections = detector.detect(image);
+    applyStoreLineFilter(detections, has_store_line, has_inside_point, store_line, inside_sign);
     for (size_t i = 0; i < detections.size(); ++i) {
       const auto& d = detections[i];
       std::cout << "bbox (x1,y1,x2,y2)=(" << static_cast<int>(d.x1) << ","
@@ -253,6 +327,11 @@ int main(int argc, char* argv[]) {
   bool draw_mode = false;
   std::string output_path;
 
+  bool has_store_line = false;
+  bool has_inside_point = false;
+  LineEq store_line;
+  float inside_sign = 0.0f;
+
   int idx = 3;
   if (idx < argc && std::strcmp(argv[idx], "--draw") == 0) {
     draw_mode = true;
@@ -263,8 +342,50 @@ int main(int argc, char* argv[]) {
     }
     output_path = argv[idx++];
   }
-  if (idx < argc) conf = static_cast<float>(atof(argv[idx++]));
-  if (idx < argc) iou = static_cast<float>(atof(argv[idx++]));
+
+  int positional_count = 0;
+  while (idx < argc) {
+    const std::string tok = argv[idx];
+    if (tok == "--line") {
+      if (idx + 4 >= argc) {
+        std::cerr << "[main] --line requires: --line x1 y1 x2 y2\n";
+        return 1;
+      }
+      float x1 = static_cast<float>(atof(argv[idx + 1]));
+      float y1 = static_cast<float>(atof(argv[idx + 2]));
+      float x2 = static_cast<float>(atof(argv[idx + 3]));
+      float y2 = static_cast<float>(atof(argv[idx + 4]));
+      store_line = lineFromTwoPoints(x1, y1, x2, y2);
+      has_store_line = true;
+      idx += 5;
+      continue;
+    }
+    if (tok == "--inside_point") {
+      if (!has_store_line) {
+        std::cerr << "[main] --inside_point must be provided after --line\n";
+        return 1;
+      }
+      if (idx + 2 >= argc) {
+        std::cerr << "[main] --inside_point requires: --inside_point ix iy\n";
+        return 1;
+      }
+      float ix = static_cast<float>(atof(argv[idx + 1]));
+      float iy = static_cast<float>(atof(argv[idx + 2]));
+      inside_sign = lineEval(store_line, ix, iy);
+      has_inside_point = true;
+      idx += 3;
+      continue;
+    }
+    if (positional_count == 0) {
+      conf = static_cast<float>(atof(argv[idx++]));
+      positional_count++;
+    } else if (positional_count == 1) {
+      iou = static_cast<float>(atof(argv[idx++]));
+      positional_count++;
+    } else {
+      ++idx;
+    }
+  }
 
   cv::Mat image = cv::imread(input_path);
   if (image.empty()) {
@@ -281,6 +402,7 @@ int main(int argc, char* argv[]) {
   detector.setIouThreshold(iou);
 
   std::vector<Detection> detections = detector.detect(image);
+  applyStoreLineFilter(detections, has_store_line, has_inside_point, store_line, inside_sign);
 
   for (size_t i = 0; i < detections.size(); ++i) {
     const auto& d = detections[i];
@@ -291,6 +413,21 @@ int main(int argc, char* argv[]) {
 
   if (draw_mode) {
     drawDetections(image, detections);
+    if (has_store_line && has_inside_point) {
+      int w = image.cols;
+      cv::Point p1, p2;
+      if (std::fabs(store_line.b) > kLineEvalEps) {
+        float y0 = -(store_line.a * 0.0f + store_line.c) / store_line.b;
+        float yw = -(store_line.a * static_cast<float>(w) + store_line.c) / store_line.b;
+        p1 = cv::Point(0, static_cast<int>(y0));
+        p2 = cv::Point(w, static_cast<int>(yw));
+      } else {
+        float x = (std::fabs(store_line.a) > kLineEvalEps) ? (-store_line.c / store_line.a) : 0.0f;
+        p1 = cv::Point(static_cast<int>(x), 0);
+        p2 = cv::Point(static_cast<int>(x), image.rows);
+      }
+      cv::line(image, p1, p2, cv::Scalar(0, 0, 255), 2);
+    }
     if (!cv::imwrite(output_path, image)) {
       std::cerr << "[main] Failed to write image: " << output_path << std::endl;
       return 1;

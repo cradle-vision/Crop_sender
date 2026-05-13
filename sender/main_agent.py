@@ -24,7 +24,7 @@ from camera_manager import CameraManager
 from person_crop import detect_persons, crop_persons, is_available as person_detector_available
 from jpeg_utils import encode_jpeg_bgr
 
-PIPELINE_FPS = 3.0
+PIPELINE_FPS = 10.0
 _STREAM_TYPES = frozenset({"rtsp", "http", "file"})
 
 

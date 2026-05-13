@@ -11,7 +11,7 @@ from typing import Optional, Callable, Union
 
 import numpy as np
 
-_PIPELINE_FPS = 3.0
+_PIPELINE_FPS = 10.0
 
 
 class SnapshotCaptureAgent:
@@ -134,19 +134,16 @@ class SnapshotCaptureAgent:
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL
                 )
                 assert self._ffmpeg_proc.stdout is not None
-                last_capture_time = 0.0
                 while self.is_running and self._ffmpeg_proc.poll() is None:
                     raw = self._ffmpeg_proc.stdout.read(frame_size)
                     if len(raw) != frame_size:
                         break
                     current_time = time.time()
-                    if current_time - last_capture_time < self.frame_interval:
-                        continue
                     frame = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
-                    last_capture_time = current_time
                     if self.callback:
                         try:
-                            self.callback(frame.copy(), current_time)
+                            # Avoid per-frame copy; downstream can copy if needed.
+                            self.callback(frame, current_time)
                         except Exception as e:
                             print(f"[Capture Agent {self.camera_id}] Callback error: {e}")
                     error_count = 0

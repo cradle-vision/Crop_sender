@@ -19,6 +19,7 @@ services:
     build: .
     container_name: streaming-agent
     restart: unless-stopped
+    profiles: ["streaming"]
     pids_limit: 4096
     volumes:
       - ./streaming_agent/streaming-agent.yaml.example:/app/config/streaming-agent.yaml:ro
