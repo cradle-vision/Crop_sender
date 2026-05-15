@@ -1,50 +1,64 @@
 """
 Snapshot Capture Agent
-Captures frames from camera with fixed FPS using FFmpeg only.
+Captures frames from camera via FFmpeg; samples with the fps filter (not -r on raw output).
+Capture thread reads as fast as FFmpeg emits; a worker thread runs the callback so the pipe
+does not stall.
+
+Processing queue: bounded backlog between capture and detection. Larger maxsize tolerates
+bursts and slow inference (fewer dropped frames) at the cost of higher latency and RAM; when
+full, oldest pending frames are dropped so capture never blocks indefinitely.
 """
 
 import subprocess
 import time
 import threading
-from queue import Queue
-from typing import Optional, Callable, Union
+from queue import Queue, Full, Empty
+from typing import Callable, Optional, Tuple, Union
 
 import numpy as np
 
-_PIPELINE_FPS = 10.0
+_PROCESS_SENTINEL = object()
+
+_DEFAULT_CAPTURE_FPS = 5.0
+_MAX_PROCESSING_QUEUE = 500
+_DEFAULT_PROCESSING_QUEUE_MAX = 100
 
 
 class SnapshotCaptureAgent:
-    """Agent for capturing snapshots from camera"""
+    """Agent for capturing snapshots from camera."""
 
     def __init__(
         self,
         source: Union[int, str] = 0,
-        fps: float = _PIPELINE_FPS,
+        fps: float = _DEFAULT_CAPTURE_FPS,
         width: int = 640,
         height: int = 480,
         camera_id: str = "camera_0",
         camera_type: str = "rtsp",
+        processing_queue_max: int = _DEFAULT_PROCESSING_QUEUE_MAX,
     ):
         self.source = source
-        self.fps = _PIPELINE_FPS
+        self.fps = max(0.0, float(fps))
         self.width = width
         self.height = height
         self.camera_id = camera_id
         self.camera_type = camera_type
-        self.frame_interval = 1.0 / self.fps
+        self.frame_interval = (1.0 / self.fps) if self.fps > 0 else 0.0
+
+        pq = int(processing_queue_max)
+        self.processing_queue_max = min(_MAX_PROCESSING_QUEUE, max(1, pq))
 
         self._input_for_ffmpeg: Optional[str] = None
         self.is_running = False
         self.capture_thread: Optional[threading.Thread] = None
-        self.frame_queue: Queue = Queue(maxsize=30)
+        self.processing_thread: Optional[threading.Thread] = None
+        self.processing_queue: Queue = Queue(maxsize=self.processing_queue_max)
         self.callback: Optional[Callable] = None
         self._ffmpeg_proc: Optional[subprocess.Popen] = None
-        if fps != _PIPELINE_FPS:
-            print(
-                f"[Capture Agent {self.camera_id}] Requested FPS {fps} ignored. "
-                f"Using fixed pipeline FPS: {_PIPELINE_FPS}"
-            )
+        print(
+            f"[Capture Agent {self.camera_id}] Processing queue depth: {self.processing_queue_max} "
+            f"(higher = more backlog tolerance, more latency/RAM if detection is slow)"
+        )
 
     def start(self, callback: Optional[Callable] = None):
         if self.is_running:
@@ -64,12 +78,18 @@ class SnapshotCaptureAgent:
         self.is_running = True
         self.capture_thread = threading.Thread(target=self._capture_loop_ffmpeg, daemon=True)
         self.capture_thread.start()
-        print(f"[Capture Agent {self.camera_id}] Capture started with FPS: {self.fps}")
+        if self.callback is not None:
+            self.processing_thread = threading.Thread(target=self._processing_loop, daemon=True)
+            self.processing_thread.start()
+        if self.fps > 0:
+            print(f"[Capture Agent {self.camera_id}] Capture started (FFmpeg fps filter: {self.fps})")
+        else:
+            print(f"[Capture Agent {self.camera_id}] Capture started (full decode rate; high CPU/bandwidth)")
 
     def stop(self):
         self.is_running = False
         if self.capture_thread:
-            self.capture_thread.join(timeout=2.0)
+            self.capture_thread.join(timeout=3.0)
         if self._ffmpeg_proc is not None:
             try:
                 self._ffmpeg_proc.terminate()
@@ -80,6 +100,18 @@ class SnapshotCaptureAgent:
                 except Exception:
                     pass
             self._ffmpeg_proc = None
+        if self.processing_thread is not None:
+            while True:
+                try:
+                    self.processing_queue.put_nowait(_PROCESS_SENTINEL)
+                    break
+                except Full:
+                    try:
+                        self.processing_queue.get_nowait()
+                    except Empty:
+                        pass
+            self.processing_thread.join(timeout=10.0)
+            self.processing_thread = None
         print(f"[Capture Agent {self.camera_id}] Capture stopped")
 
     def _probe_resolution(self) -> tuple[int, int]:
@@ -118,6 +150,42 @@ class SnapshotCaptureAgent:
             return base + ["-i", inp]
         return base + ["-i", inp]
 
+    def _ffmpeg_output_suffix(self) -> list[str]:
+        """Output raw BGR24. Use fps filter for steady sampling; avoid -r on rawvideo (dup/drop)."""
+        out: list[str] = []
+        if self.fps > 0:
+            out.extend(["-vf", f"fps={self.fps}"])
+        out.extend(["-f", "rawvideo", "-pix_fmt", "bgr24", "-an", "-"])
+        return out
+
+    def _offer_processing(self, item: Tuple[float, np.ndarray]) -> None:
+        """Enqueue for the worker; drop oldest pending frames if queue is full."""
+        while True:
+            try:
+                self.processing_queue.put_nowait(item)
+                return
+            except Full:
+                try:
+                    self.processing_queue.get_nowait()
+                except Empty:
+                    pass
+
+    def _processing_loop(self) -> None:
+        while True:
+            try:
+                item = self.processing_queue.get(timeout=0.5)
+            except Empty:
+                continue
+            if item is _PROCESS_SENTINEL:
+                break
+            ts, frame = item
+            if self.callback is None:
+                continue
+            try:
+                self.callback(frame, ts)
+            except Exception as e:
+                print(f"[Capture Agent {self.camera_id}] Callback error: {e}")
+
     def _capture_loop_ffmpeg(self):
         error_count = 0
         while self.is_running:
@@ -126,10 +194,7 @@ class SnapshotCaptureAgent:
                 if w <= 0 or h <= 0:
                     w, h = self.width, self.height
                 frame_size = w * h * 3
-                cmd = self._ffmpeg_decode_prefix() + [
-                    "-f", "rawvideo", "-pix_fmt", "bgr24",
-                    "-r", str(int(_PIPELINE_FPS)), "-an", "-",
-                ]
+                cmd = self._ffmpeg_decode_prefix() + self._ffmpeg_output_suffix()
                 self._ffmpeg_proc = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL
                 )
@@ -138,14 +203,12 @@ class SnapshotCaptureAgent:
                     raw = self._ffmpeg_proc.stdout.read(frame_size)
                     if len(raw) != frame_size:
                         break
+                    if not self.is_running:
+                        break
                     current_time = time.time()
-                    frame = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3))
-                    if self.callback:
-                        try:
-                            # Avoid per-frame copy; downstream can copy if needed.
-                            self.callback(frame, current_time)
-                        except Exception as e:
-                            print(f"[Capture Agent {self.camera_id}] Callback error: {e}")
+                    if self.callback is not None:
+                        frame = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3)).copy()
+                        self._offer_processing((current_time, frame))
                     error_count = 0
             except Exception as e:
                 error_count += 1
@@ -162,16 +225,10 @@ class SnapshotCaptureAgent:
             if self.is_running:
                 time.sleep(2.0)
 
-    def get_frame(self, timeout: float = 1.0) -> Optional[tuple]:
-        try:
-            return self.frame_queue.get(timeout=timeout)
-        except Exception:
-            return None
-
     def update_fps(self, new_fps: float):
-        self.fps = _PIPELINE_FPS
-        self.frame_interval = 1.0 / self.fps
+        self.fps = max(0.0, float(new_fps))
+        self.frame_interval = (1.0 / self.fps) if self.fps > 0 else 0.0
         print(
-            f"[Capture Agent {self.camera_id}] FPS update request ({new_fps}) ignored. "
-            f"Fixed FPS: {self.fps}"
+            f"[Capture Agent {self.camera_id}] FPS set to {self.fps} "
+            f"(applied on next FFmpeg reconnect after a stream error or restart)"
         )

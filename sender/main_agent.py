@@ -24,7 +24,6 @@ from camera_manager import CameraManager
 from person_crop import detect_persons, crop_persons, is_available as person_detector_available
 from jpeg_utils import encode_jpeg_bgr
 
-PIPELINE_FPS = 10.0
 _STREAM_TYPES = frozenset({"rtsp", "http", "file"})
 
 
@@ -63,12 +62,24 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
+def _env_int(key: str, default: int, min_v: int = 0, max_v: int = 2147483647) -> int:
+    try:
+        raw = os.getenv(key)
+        v = int(float(raw)) if raw not in (None, "") else int(default)
+    except (ValueError, TypeError):
+        v = int(default)
+    return max(min_v, min(max_v, v))
+
+
 class MainAgent:
     """Main coordinator agent. Configuration from .env only."""
 
     def __init__(self, cameras_config_path: str = None):
         self.running = False
         self._snapshot_sent = set()
+        self._sender_debug = _env_bool("SENDER_DEBUG", False)
+        self._debug_no_person_interval = max(2.0, _env_float("SENDER_DEBUG_NO_PERSON_INTERVAL_SEC", 15.0))
+        self._debug_miss_state: Dict[str, dict] = {}
         self._backend_bearer_token = None
         self.backend_snapshot_base_url = None
         backend_timeout = _env_float('BACKEND_CAMERAS_TIMEOUT', 10.0)
@@ -164,7 +175,21 @@ class MainAgent:
             )
         print("[Main Agent] Using person detection (cpu-person-detection binary)")
         print("[Main Agent] RTSP capture: using FFmpeg pipe only")
-        
+
+        # Decode/sample rate: FFmpeg fps= filter from DEFAULT_FPS in .env. 0 = full stream rate (high CPU).
+        self.capture_fps = max(0.0, _env_float("DEFAULT_FPS", 20.0))
+        self.processing_queue_max = _env_int("PROCESSING_QUEUE_MAX", 100, 1, 500)
+        print(
+            f"[Main Agent] DEFAULT_FPS={self.capture_fps} "
+            f"(FFmpeg fps filter; 0 = unlimited), PROCESSING_QUEUE_MAX={self.processing_queue_max}"
+        )
+        if self._sender_debug:
+            print(
+                f"[Main Agent] SENDER_DEBUG=1: person hits logged; "
+                f"'no crop' summary every {self._debug_no_person_interval:.0f}s per camera "
+                f"(SENDER_DEBUG_NO_PERSON_INTERVAL_SEC)"
+            )
+
         # Capture agents for each camera
         self.capture_agents: Dict[str, SnapshotCaptureAgent] = {}
         self._init_cameras()
@@ -196,16 +221,14 @@ class MainAgent:
                 print(f"[Main Agent] Camera {camera.camera_id} has no stream URL, skipping capture (add ddns_rtsp_url/ddns_stream_url in backend)")
                 continue
             
-            # Fixed pipeline FPS for stable quality/latency.
-            fps = PIPELINE_FPS
-            
             capture_agent = SnapshotCaptureAgent(
                 source=source,
-                fps=fps,
+                fps=self.capture_fps,
                 width=camera.width,
                 height=camera.height,
                 camera_id=camera.camera_id,
                 camera_type=_capture_transport_type(camera.type, source),
+                processing_queue_max=self.processing_queue_max,
             )
             
             self.capture_agents[camera.camera_id] = capture_agent
@@ -308,6 +331,37 @@ class MainAgent:
             line_params=line_params,
         )
         crops = crop_persons(frame, rects)
+        h, w = frame.shape[:2]
+
+        if self._sender_debug:
+            if crops:
+                print(
+                    f"[DEBUG] camera={camera_id} person_hit boxes={len(rects)} crops={len(crops)} "
+                    f"frame={w}x{h} PERSON_CONF={self.person_conf} PERSON_IOU={self.person_iou}"
+                )
+                self._debug_miss_state.pop(camera_id, None)
+            elif rects:
+                print(
+                    f"[DEBUG] camera={camera_id} boxes={len(rects)} but 0 crops (unexpected); "
+                    f"frame={w}x{h}"
+                )
+            else:
+                st = self._debug_miss_state.setdefault(
+                    camera_id,
+                    {"since_log": time.monotonic(), "frames": 0},
+                )
+                st["frames"] += 1
+                now = time.monotonic()
+                if now - st["since_log"] >= self._debug_no_person_interval:
+                    trip = "on" if line_params is not None else "off"
+                    print(
+                        f"[DEBUG] camera={camera_id} no_crop_summary: {st['frames']} frame(s) in "
+                        f"~{self._debug_no_person_interval:.0f}s (no boxes above threshold, detector empty, "
+                        f"or tripwire filtered) frame={w}x{h} tripwire={trip} "
+                        f"PERSON_CONF={self.person_conf} PERSON_IOU={self.person_iou}"
+                    )
+                    st["since_log"] = now
+                    st["frames"] = 0
 
         # Optional company/building/camera metadata for MinIO path and Kafka payload
         company_id = getattr(camera, "company_id", None) if camera else None
@@ -435,28 +489,21 @@ class MainAgent:
     
     def update_fps(self, new_fps: float, camera_id: str = None):
         """
-        Update frame rate
-        
+        Set target capture FPS on agents (stored for next FFmpeg reconnect after stream errors).
         Args:
-            new_fps: New frame rate
-            camera_id: Camera identifier (if None, updates all cameras)
+            new_fps: Target FPS for the fps= filter (0 = full decode rate on reconnect).
+            camera_id: Camera identifier (if None, updates all cameras).
         """
+        val = max(0.0, float(new_fps))
+        self.capture_fps = val
         if camera_id:
             if camera_id in self.capture_agents:
-                print(
-                    f"[Main Agent] FPS update request for {camera_id} ignored. "
-                    f"Fixed FPS: {PIPELINE_FPS}"
-                )
-                self.capture_agents[camera_id].update_fps(PIPELINE_FPS)
+                self.capture_agents[camera_id].update_fps(val)
             else:
                 print(f"[Main Agent] Camera {camera_id} not found")
         else:
-            print(
-                f"[Main Agent] FPS update request ({new_fps}) ignored. "
-                f"Fixed FPS for all cameras: {PIPELINE_FPS}"
-            )
-            for cam_id, capture_agent in self.capture_agents.items():
-                capture_agent.update_fps(PIPELINE_FPS)
+            for _, capture_agent in self.capture_agents.items():
+                capture_agent.update_fps(val)
 
 
 def main():
