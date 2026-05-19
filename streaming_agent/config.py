@@ -10,6 +10,8 @@ from typing import Any
 
 import yaml
 
+from streaming_agent.rtsp_urls import to_substream_rtsp_url
+
 
 def _env(key: str, default: str = "") -> str:
     v = os.getenv(key)
@@ -54,6 +56,22 @@ class CameraEntry:
 
 
 @dataclass
+class TranscodeConfig:
+    """Low-latency libx264 tuned for camera substream (~640p) live push."""
+
+    preset: str = "ultrafast"
+    tune: str = "zerolatency"
+    profile: str = "baseline"
+    pix_fmt: str = "yuv420p"
+    maxrate: str = "768k"
+    bufsize: str = "1536k"
+    gop: int = 30
+    keyint_min: int = 30
+    bf: int = 0
+    threads: int = 0  # 0 = ffmpeg auto
+
+
+@dataclass
 class UpstreamConfig:
     """
     Центральный ingest (RTMP): агент открывает исходящее соединение — NAT/static IP на объекте не нужен.
@@ -65,8 +83,9 @@ class UpstreamConfig:
     playback_url_template: str = ""
     ffmpeg_path: str = "ffmpeg"
     ffmpeg_extra_args: list[str] = field(default_factory=list)
-    # True: libx264 вместо copy — новые монотонные PTS/DTS (камеры с «ломаными» таймстампами / RTP cseq).
-    transcode: bool = False
+    # libx264 re-encode — stable PTS/DTS for RTMP ingest (default on).
+    transcode: bool = True
+    transcode_opts: TranscodeConfig = field(default_factory=TranscodeConfig)
 
 
 @dataclass
@@ -85,9 +104,50 @@ class AgentConfig:
     mediamtx: MediaMTXConfig = field(default_factory=MediaMTXConfig)
     upstream: UpstreamConfig = field(default_factory=UpstreamConfig)
     cameras: list[CameraEntry] = field(default_factory=list)
+    # Live view uses camera substream (Hikvision /102, Dahua subtype=1) — lower CPU/bandwidth than main.
+    use_substream: bool = True
 
     def camera_rtsp_map(self) -> dict[str, str]:
         return {c.id: c.rtsp_url for c in self.cameras}
+
+
+def _parse_transcode_opts(obj: dict[str, Any] | None) -> TranscodeConfig:
+    o = obj if isinstance(obj, dict) else {}
+    return TranscodeConfig(
+        preset=str(o.get("preset") or _env("STREAMING_TRANSCODE_PRESET") or "ultrafast"),
+        tune=str(o.get("tune") or _env("STREAMING_TRANSCODE_TUNE") or "zerolatency"),
+        profile=str(o.get("profile") or _env("STREAMING_TRANSCODE_PROFILE") or "baseline"),
+        pix_fmt=str(o.get("pix_fmt") or "yuv420p"),
+        maxrate=str(o.get("maxrate") or _env("STREAMING_TRANSCODE_MAXRATE") or "768k"),
+        bufsize=str(o.get("bufsize") or _env("STREAMING_TRANSCODE_BUFSIZE") or "1536k"),
+        gop=_env_int("STREAMING_TRANSCODE_GOP", int(o.get("gop") or 30)),
+        keyint_min=int(o.get("keyint_min") or o.get("gop") or 30),
+        bf=int(o.get("bf") or 0),
+        threads=_env_int("STREAMING_TRANSCODE_THREADS", int(o.get("threads") or 0)),
+    )
+
+
+def _apply_substream_to_cameras(cameras: list[CameraEntry], use_substream: bool) -> list[CameraEntry]:
+    if not use_substream:
+        return cameras
+    out: list[CameraEntry] = []
+    for c in cameras:
+        sub = to_substream_rtsp_url(c.rtsp_url)
+        if sub != c.rtsp_url:
+            print(f"[Streaming Config] camera {c.id}: substream URL { _redact_rtsp(sub) }")
+        out.append(CameraEntry(id=c.id, rtsp_url=sub))
+    return out
+
+
+def _redact_rtsp(url: str) -> str:
+    if "@" not in url:
+        return url
+    try:
+        head, tail = url.split("://", 1)
+        host = tail.split("@", 1)[-1]
+        return f"{head}://***@{host}"
+    except Exception:
+        return url
 
 
 def _parse_camera(obj: dict[str, Any]) -> CameraEntry | None:
@@ -280,11 +340,18 @@ def load_config(path: str | Path | None = None) -> AgentConfig:
             ffmpeg_extra_args=list(up.get("ffmpeg_extra_args") or []),
             transcode=_env_bool(
                 "STREAMING_UPSTREAM_TRANSCODE",
-                bool(up.get("transcode", False)),
+                bool(up.get("transcode", True)),
             ),
+            transcode_opts=_parse_transcode_opts(up.get("transcode_opts")),
         ),
         cameras=cameras,
+        use_substream=_env_bool(
+            "STREAMING_USE_SUBSTREAM",
+            bool(data.get("use_substream", True)),
+        ),
     )
+
+    cfg.cameras = _apply_substream_to_cameras(cfg.cameras, cfg.use_substream)
 
     # Env overrides for agent_id / backend if still default
     if _env("STREAMING_AGENT_ID"):

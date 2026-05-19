@@ -51,6 +51,7 @@ class StreamManager:
                 rtsp_transport=cfg.mediamtx.rtsp_transport,
                 extra_args=cfg.upstream.ffmpeg_extra_args,
                 transcode=cfg.upstream.transcode,
+                transcode_opts=cfg.upstream.transcode_opts,
                 on_process_exit=self._on_upstream_ffmpeg_exit,
             )
 

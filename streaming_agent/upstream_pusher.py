@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from streaming_agent.config import TranscodeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +40,8 @@ class UpstreamPusher:
         rtmp_url_template: str,
         rtsp_transport: str = "tcp",
         extra_args: list[str] | None = None,
-        transcode: bool = False,
+        transcode: bool = True,
+        transcode_opts: "TranscodeConfig | None" = None,
         on_process_exit: UpstreamExitCallback = None,
     ):
         self.ffmpeg_path = ffmpeg_path
@@ -45,8 +49,41 @@ class UpstreamPusher:
         self.rtsp_transport = rtsp_transport
         self.extra_args = extra_args or []
         self.transcode = transcode
+        self.transcode_opts = transcode_opts
         self.on_process_exit = on_process_exit
         self._procs: dict[str, asyncio.subprocess.Process] = {}
+
+    def _transcode_video_args(self) -> list[str]:
+        from streaming_agent.config import TranscodeConfig
+
+        o = self.transcode_opts or TranscodeConfig()
+        args: list[str] = [
+            "-c:v",
+            "libx264",
+            "-preset",
+            o.preset,
+            "-tune",
+            o.tune,
+            "-profile:v",
+            o.profile,
+            "-pix_fmt",
+            o.pix_fmt,
+            "-g",
+            str(o.gop),
+            "-keyint_min",
+            str(o.keyint_min),
+            "-sc_threshold",
+            "0",
+            "-bf",
+            str(o.bf),
+            "-maxrate",
+            o.maxrate,
+            "-bufsize",
+            o.bufsize,
+        ]
+        if o.threads > 0:
+            args.extend(["-threads", str(o.threads)])
+        return args
 
     def _ffmpeg_args(self, rtsp_url: str, rtmp: str) -> list[str]:
         """RTSP → FLV/RTMP. Default: copy + genpts; optional transcode for broken PTS/DTS (Hikvision, etc.)."""
@@ -62,6 +99,8 @@ class UpstreamPusher:
             "5000000",
             "-rtsp_transport",
             self.rtsp_transport,
+            "-timeout",
+            "5000000",
             "-use_wallclock_as_timestamps",
             "1",
             "-i",
@@ -72,20 +111,7 @@ class UpstreamPusher:
         flv_live = ["-f", "flv", "-flvflags", "no_duration_filesize"]
         if self.transcode:
             mid: list[str] = [
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-tune",
-                "zerolatency",
-                "-pix_fmt",
-                "yuv420p",
-                "-g",
-                "50",
-                "-keyint_min",
-                "50",
-                "-bf",
-                "0",
+                *self._transcode_video_args(),
                 "-an",
                 *flv_live,
             ]
@@ -129,8 +155,11 @@ class UpstreamPusher:
 
         args = self._ffmpeg_args(rtsp_url, rtmp)
         if self.transcode:
+            o = self.transcode_opts
+            preset = o.preset if o else "ultrafast"
             logger.info(
-                "upstream mode=transcode(libx264) camera=%s (stable timestamps; higher CPU)",
+                "upstream mode=transcode(libx264/%s) camera=%s substream",
+                preset,
                 camera_id,
             )
         else:

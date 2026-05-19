@@ -1,0 +1,18 @@
+# Streaming agent — secrets/URLs from .env (STREAMING_*).
+# Cameras: loaded from config/cameras.yaml; URLs rewritten to substream (/102).
+
+use_substream: true
+viewer_idle_stop: true
+
+upstream:
+  transcode: true
+  transcode_opts:
+    preset: ultrafast
+    tune: zerolatency
+    profile: baseline
+    maxrate: 768k
+    bufsize: 1536k
+    gop: 30
+    keyint_min: 30
+    bf: 0
+    threads: 0
