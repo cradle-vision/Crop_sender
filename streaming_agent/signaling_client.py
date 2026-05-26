@@ -21,6 +21,23 @@ except ImportError as e:
     raise ImportError("Install package 'websockets' for Streaming Agent") from e
 
 
+def _is_connection_error(exc: BaseException) -> bool:
+    """True when the TCP/TLS/WS session is gone (half-open or fully closed)."""
+    if isinstance(exc, ConnectionClosed):
+        return True
+    msg = str(exc).lower()
+    needles = (
+        "ssl",
+        "connection is closed",
+        "connection closed",
+        "connection reset",
+        "broken pipe",
+        "eof occurred",
+        "transport is closing",
+    )
+    return any(n in msg for n in needles)
+
+
 class SignalingClient:
     def __init__(
         self,
@@ -40,9 +57,14 @@ class SignalingClient:
         headers: list[tuple[str, str]] = []
         if self.cfg.auth_token:
             headers.append(("Authorization", f"Bearer {self.cfg.auth_token}"))
+        # Protocol-level pings detect half-open TLS/WS (LB idle timeout, NAT, etc.).
+        # ping_interval=None left recv loop alive while send only logged warnings.
+        hb = max(5.0, float(self.cfg.heartbeat_interval_sec))
+        ping_timeout = min(20.0, max(10.0, hb * 0.8))
+        ping_interval = max(ping_timeout + 5.0, hb)
         kwargs: dict[str, Any] = {
-            "ping_interval": None,
-            "ping_timeout": 60,
+            "ping_interval": ping_interval,
+            "ping_timeout": ping_timeout,
             "close_timeout": 10,
             "open_timeout": 30,
         }
@@ -51,15 +73,31 @@ class SignalingClient:
             kwargs["additional_headers"] = headers
         return kwargs
 
-    async def send_json(self, data: dict[str, Any]) -> None:
+    async def _force_reconnect(self, reason: str) -> None:
+        """Close WS so the recv loop exits and run() reconnects with backoff."""
+        ws = self._ws
+        if ws is None:
+            return
+        logger.warning("Forcing WS reconnect: %s", reason)
+        try:
+            await ws.close(code=1001, reason=reason[:120])
+        except Exception as e:
+            logger.debug("ws.close during reconnect: %s", e)
+
+    async def send_json(self, data: dict[str, Any]) -> bool:
         if self._ws is None:
             logger.debug("send_json skipped (no ws): %s", data.get("type"))
-            return
+            return False
         async with self._send_lock:
             try:
                 await self._ws.send(json.dumps(data, ensure_ascii=False))
+                return True
             except Exception as e:
-                logger.warning("send_json failed: %s", e)
+                msg_type = data.get("type", "?")
+                logger.warning("send_json failed (%s): %s", msg_type, e)
+                if _is_connection_error(e):
+                    await self._force_reconnect(f"send failed: {msg_type}")
+                return False
 
     async def _heartbeat_loop(self) -> None:
         while not self._stopped.is_set():
@@ -77,7 +115,7 @@ class SignalingClient:
             m = collect_metrics(
                 mtx_for_metrics, self.stream_manager.streams_active_count()
             )
-            await self.send_json(
+            ok = await self.send_json(
                 {
                     "type": "heartbeat",
                     "cpu": m.get("cpu", 0),
@@ -85,6 +123,8 @@ class SignalingClient:
                     "streams_active": m.get("streams_active", 0),
                 }
             )
+            if not ok:
+                break
 
     async def _handle_incoming(self, raw: str) -> None:
         try:
