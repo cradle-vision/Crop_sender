@@ -1,18 +1,16 @@
-# MediaMTX for Streaming Agent MVP (RTSP pull → WebRTC WHEP).
+# MediaMTX: local RTSP relay for streaming-agent (camera → localhost → FFmpeg → RTMP).
 # Docs: https://mediamtx.org/docs/references/configuration-file
 
 logLevel: info
 logDestinations: [stdout]
 
-readTimeout: 10s
-writeTimeout: 10s
+readTimeout: 30s
+writeTimeout: 30s
 
-# Control API (used by streaming_agent to add/remove paths)
 api: true
 apiAddress: :9997
 apiAllowOrigins: ['*']
 
-# WebRTC / WHEP (browser connects here; set MEDIAMTX_PUBLIC_WEBRTC_BASE on the agent)
 webrtc: true
 webrtcAddress: :8889
 webrtcAllowOrigins: ['*']
@@ -20,12 +18,13 @@ webrtcLocalUDPAddress: :8189
 webrtcIPsFromInterfaces: true
 webrtcAdditionalHosts: []
 
-# STUN (add TURN URLs here for restrictive NATs)
 webrtcICEServers2:
   - url: stun:stun.l.google.com:19302
 
 rtsp: true
 rtspAddress: :8554
+
+# Relay paths (up_<camera_id>) are added via API with sourceOnDemand per path.
 
 paths:
   all_others:

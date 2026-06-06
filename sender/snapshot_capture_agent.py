@@ -318,9 +318,34 @@ class SnapshotCaptureAgent:
             return None
         return b"".join(chunks)
 
+    def _start_stderr_drain(self, proc: subprocess.Popen) -> tuple[list[bytes], threading.Thread]:
+        chunks: list[bytes] = []
+
+        def _run() -> None:
+            if proc.stderr is None:
+                return
+            try:
+                while proc.poll() is None:
+                    block = proc.stderr.read(4096)
+                    if not block:
+                        break
+                    chunks.append(block)
+                    if sum(len(c) for c in chunks) > 12000:
+                        del chunks[:-3]
+            except Exception:
+                pass
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        return chunks, thread
+
     def _stop_ffmpeg(self, reason: str = "") -> None:
         proc = self._ffmpeg_proc
         self._ffmpeg_proc = None
+        drain = getattr(self, "_stderr_drain_thread", None)
+        stderr_chunks = getattr(self, "_stderr_chunks", None)
+        self._stderr_drain_thread = None
+        self._stderr_chunks = None
         if proc is None:
             return
         try:
@@ -372,6 +397,9 @@ class SnapshotCaptureAgent:
                     stderr=subprocess.PIPE,
                     stdin=subprocess.DEVNULL,
                 )
+                self._stderr_chunks, self._stderr_drain_thread = self._start_stderr_drain(
+                    self._ffmpeg_proc
+                )
                 assert self._ffmpeg_proc.stdout is not None
                 got_frame = False
                 while self.is_running and self._ffmpeg_proc.poll() is None:
@@ -405,7 +433,11 @@ class SnapshotCaptureAgent:
             finally:
                 proc = self._ffmpeg_proc
                 stderr_tail = ""
-                if proc is not None and proc.stderr is not None:
+                if drain := getattr(self, "_stderr_drain_thread", None):
+                    drain.join(timeout=1.0)
+                if chunks := getattr(self, "_stderr_chunks", None):
+                    stderr_tail = b"".join(chunks).decode(errors="replace").strip()[-400:]
+                elif proc is not None and proc.stderr is not None:
                     try:
                         err_b = proc.stderr.read()
                         stderr_tail = (err_b or b"").decode(errors="replace").strip()[-400:]

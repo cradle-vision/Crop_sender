@@ -1,5 +1,11 @@
 
 cameras:
+  # Cam-Webs / OEM PTZ example (major=main, minor=sub — set rtsp_vendor for auto substream):
+  # - camera_id: "ptz_1"
+  #   source: "rtsp://admin:pass@192.168.0.205:554/1/h264major"
+  #   rtsp_vendor: cam_webs
+  #   streaming_rtsp_url: "rtsp://admin:pass@192.168.0.205:554/1/h264minor"  # optional override
+
   - camera_id: "ip_camera_1"
     name: "IP Camera Front Door"
     source: "rtsp://admin:password123@192.168.1.100:554/stream1"

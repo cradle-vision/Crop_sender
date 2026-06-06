@@ -1,8 +1,23 @@
-# Streaming agent — secrets/URLs from .env (STREAMING_*).
-# Cameras: loaded from config/cameras.yaml; URLs rewritten to substream (/102).
+# Streaming agent — edge store profile (light transcode, auto-restart forever).
+# Secrets/URLs: .env (STREAMING_*). Cameras: config/cameras.yaml.
+# Architecture: camera → MediaMTX local relay → FFmpeg → RTMP (one publisher, N viewers).
 
+delivery: upstream_rtmp
+
+mediamtx:
+  api_url: http://127.0.0.1:9997
+  # Local RTSP relay — FFmpeg reads localhost; camera sees one stable pull.
+  rtsp_relay_enabled: true
+  rtsp_listen_base: rtsp://127.0.0.1:8554
 use_substream: true
+# Stop stream only when last viewer leaves (multi-user safe).
 viewer_idle_stop: true
+idle_grace_sec: 10
+
+# FFmpeg retry when camera offline / slow internet / RTMP hiccup (never give up).
+restart_base_delay_sec: 6
+restart_max_delay_sec: 90
+rtmp_republish_cooldown_sec: 15
 
 upstream:
   transcode: true
@@ -10,9 +25,15 @@ upstream:
     preset: ultrafast
     tune: zerolatency
     profile: baseline
-    maxrate: 768k
-    bufsize: 1536k
+    # Native res when real substream exists; Cam-Webs/HEVC fallback auto-downscales to 640x360.
+    maxrate: 2M
+    bufsize: 4M
     gop: 30
     keyint_min: 30
+    fps: 3
+    crf: 28
+    level: "4.1"
     bf: 0
     threads: 0
+    max_muxing_queue_size: 2048
+    x264_params: "scenecut=0:repeat-headers=1:aud=1"

@@ -1,4 +1,5 @@
 import json
+import time
 import uuid
 import io
 import numpy as np
@@ -40,6 +41,7 @@ class KafkaSenderAgent:
         self._minio_bucket = self._minio_config.get("bucket", "crops")
         self._producer: Optional[Producer] = None
         self._connected = False
+        self._reconnect_attempts = 0
         # Kafka expects "host:port", not "http://host:port"
         if self.bootstrap_servers:
             self.bootstrap_servers = str(self.bootstrap_servers).replace("http://", "").replace("https://", "").rstrip("/")
@@ -53,7 +55,17 @@ class KafkaSenderAgent:
             print("[Kafka Sender Agent] ✗ MinIO is required. Set minio.enabled: true in config (flow: crop → MinIO → Kafka).")
             return False
         try:
-            self._producer = Producer({"bootstrap.servers": self.bootstrap_servers})
+            self._producer = Producer(
+                {
+                    "bootstrap.servers": self.bootstrap_servers,
+                    "socket.timeout.ms": 30000,
+                    "metadata.max.age.ms": 300000,
+                    "message.timeout.ms": 120000,
+                    "acks": "1",
+                    "retries": 5,
+                    "retry.backoff.ms": 500,
+                }
+            )
             endpoint = self._minio_config.get("endpoint", "localhost:9000").replace("http://", "").replace("https://", "").rstrip("/")
             secure = self._minio_config.get("secure", False)
             self._minio_client = Minio(
@@ -65,12 +77,27 @@ class KafkaSenderAgent:
             if not self._minio_client.bucket_exists(self._minio_bucket):
                 self._minio_client.make_bucket(self._minio_bucket)
             self._connected = True
+            self._reconnect_attempts = 0
             print(f"[Kafka Sender Agent] ✓ Flow: JPEG → MinIO → Kafka. bucket={self._minio_bucket}, topic={self.topic}")
             return True
         except Exception as e:
             print(f"[Kafka Sender Agent] ✗ Failed to connect: {e}")
             self._connected = False
+            self._producer = None
             return False
+
+    def _ensure_connected(self) -> bool:
+        if self._connected and self._producer and self._minio_client:
+            return True
+        self._reconnect_attempts += 1
+        if self._reconnect_attempts > 1:
+            delay = min(30.0, 2.0 * self._reconnect_attempts)
+            print(
+                f"[Kafka Sender Agent] Reconnecting to Kafka/MinIO in {delay:.0f}s "
+                f"(attempt {self._reconnect_attempts})"
+            )
+            time.sleep(delay)
+        return self.connect()
 
     def disconnect(self) -> None:
         """Flush and close producer."""
@@ -99,9 +126,6 @@ class KafkaSenderAgent:
         Flow: JPEG encode → MinIO.put_object() → Kafka.send(metadata + object_key).
         company_id/building_id are optional and used only for MinIO path / metadata if provided.
         """
-        if not self._connected or not self._producer or not self._minio_client:
-            return False
-
         def _sanitize(value: Optional[str]) -> Optional[str]:
             if value is None:
                 return None
@@ -124,15 +148,51 @@ class KafkaSenderAgent:
         company_name = _sanitize(company_name)
         building_name = _sanitize(building_name)
         camera_name = _sanitize(camera_name)
+
+        for publish_attempt in range(4):
+            if not self._ensure_connected():
+                continue
+            try:
+                return self._publish_once(
+                    frame=frame,
+                    timestamp=timestamp,
+                    camera_id=camera_id,
+                    company_id=company_id,
+                    building_id=building_id,
+                    company_name=company_name,
+                    building_name=building_name,
+                    camera_name=camera_name,
+                    _slug=_slug,
+                )
+            except Exception as e:
+                print(f"[Kafka Sender Agent] Publish error (attempt {publish_attempt + 1}): {e}")
+                self._connected = False
+                self._producer = None
+        return False
+
+    def _publish_once(
+        self,
+        *,
+        frame: np.ndarray,
+        timestamp: float,
+        camera_id: str,
+        company_id: Optional[str],
+        building_id: Optional[str],
+        company_name: Optional[str],
+        building_name: Optional[str],
+        camera_name: Optional[str],
+        _slug,
+    ) -> bool:
+        if not self._producer or not self._minio_client:
+            return False
         try:
-            # 1. JPEG encode (fixed quality=100 by project requirement)
             data = encode_jpeg_bgr(frame, quality=self.jpeg_quality)
             if data is None:
                 print("[Kafka Sender Agent] Image encode error")
                 return False
             ts_ms = int(timestamp * 1000)
 
-            # 2. MinIO.put_object()
+            # MinIO.put_object()
             # Path pattern (по твоему запросу):
             #   crops/<camera_name>/<building_id>/<camera_id>/<timestamp_uuid>.jpg
             # company_* остаются только в метаданных Kafka.
@@ -185,6 +245,5 @@ class KafkaSenderAgent:
             if self._sent_count % 50 == 0:
                 print(f"[Kafka Sender Agent] Published {self._sent_count} messages")
             return True
-        except Exception as e:
-            print(f"[Kafka Sender Agent] Publish error: {e}")
-            return False
+        except Exception:
+            raise

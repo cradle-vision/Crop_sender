@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -24,6 +25,9 @@ class MediaMTXClient:
         name: str,
         source: str,
         rtsp_transport: str = "tcp",
+        *,
+        source_on_demand: bool = True,
+        source_on_demand_close_after: str = "20s",
     ) -> tuple[bool, str | None]:
         """
         POST /v3/config/paths/add/{name}
@@ -33,6 +37,8 @@ class MediaMTXClient:
             "name": name,
             "source": source,
             "rtspTransport": rtsp_transport,
+            "sourceOnDemand": source_on_demand,
+            "sourceOnDemandCloseAfter": source_on_demand_close_after,
         }
         try:
             r = requests.post(
@@ -47,6 +53,73 @@ class MediaMTXClient:
         except requests.RequestException as e:
             logger.exception("MediaMTX add path failed")
             return False, str(e)
+
+    def patch_path(self, name: str, body: dict[str, Any]) -> tuple[bool, str | None]:
+        """PATCH /v3/config/paths/patch/{name}"""
+        try:
+            r = requests.patch(
+                self._url(f"/v3/config/paths/patch/{quote(name, safe='')}"),
+                json=body,
+                timeout=self.timeout,
+            )
+            if r.status_code == 200:
+                return True, None
+            return False, self._err_body(r)
+        except requests.RequestException as e:
+            logger.exception("MediaMTX patch path failed")
+            return False, str(e)
+
+    def ensure_relay_path(
+        self,
+        name: str,
+        source: str,
+        rtsp_transport: str = "tcp",
+    ) -> tuple[bool, str | None]:
+        """Idempotent relay path: patch if exists, else add."""
+        existing = self._path_item(name)
+        body = {
+            "source": source,
+            "rtspTransport": rtsp_transport,
+            "sourceOnDemand": True,
+            "sourceOnDemandCloseAfter": "20s",
+        }
+        if existing is not None:
+            ok, err = self.patch_path(name, body)
+            if ok:
+                return True, None
+            logger.warning("relay patch failed path=%s err=%s — recreate", name, err)
+            self.delete_path(name)
+
+        return self.add_rtsp_path(
+            name,
+            source,
+            rtsp_transport,
+            source_on_demand=True,
+            source_on_demand_close_after="20s",
+        )
+
+    def wait_path_ready(self, name: str, timeout_sec: float = 12.0) -> bool:
+        """Poll until MediaMTX reports a ready source for the path."""
+        deadline = time.monotonic() + max(1.0, timeout_sec)
+        while time.monotonic() < deadline:
+            item = self._path_item(name)
+            if item:
+                ready = item.get("ready")
+                readers = item.get("readers") or []
+                if ready or readers:
+                    return True
+            time.sleep(0.4)
+        return False
+
+    def _path_item(self, name: str) -> dict[str, Any] | None:
+        data = self.list_paths()
+        if not data:
+            return None
+        items = data.get("items") or []
+        for item in items:
+            if isinstance(item, dict) and item.get("name") == name:
+                return item
+        return None
 
     def delete_path(self, name: str) -> tuple[bool, str | None]:
         """DELETE /v3/config/paths/delete/{name}"""

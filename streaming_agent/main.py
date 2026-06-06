@@ -28,21 +28,32 @@ async def _run_async(config_path: str | None) -> None:
         return
     cfg = load_config(config_path)
     mtx = MediaMTXClient(cfg.mediamtx.api_url)
-    stream_manager = StreamManager(cfg, mtx, on_status=None)
+    stream_manager = StreamManager(cfg, mtx, on_status=None, config_path=config_path)
     signaling = SignalingClient(cfg, stream_manager, mtx)
     stream_manager._on_status = signaling.on_stream_status  # noqa: SLF001
 
     loop = asyncio.get_running_loop()
     runner = asyncio.create_task(signaling.run(), name="signaling_run")
+    shutdown = asyncio.Event()
 
-    def _stop(*_: object) -> None:
-        logger.info("Shutdown requested")
+    async def _shutdown(*_: object) -> None:
+        if shutdown.is_set():
+            return
+        shutdown.set()
+        logger.info("Shutdown requested — stopping streams and signaling")
         signaling.stop()
+        try:
+            await stream_manager.stop_all()
+        except Exception:
+            logger.exception("stop_all failed during shutdown")
         runner.cancel()
+
+    def _request_shutdown() -> None:
+        asyncio.create_task(_shutdown())
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, _stop)
+            loop.add_signal_handler(sig, _request_shutdown)
         except NotImplementedError:
             pass
 
@@ -50,6 +61,9 @@ async def _run_async(config_path: str | None) -> None:
         await runner
     except asyncio.CancelledError:
         logger.info("Signaling task cancelled")
+    finally:
+        if not shutdown.is_set():
+            await _shutdown()
 
 
 def main(argv: list[str] | None = None) -> None:

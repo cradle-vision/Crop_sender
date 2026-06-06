@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from streaming_agent.rtsp_urls import to_substream_rtsp_url
+from streaming_agent.rtsp_urls import (
+    cam_webs_major_url,
+    is_cam_webs_style_main,
+    is_likely_substream_url,
+    to_substream_rtsp_url,
+)
 
 
 def _env(key: str, default: str = "") -> str:
@@ -47,28 +54,60 @@ class MediaMTXConfig:
     """Public base for WHEP/WebRTC URLs shown to clients (no trailing slash)."""
     public_webrtc_base: str = "http://127.0.0.1:8889"
     rtsp_transport: str = "tcp"
+    # Local RTSP relay: camera → MediaMTX → FFmpeg (stable; FFmpeg restarts skip camera).
+    rtsp_relay_enabled: bool = True
+    rtsp_listen_base: str = "rtsp://127.0.0.1:8554"
 
 
 @dataclass
 class CameraEntry:
     id: str
     rtsp_url: str
+    # Original main/capture URL before substream rewrite (for fallback when sub is disabled).
+    main_rtsp_url: str = ""
+    # Optional per-camera live-view URL (overrides auto substream detection).
+    streaming_rtsp_url: str = ""
+    # hikvision | cam_webs — guides substream path when source is a bare RTSP URL.
+    rtsp_vendor: str = ""
+    # Non-empty = downscale during live transcode (main-stream fallback for Cam-Webs etc.).
+    streaming_scale_filter: str = ""
+    # Resolved transport for camera pull (relay): tcp | udp | auto → tcp/udp at probe time.
+    streaming_rtsp_transport: str = ""
+
+
+# Lightweight PTS fix only — no resize (native camera resolution, any H.264/HEVC/MJPEG).
+_DEFAULT_PTS_FILTER = "setpts=PTS-STARTPTS"
+# When no real substream: read main (often HEVC 1080p) and downscale while transcoding.
+# fps=3 BEFORE scale: drop 30fps HEVC frames early (huge CPU save on Cam-Webs main).
+_STREAMING_FALLBACK_SCALE = (
+    "setpts=PTS-STARTPTS,fps=3,"
+    "scale=640:360:force_original_aspect_ratio=decrease:flags=fast_bilinear,"
+    "pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p,setsar=1"
+)
 
 
 @dataclass
 class TranscodeConfig:
-    """Low-latency libx264 tuned for camera substream (~640p) live push."""
+    """Light libx264 live push: ultrafast, native resolution, works with H.264/HEVC inputs."""
 
     preset: str = "ultrafast"
     tune: str = "zerolatency"
     profile: str = "baseline"
     pix_fmt: str = "yuv420p"
-    maxrate: str = "768k"
-    bufsize: str = "1536k"
+    # Substream live view @ ~3 fps — realistic for store uplink (adjust per site).
+    maxrate: str = "2M"
+    bufsize: str = "4M"
     gop: int = 30
     keyint_min: int = 30
     bf: int = 0
     threads: int = 0  # 0 = ffmpeg auto
+    fps: int = 3
+    crf: int = 28
+    level: str = "4.1"
+    # Empty = no scaling; only setpts for timestamp stability.
+    scale_filter: str = ""
+    x264_params: str = "scenecut=0:repeat-headers=1:aud=1"
+    max_muxing_queue_size: int = 2048
 
 
 @dataclass
@@ -99,6 +138,10 @@ class AgentConfig:
     idle_grace_sec: float = 10.0
     # viewer_idle_stop: False = гасить только по stop_stream; True = ещё auto-stop при нуле зрителей (viewer_*)
     viewer_idle_stop: bool = True
+    # Upstream FFmpeg auto-restart (edge store: retry until camera/RTMP recovers).
+    restart_base_delay_sec: float = 6.0
+    restart_max_delay_sec: float = 90.0
+    rtmp_republish_cooldown_sec: float = 15.0
     # delivery: local_webrtc | upstream_rtmp | both — см. README
     delivery: str = "local_webrtc"
     mediamtx: MediaMTXConfig = field(default_factory=MediaMTXConfig)
@@ -110,33 +153,246 @@ class AgentConfig:
     def camera_rtsp_map(self) -> dict[str, str]:
         return {c.id: c.rtsp_url for c in self.cameras}
 
+    def camera_scale_map(self) -> dict[str, str]:
+        return {
+            c.id: c.streaming_scale_filter
+            for c in self.cameras
+            if c.streaming_scale_filter.strip()
+        }
+
+    def camera_transport_map(self) -> dict[str, str]:
+        return {
+            c.id: c.streaming_rtsp_transport
+            for c in self.cameras
+            if c.streaming_rtsp_transport.strip() in ("tcp", "udp")
+        }
+
+    def camera_main_rtsp_map(self) -> dict[str, str]:
+        return {
+            c.id: (c.main_rtsp_url or c.rtsp_url).strip()
+            for c in self.cameras
+            if (c.main_rtsp_url or c.rtsp_url).strip()
+        }
+
 
 def _parse_transcode_opts(obj: dict[str, Any] | None) -> TranscodeConfig:
     o = obj if isinstance(obj, dict) else {}
+    gop = _env_int("STREAMING_TRANSCODE_GOP", int(o.get("gop") or 30))
+    scale_raw = o.get("scale_filter")
+    if scale_raw is None:
+        scale_raw = _env("STREAMING_TRANSCODE_SCALE_FILTER")
+    scale_filter = str(scale_raw) if scale_raw is not None else ""
     return TranscodeConfig(
         preset=str(o.get("preset") or _env("STREAMING_TRANSCODE_PRESET") or "ultrafast"),
         tune=str(o.get("tune") or _env("STREAMING_TRANSCODE_TUNE") or "zerolatency"),
         profile=str(o.get("profile") or _env("STREAMING_TRANSCODE_PROFILE") or "baseline"),
         pix_fmt=str(o.get("pix_fmt") or "yuv420p"),
-        maxrate=str(o.get("maxrate") or _env("STREAMING_TRANSCODE_MAXRATE") or "768k"),
-        bufsize=str(o.get("bufsize") or _env("STREAMING_TRANSCODE_BUFSIZE") or "1536k"),
-        gop=_env_int("STREAMING_TRANSCODE_GOP", int(o.get("gop") or 30)),
-        keyint_min=int(o.get("keyint_min") or o.get("gop") or 30),
+        maxrate=str(o.get("maxrate") or _env("STREAMING_TRANSCODE_MAXRATE") or "2M"),
+        bufsize=str(o.get("bufsize") or _env("STREAMING_TRANSCODE_BUFSIZE") or "4M"),
+        gop=gop,
+        keyint_min=int(o.get("keyint_min") or o.get("gop") or gop),
         bf=int(o.get("bf") or 0),
         threads=_env_int("STREAMING_TRANSCODE_THREADS", int(o.get("threads") or 0)),
+        fps=_env_int("STREAMING_TRANSCODE_FPS", int(o.get("fps") or 3)),
+        crf=_env_int("STREAMING_TRANSCODE_CRF", int(o.get("crf") or 28)),
+        level=str(o.get("level") or _env("STREAMING_TRANSCODE_LEVEL") or "4.1"),
+        scale_filter=scale_filter,
+        x264_params=str(
+            o.get("x264_params")
+            or _env("STREAMING_TRANSCODE_X264_PARAMS")
+            or "scenecut=0:repeat-headers=1:aud=1"
+        ),
+        max_muxing_queue_size=_env_int(
+            "STREAMING_TRANSCODE_MUX_QUEUE",
+            int(o.get("max_muxing_queue_size") or 2048),
+        ),
     )
 
 
-def _apply_substream_to_cameras(cameras: list[CameraEntry], use_substream: bool) -> list[CameraEntry]:
-    if not use_substream:
-        return cameras
-    out: list[CameraEntry] = []
-    for c in cameras:
-        sub = to_substream_rtsp_url(c.rtsp_url)
-        if sub != c.rtsp_url:
-            print(f"[Streaming Config] camera {c.id}: substream URL { _redact_rtsp(sub) }")
-        out.append(CameraEntry(id=c.id, rtsp_url=sub))
-    return out
+def _probe_rtsp_video(url: str, ffmpeg_path: str = "ffmpeg") -> tuple[int, int, str]:
+    """Return (width, height, codec_name) for first video stream; 0,0,'' on failure."""
+    ffprobe = shutil.which("ffprobe") or "ffprobe"
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-rtsp_transport",
+        "tcp",
+        "-timeout",
+        "5000000",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_name,width,height",
+        "-of",
+        "csv=p=0:s=,",
+        url,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=12, check=False)
+        line = (r.stdout or "").strip().splitlines()[0] if r.stdout else ""
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3:
+            return 0, 0, ""
+        codec, w, h = parts[0], int(parts[1] or 0), int(parts[2] or 0)
+        return w, h, codec
+    except Exception:
+        return 0, 0, ""
+
+
+def _substream_is_usable(url: str, ffmpeg_path: str) -> tuple[bool, int, int, str]:
+    w, h, codec = _probe_rtsp_video(url, ffmpeg_path)
+    return w > 0 and h > 0, w, h, codec
+
+
+def _resolve_rtsp_transport(
+    *,
+    explicit: str,
+    main: str,
+    vendor: str,
+    scale: str,
+    stream_url: str,
+) -> str:
+    """Per-camera RTSP transport for relay pull (auto: UDP for Cam-Webs/downscale, else TCP)."""
+    t = (explicit or "").strip().lower()
+    if t in ("tcp", "udp"):
+        return t
+    vend = (vendor or "").strip().lower()
+    if vend in ("hikvision", "hik", "dahua"):
+        return "tcp"
+    if scale.strip() or is_cam_webs_style_main(main, vendor):
+        return "udp"
+    if is_likely_substream_url(stream_url):
+        return "tcp"
+    return "tcp"
+
+
+def _resolve_streaming_rtsp_url(
+    c: CameraEntry,
+    *,
+    use_substream: bool,
+    ffmpeg_path: str,
+) -> CameraEntry:
+    main = (c.main_rtsp_url or c.rtsp_url).strip()
+    vendor = (c.rtsp_vendor or "").strip()
+    scale = (c.streaming_scale_filter or "").strip()
+
+    if c.streaming_rtsp_url.strip():
+        stream = c.streaming_rtsp_url.strip()
+        print(
+            f"[Streaming Config] camera {c.id}: explicit streaming URL {_redact_rtsp(stream)}"
+        )
+    elif use_substream:
+        stream = to_substream_rtsp_url(main, vendor=vendor)
+        if stream != main:
+            print(
+                f"[Streaming Config] camera {c.id}: substream URL {_redact_rtsp(stream)}"
+            )
+    else:
+        stream = main
+
+    if use_substream and stream != main:
+        ok, w, h, codec = _substream_is_usable(stream, ffmpeg_path)
+        if not ok:
+            cam_webs = to_substream_rtsp_url(main, vendor="cam_webs")
+            if cam_webs != stream:
+                ok2, w2, h2, codec2 = _substream_is_usable(cam_webs, ffmpeg_path)
+                if ok2:
+                    print(
+                        f"[Streaming Config] camera {c.id}: Cam-Webs substream "
+                        f"{_redact_rtsp(cam_webs)} ({codec2} {w2}x{h2})"
+                    )
+                    stream = cam_webs
+                else:
+                    print(
+                        f"[Streaming Config] camera {c.id}: substream unavailable "
+                        f"({codec or 'no signal'} {w}x{h}; Cam-Webs {codec2 or 'n/a'} "
+                        f"{w2}x{h2}); main + downscale 640x360 {_redact_rtsp(main)}"
+                    )
+                    stream = cam_webs_major_url(main)
+                    vendor = vendor or "cam_webs"
+                    scale = _STREAMING_FALLBACK_SCALE
+            else:
+                print(
+                    f"[Streaming Config] camera {c.id}: substream unavailable "
+                    f"({codec or 'no signal'} {w}x{h}); main + downscale 640x360 "
+                    f"{_redact_rtsp(main)}"
+                )
+                stream = cam_webs_major_url(main)
+                if stream != main:
+                    vendor = vendor or "cam_webs"
+                scale = _STREAMING_FALLBACK_SCALE
+        elif w >= 1280 and h >= 720:
+            # Full HD on /102 alias — Cam-Webs bare main + sender on / (not Hik substream).
+            from urllib.parse import urlparse as _urlparse
+
+            main_path = (_urlparse(main).path or "/").rstrip("/")
+            bare_main = main_path in ("", "/")
+            cam_webs = to_substream_rtsp_url(main, vendor="cam_webs")
+            cam_webs_concurrent = bare_main and "/streaming/channels/102" in stream.lower()
+            if is_cam_webs_style_main(main, vendor) or cam_webs_concurrent:
+                scale = scale or _STREAMING_FALLBACK_SCALE
+                vendor = vendor or "cam_webs"
+                print(
+                    f"[Streaming Config] camera {c.id}: Cam-Webs concurrent stream "
+                    f"{_redact_rtsp(stream)} ({codec} {w}x{h}) + downscale — "
+                    f"sender-crop uses main {_redact_rtsp(main)}"
+                )
+            elif cam_webs != stream:
+                ok2, w2, h2, codec2 = _substream_is_usable(cam_webs, ffmpeg_path)
+                if ok2 and w2 > 0 and (w2 < w or h2 < h):
+                    print(
+                        f"[Streaming Config] camera {c.id}: Cam-Webs substream "
+                        f"{_redact_rtsp(cam_webs)} ({codec2} {w2}x{h2})"
+                    )
+                    stream = cam_webs
+                else:
+                    stream = cam_webs_major_url(main)
+                    vendor = vendor or "cam_webs"
+                    scale = _STREAMING_FALLBACK_SCALE
+                    print(
+                        f"[Streaming Config] camera {c.id}: no usable substream "
+                        f"({codec} {w}x{h}); main + downscale 640x360 "
+                        f"{_redact_rtsp(stream)}"
+                    )
+            else:
+                print(
+                    f"[Streaming Config] camera {c.id}: substream is full resolution "
+                    f"({codec} {w}x{h}); main + downscale 640x360 {_redact_rtsp(main)}"
+                )
+                stream = cam_webs_major_url(main)
+                if stream != main:
+                    vendor = vendor or "cam_webs"
+                scale = _STREAMING_FALLBACK_SCALE
+
+    transport = _resolve_rtsp_transport(
+        explicit=c.streaming_rtsp_transport,
+        main=main,
+        vendor=vendor,
+        scale=scale,
+        stream_url=stream,
+    )
+
+    return CameraEntry(
+        id=c.id,
+        rtsp_url=stream,
+        main_rtsp_url=main,
+        streaming_rtsp_url=c.streaming_rtsp_url,
+        rtsp_vendor=vendor,
+        streaming_scale_filter=scale,
+        streaming_rtsp_transport=transport,
+    )
+
+
+def _apply_substream_to_cameras(
+    cameras: list[CameraEntry],
+    use_substream: bool,
+    ffmpeg_path: str = "ffmpeg",
+) -> list[CameraEntry]:
+    return [
+        _resolve_streaming_rtsp_url(c, use_substream=use_substream, ffmpeg_path=ffmpeg_path)
+        for c in cameras
+    ]
 
 
 def _redact_rtsp(url: str) -> str:
@@ -150,6 +406,25 @@ def _redact_rtsp(url: str) -> str:
         return url
 
 
+def _camera_entry_from_yaml_item(item: dict[str, Any], rtsp_url: str) -> CameraEntry:
+    cid = str(item.get("camera_id") or item.get("id") or "").strip()
+    vendor = str(item.get("rtsp_vendor") or item.get("streaming_vendor") or "").strip()
+    streaming = str(item.get("streaming_rtsp_url") or item.get("streaming_source") or "").strip()
+    scale = str(item.get("streaming_scale_filter") or "").strip()
+    transport = str(
+        item.get("streaming_rtsp_transport") or item.get("rtsp_transport") or ""
+    ).strip()
+    return CameraEntry(
+        id=cid,
+        rtsp_url=rtsp_url,
+        main_rtsp_url=rtsp_url,
+        streaming_rtsp_url=streaming,
+        rtsp_vendor=vendor,
+        streaming_scale_filter=scale,
+        streaming_rtsp_transport=transport,
+    )
+
+
 def _parse_camera(obj: dict[str, Any]) -> CameraEntry | None:
     cid = obj.get("id") or obj.get("camera_id")
     if not cid:
@@ -158,7 +433,7 @@ def _parse_camera(obj: dict[str, Any]) -> CameraEntry | None:
     url = obj.get("rtsp_url") or obj.get("source") or obj.get("url")
     if not url or not str(url).strip():
         return None
-    return CameraEntry(id=cid, rtsp_url=str(url).strip())
+    return _camera_entry_from_yaml_item(obj, str(url).strip())
 
 
 def _build_rtsp_url_from_camera_yaml(cam: dict[str, Any]) -> str:
@@ -228,11 +503,13 @@ def _load_cameras_from_sender_cameras_yaml(path: str | Path) -> list[CameraEntry
         if not rtsp_url:
             continue
 
-        out.append(CameraEntry(id=cid_str, rtsp_url=rtsp_url))
+        out.append(_camera_entry_from_yaml_item(item, rtsp_url))
     return out
 
 
-def load_config(path: str | Path | None = None) -> AgentConfig:
+def load_config(
+    path: str | Path | None = None, *, probe_cameras: bool = True
+) -> AgentConfig:
     """
     Load YAML or JSON. Path: STREAMING_AGENT_CONFIG or arg or default
     `config/streaming-agent.yaml`.
@@ -310,6 +587,18 @@ def load_config(path: str | Path | None = None) -> AgentConfig:
         idle_grace_sec=_env_float(
             "STREAMING_IDLE_GRACE_SEC", float(data.get("idle_grace_sec", 10.0))
         ),
+        restart_base_delay_sec=_env_float(
+            "STREAMING_RESTART_BASE_DELAY_SEC",
+            float(data.get("restart_base_delay_sec", 6.0)),
+        ),
+        restart_max_delay_sec=_env_float(
+            "STREAMING_RESTART_MAX_DELAY_SEC",
+            float(data.get("restart_max_delay_sec", 90.0)),
+        ),
+        rtmp_republish_cooldown_sec=_env_float(
+            "STREAMING_RTMP_REPUBLISH_COOLDOWN_SEC",
+            float(data.get("rtmp_republish_cooldown_sec", 15.0)),
+        ),
         viewer_idle_stop=bool(data.get("viewer_idle_stop", True)),
         delivery=delivery,
         mediamtx=MediaMTXConfig(
@@ -324,6 +613,15 @@ def load_config(path: str | Path | None = None) -> AgentConfig:
                 or "http://127.0.0.1:8889"
             ).rstrip("/"),
             rtsp_transport=str(med.get("rtsp_transport") or "tcp"),
+            rtsp_relay_enabled=_env_bool(
+                "STREAMING_RTSP_RELAY_ENABLED",
+                bool(med.get("rtsp_relay_enabled", True)),
+            ),
+            rtsp_listen_base=str(
+                med.get("rtsp_listen_base")
+                or _env("STREAMING_RTSP_RELAY_BASE")
+                or "rtsp://127.0.0.1:8554"
+            ).rstrip("/"),
         ),
         upstream=UpstreamConfig(
             rtmp_url_template=str(
@@ -351,7 +649,12 @@ def load_config(path: str | Path | None = None) -> AgentConfig:
         ),
     )
 
-    cfg.cameras = _apply_substream_to_cameras(cfg.cameras, cfg.use_substream)
+    if probe_cameras:
+        cfg.cameras = _apply_substream_to_cameras(
+            cfg.cameras,
+            cfg.use_substream,
+            ffmpeg_path=cfg.upstream.ffmpeg_path,
+        )
 
     # Env overrides for agent_id / backend if still default
     if _env("STREAMING_AGENT_ID"):
@@ -374,3 +677,13 @@ def path_name_for_camera(camera_id: str) -> str:
     """Sanitize camera id for MediaMTX path segment."""
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in camera_id.strip())
     return safe or "cam"
+
+
+def relay_path_for_camera(camera_id: str) -> str:
+    """MediaMTX path for upstream RTSP relay (separate from WebRTC path names)."""
+    return f"up_{path_name_for_camera(camera_id)}"
+
+
+def relay_rtsp_url(listen_base: str, camera_id: str) -> str:
+    base = (listen_base or "rtsp://127.0.0.1:8554").rstrip("/")
+    return f"{base}/{relay_path_for_camera(camera_id)}"

@@ -57,14 +57,11 @@ class SignalingClient:
         headers: list[tuple[str, str]] = []
         if self.cfg.auth_token:
             headers.append(("Authorization", f"Bearer {self.cfg.auth_token}"))
-        # Protocol-level pings detect half-open TLS/WS (LB idle timeout, NAT, etc.).
-        # ping_interval=None left recv loop alive while send only logged warnings.
-        hb = max(5.0, float(self.cfg.heartbeat_interval_sec))
-        ping_timeout = min(20.0, max(10.0, hb * 0.8))
-        ping_interval = max(ping_timeout + 5.0, hb)
+        # App-level heartbeat (type=heartbeat) keeps agent online on backend.
+        # ping_interval=None: avoid WS protocol pings conflicting with some proxies.
         kwargs: dict[str, Any] = {
-            "ping_interval": ping_interval,
-            "ping_timeout": ping_timeout,
+            "ping_interval": None,
+            "ping_timeout": 60,
             "close_timeout": 10,
             "open_timeout": 30,
         }
@@ -99,7 +96,25 @@ class SignalingClient:
                     await self._force_reconnect(f"send failed: {msg_type}")
                 return False
 
+    async def _send_heartbeat(self) -> bool:
+        mtx_for_metrics = (
+            None if self.cfg.delivery == "upstream_rtmp" else self.mtx
+        )
+        m = collect_metrics(
+            mtx_for_metrics, self.stream_manager.streams_active_count()
+        )
+        return await self.send_json(
+            {
+                "type": "heartbeat",
+                "agent_id": self.cfg.agent_id,
+                "cpu": m.get("cpu", 0),
+                "ram": m.get("ram", 0),
+                "streams_active": m.get("streams_active", 0),
+            }
+        )
+
     async def _heartbeat_loop(self) -> None:
+        tick = 0
         while not self._stopped.is_set():
             try:
                 await asyncio.wait_for(
@@ -109,21 +124,17 @@ class SignalingClient:
                 break
             except asyncio.TimeoutError:
                 pass
-            mtx_for_metrics = (
-                None if self.cfg.delivery == "upstream_rtmp" else self.mtx
-            )
-            m = collect_metrics(
-                mtx_for_metrics, self.stream_manager.streams_active_count()
-            )
-            ok = await self.send_json(
-                {
-                    "type": "heartbeat",
-                    "cpu": m.get("cpu", 0),
-                    "ram": m.get("ram", 0),
-                    "streams_active": m.get("streams_active", 0),
-                }
-            )
+            ok = await self._send_heartbeat()
+            tick += 1
+            if tick == 1 or tick % 4 == 0:
+                logger.info(
+                    "heartbeat sent agent_id=%s streams_active=%s ok=%s",
+                    self.cfg.agent_id,
+                    self.stream_manager.streams_active_count(),
+                    ok,
+                )
             if not ok:
+                logger.warning("heartbeat send failed — WS will reconnect")
                 break
 
     async def _handle_incoming(self, raw: str) -> None:
@@ -138,29 +149,43 @@ class SignalingClient:
         if t == "ping":
             await self.send_json({"type": "pong"})
             return
+        if t == "pong":
+            return
+        if t == "ack":
+            logger.info("backend ack: %s", msg.get("message", msg))
+            return
+        if t in ("register_ack", "registered", "agent_online"):
+            logger.info("backend ack: %s", msg)
+            return
         if t == "start_stream":
             cid = msg.get("camera_id")
             sid = msg.get("session_id")
+            logger.info("backend start_stream camera=%s session=%s", cid, sid)
             if cid:
-                await self.stream_manager.start_stream(str(cid), session_id=str(sid) if sid else None)
+                await self.stream_manager.start_stream(
+                    str(cid), session_id=str(sid) if sid else None
+                )
             return
         if t == "stop_stream":
             cid = msg.get("camera_id")
             sid = msg.get("session_id")
+            logger.info("backend stop_stream camera=%s session=%s", cid, sid)
             if cid:
                 await self.stream_manager.stop_stream(
                     str(cid),
-                    force=True,
+                    force=False,
                     session_id=str(sid) if sid else None,
                 )
             return
         if t == "viewer_join":
             cid = msg.get("camera_id")
+            logger.info("backend viewer_join camera=%s", cid)
             if cid:
                 await self.stream_manager.viewer_join(str(cid))
             return
         if t == "viewer_leave":
             cid = msg.get("camera_id")
+            logger.info("backend viewer_leave camera=%s", cid)
             if cid:
                 await self.stream_manager.viewer_leave(str(cid))
             return
@@ -168,18 +193,19 @@ class SignalingClient:
             # Reserved for future SDP/ICE relay; browser typically uses WHEP URL from stream_status.
             logger.debug("webrtc_signal from backend: %s", msg)
             return
-        logger.debug("unhandled message type=%s", t)
+        logger.warning("unhandled backend message type=%s keys=%s", t, list(msg.keys()))
 
     async def on_stream_status(self, camera_id: str, data: dict[str, Any]) -> None:
         await self.send_json(data)
 
     def _next_backoff_sec(self, attempt: int) -> float:
-        seq = [2.0, 5.0, 10.0]
-        max_b = self.cfg.reconnect_backoff_max_sec
+        initial = max(1.0, float(self.cfg.reconnect_backoff_initial_sec))
+        max_b = max(initial, float(self.cfg.reconnect_backoff_max_sec))
+        seq = [initial, min(max_b, initial * 2.5), min(max_b, initial * 5.0)]
         if attempt < len(seq):
-            return min(seq[attempt], max_b)
+            return seq[attempt]
         extra = attempt - len(seq) + 1
-        return min(max_b, seq[-1] * (2**extra))
+        return min(max_b, seq[-1] * (2**min(extra, 4)))
 
     async def run(self) -> None:
         attempt = 0
@@ -205,6 +231,9 @@ class SignalingClient:
                         self.cfg.agent_id,
                         cams,
                     )
+                    await self._send_heartbeat()
+                    logger.info("initial heartbeat sent agent_id=%s", self.cfg.agent_id)
+                    await self.stream_manager.restore_wanted_streams()
                     self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
                     attempt = 0
                     try:
