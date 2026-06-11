@@ -83,7 +83,6 @@ class MainAgent:
         self._snapshot_last_attempt: Dict[str, float] = {}
         self._snapshot_retry_interval = max(10.0, _env_float("BACKEND_SNAPSHOT_RETRY_SEC", 30.0))
         self._snapshot_upload_timeout = max(5.0, _env_float("BACKEND_SNAPSHOT_UPLOAD_TIMEOUT_SEC", 30.0))
-        self._snapshot_max_width = _env_int("BACKEND_SNAPSHOT_MAX_WIDTH", 1280, 320, 3840)
         self._sender_debug = _env_bool("SENDER_DEBUG", False)
         self._debug_no_person_interval = max(2.0, _env_float("SENDER_DEBUG_NO_PERSON_INTERVAL_SEC", 15.0))
         self._debug_miss_state: Dict[str, dict] = {}
@@ -407,22 +406,6 @@ class MainAgent:
         except Exception as e:
             print(f"[Main Agent] Initial snapshot upload error for camera {camera_id}: {e}")
 
-    @staticmethod
-    def _resize_frame_for_upload(frame: np.ndarray, max_width: int) -> np.ndarray:
-        h, w = frame.shape[:2]
-        if w <= max_width:
-            return frame
-        scale = max_width / float(w)
-        new_w = max_width
-        new_h = max(1, int(round(h * scale)))
-        try:
-            import cv2
-
-            return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        except Exception:
-            step = max(1, int(round(1.0 / scale)))
-            return frame[::step, ::step].copy()
-
     def _send_initial_snapshot(self, frame, timestamp: float, camera_id: str, camera) -> bool:
         """Send one original snapshot per camera to backend /company/{company_id}/smartcamera/{smartcamera_id}/snapshot.
         Returns True only on 200 OK (so caller can add to _snapshot_sent and skip retries)."""
@@ -453,8 +436,7 @@ class MainAgent:
             print(f"[Main Agent] No backend bearer token; sending initial snapshot for camera {camera_id} without Authorization header")
         else:
             print(f"[Main Agent] Sending initial snapshot for camera {camera_id} -> {url} with bearer token")
-        upload_frame = self._resize_frame_for_upload(frame, self._snapshot_max_width)
-        data = encode_jpeg_bgr(upload_frame, quality=85)
+        data = encode_jpeg_bgr(frame, quality=85)
         if data is None:
             print(f"[Main Agent] Failed to encode initial snapshot for camera {camera_id}")
             return False
