@@ -167,11 +167,40 @@ class MainAgent:
                 minio_config[key] = _env(env_key)
         minio_config['endpoint'] = str(minio_config['endpoint']).replace('http://', '').replace('https://', '').rstrip('/')
 
+        buffer_max_bytes_raw = _env('KAFKA_BUFFER_MAX_BYTES')
+        buffer_max_bytes = None
+        if buffer_max_bytes_raw:
+            try:
+                buffer_max_bytes = int(buffer_max_bytes_raw)
+            except (ValueError, TypeError):
+                buffer_max_bytes = None
+
+        resilience_config = {
+            'reconnect_sec': max(5.0, _env_float('KAFKA_RECONNECT_SEC', 15.0)),
+            'offline_log_sec': max(15.0, _env_float('KAFKA_OFFLINE_LOG_SEC', 60.0)),
+            'broker_check_sec': max(3.0, _env_float('KAFKA_BROKER_CHECK_SEC', 10.0)),
+            'delivery_timeout_sec': max(3.0, _env_float('KAFKA_DELIVERY_TIMEOUT_SEC', 10.0)),
+            'buffer_enabled': _env_bool('KAFKA_BUFFER_ENABLED', True),
+            'buffer_max_items': _env_int('KAFKA_BUFFER_MAX_ITEMS', 340000, 1, 10000000),
+            'buffer_dir': _env('KAFKA_BUFFER_DIR') or '/app/config/kafka_buffer',
+            'buffer_replay_batch': _env_int('KAFKA_BUFFER_REPLAY_BATCH', 20, 1, 1000),
+            'buffer_max_bytes': buffer_max_bytes,
+            'local_spill_enabled': _env_bool('KAFKA_LOCAL_SPILL_ENABLED', False),
+            'local_spill_dir': _env('KAFKA_LOCAL_SPILL_DIR') or '/app/config/kafka_spill',
+        }
+        print(
+            f"[Main Agent] Kafka buffer: enabled={resilience_config['buffer_enabled']}, "
+            f"max_items={resilience_config['buffer_max_items']}, "
+            f"dir={resilience_config['buffer_dir']}, "
+            f"local_spill={resilience_config['local_spill_enabled']}"
+        )
+
         self.sender_agent = KafkaSenderAgent(
             bootstrap_servers=bootstrap_servers,
             topic=topic,
             jpeg_quality=jpeg_quality,
             minio_config=minio_config if minio_config.get('enabled') else None,
+            resilience_config=resilience_config,
         )
 
         # Detection: CPU person detection only (person_detect binary)
@@ -267,11 +296,13 @@ class MainAgent:
         """Start all agents"""
         print("[Main Agent] Starting snapshot sending system...")
         
-        # Connect to Kafka (create producer) for person crops
+        # Connect MinIO (required) and Kafka (optional — capture continues if broker is down)
         if not self.sender_agent.connect():
-            print("[Main Agent] Failed to connect to Kafka")
+            print("[Main Agent] Failed to connect to MinIO (and local spill is disabled)")
             return False
-        
+
+        self.sender_agent.start_auto_reconnect()
+
         # Start capture for all cameras
         for camera_id, capture_agent in self.capture_agents.items():
             try:

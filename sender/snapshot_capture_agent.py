@@ -11,6 +11,7 @@ full, oldest pending frames are dropped so capture never blocks indefinitely.
 
 import os
 import select
+import signal
 import subprocess
 import time
 import threading
@@ -27,6 +28,7 @@ _DEFAULT_PROCESSING_QUEUE_MAX = 100
 _DEFAULT_RTSP_TIMEOUT_US = 5_000_000  # 5s socket I/O timeout (FFmpeg -timeout, microseconds)
 _DEFAULT_RECONNECT_SEC = 3.0
 _DEFAULT_FFPROBE_TIMEOUT_SEC = 8.0
+_DEFAULT_WATCHDOG_SEC = 90.0
 _OFFLINE_LOG_INTERVAL_SEC = 60.0
 
 # Cached RTSP socket timeout CLI flag: "-timeout" (most builds) or "-stimeout" (some newer).
@@ -158,6 +160,12 @@ class SnapshotCaptureAgent:
             self._frame_stall_sec = 25.0
         self._stream_healthy = False
         self._last_offline_log = 0.0
+        self._last_frame_at = time.monotonic()
+        self._last_good_resolution: Tuple[int, int] = (0, 0)
+        self._reconnect_attempts = 0
+        watchdog = _env_float("CAPTURE_WATCHDOG_SEC", _DEFAULT_WATCHDOG_SEC)
+        self._watchdog_sec = max(30.0, watchdog) if watchdog > 0 else 0.0
+        self._watchdog_thread: Optional[threading.Thread] = None
         print(
             f"[Capture Agent {self.camera_id}] Processing queue depth: {self.processing_queue_max} "
             f"(higher = more backlog tolerance, more latency/RAM if detection is slow)"
@@ -179,8 +187,14 @@ class SnapshotCaptureAgent:
             self._input_for_ffmpeg = str(self.source).strip()
 
         self.is_running = True
+        self._last_frame_at = time.monotonic()
         self.capture_thread = threading.Thread(target=self._capture_loop_ffmpeg, daemon=True)
         self.capture_thread.start()
+        if self._watchdog_sec > 0:
+            self._watchdog_thread = threading.Thread(
+                target=self._watchdog_loop, name=f"capture-watchdog-{self.camera_id}", daemon=True
+            )
+            self._watchdog_thread.start()
         if self.callback is not None:
             self.processing_thread = threading.Thread(target=self._processing_loop, daemon=True)
             self.processing_thread.start()
@@ -191,18 +205,12 @@ class SnapshotCaptureAgent:
 
     def stop(self):
         self.is_running = False
+        self._force_kill_ffmpeg()
+        if self._watchdog_thread:
+            self._watchdog_thread.join(timeout=2.0)
+            self._watchdog_thread = None
         if self.capture_thread:
             self.capture_thread.join(timeout=3.0)
-        if self._ffmpeg_proc is not None:
-            try:
-                self._ffmpeg_proc.terminate()
-                self._ffmpeg_proc.wait(timeout=2.0)
-            except Exception:
-                try:
-                    self._ffmpeg_proc.kill()
-                except Exception:
-                    pass
-            self._ffmpeg_proc = None
         if self.processing_thread is not None:
             while True:
                 try:
@@ -268,6 +276,7 @@ class SnapshotCaptureAgent:
 
     def _offer_processing(self, item: Tuple[float, np.ndarray]) -> None:
         """Enqueue for the worker; drop oldest pending frames if queue is full."""
+        self._last_frame_at = time.monotonic()
         while True:
             try:
                 self.processing_queue.put_nowait(item)
@@ -339,6 +348,29 @@ class SnapshotCaptureAgent:
         thread.start()
         return chunks, thread
 
+    def _force_kill_ffmpeg(self) -> None:
+        proc = self._ffmpeg_proc
+        self._ffmpeg_proc = None
+        self._stderr_drain_thread = None
+        self._stderr_chunks = None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError, AttributeError):
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                try:
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _stop_ffmpeg(self, reason: str = "") -> None:
         proc = self._ffmpeg_proc
         self._ffmpeg_proc = None
@@ -349,16 +381,55 @@ class SnapshotCaptureAgent:
         if proc is None:
             return
         try:
-            proc.terminate()
-            proc.wait(timeout=2.0)
+            if proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except (ProcessLookupError, OSError, AttributeError):
+                    proc.terminate()
+                try:
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (ProcessLookupError, OSError, AttributeError):
+                        proc.kill()
+                    try:
+                        proc.wait(timeout=1.0)
+                    except Exception:
+                        pass
         except Exception:
-            try:
-                proc.kill()
-                proc.wait(timeout=1.0)
-            except Exception:
-                pass
+            pass
+        if drain is not None:
+            drain.join(timeout=1.0)
         if reason:
             print(f"[Capture Agent {self.camera_id}] {reason}")
+
+    def _resolve_frame_size(self) -> Tuple[int, int, int]:
+        w, h = self._last_good_resolution
+        if w <= 0 or h <= 0:
+            w, h = self._probe_resolution()
+            if w > 0 and h > 0:
+                self._last_good_resolution = (w, h)
+        if w <= 0 or h <= 0:
+            w, h = self.width, self.height
+            if not self._stream_healthy:
+                self._log_offline_periodic()
+        return w, h, w * h * 3
+
+    def _watchdog_loop(self) -> None:
+        while self.is_running:
+            time.sleep(min(30.0, max(10.0, self._watchdog_sec / 3)))
+            if not self.is_running:
+                break
+            stale = time.monotonic() - self._last_frame_at
+            if stale < self._watchdog_sec:
+                continue
+            print(
+                f"[Capture Agent {self.camera_id}] Watchdog: no frames for {stale:.0f}s "
+                f"(limit {self._watchdog_sec:.0f}s) — forcing FFmpeg reconnect"
+            )
+            self._last_frame_at = time.monotonic()
+            self._force_kill_ffmpeg()
 
     def _log_offline_periodic(self) -> None:
         now = time.time()
@@ -383,19 +454,20 @@ class SnapshotCaptureAgent:
     def _capture_loop_ffmpeg(self):
         while self.is_running:
             disconnect_reason = ""
+            self._reconnect_attempts += 1
+            print(
+                f"[Capture Agent {self.camera_id}] Connecting to camera "
+                f"(attempt {self._reconnect_attempts})"
+            )
             try:
-                w, h = self._probe_resolution()
-                if w <= 0 or h <= 0:
-                    w, h = self.width, self.height
-                    if not self._stream_healthy:
-                        self._log_offline_periodic()
-                frame_size = w * h * 3
+                w, h, frame_size = self._resolve_frame_size()
                 cmd = self._ffmpeg_decode_prefix() + self._ffmpeg_output_suffix()
                 self._ffmpeg_proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     stdin=subprocess.DEVNULL,
+                    start_new_session=True,
                 )
                 self._stderr_chunks, self._stderr_drain_thread = self._start_stderr_drain(
                     self._ffmpeg_proc
@@ -419,6 +491,8 @@ class SnapshotCaptureAgent:
                     if not self.is_running:
                         break
                     got_frame = True
+                    if self._last_good_resolution != (w, h):
+                        self._last_good_resolution = (w, h)
                     self._mark_stream_restored()
                     current_time = time.time()
                     if self.callback is not None:
