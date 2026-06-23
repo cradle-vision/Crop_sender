@@ -39,6 +39,7 @@ class CameraInfo:
     inside_x: Optional[int] = None
     inside_y: Optional[int] = None
     line_active: Optional[bool] = None
+    roi_updated_at: Optional[str] = None
 
 
 class CameraManager:
@@ -129,6 +130,8 @@ class CameraManager:
             top_line = _extract_line_config(out)
             line_obj = out.get('camera_line') or out.get('line') or out.get('camera_roi')
             nested_line = _extract_line_config(line_obj) if isinstance(line_obj, dict) else {}
+            if isinstance(line_obj, dict) and line_obj.get('updated_at'):
+                out['roi_updated_at'] = line_obj.get('updated_at')
             merged_line = {}
             for key in ("line_x1", "line_y1", "line_x2", "line_y2", "inside_x", "inside_y", "line_active"):
                 merged_line[key] = top_line.get(key) if top_line.get(key) is not None else nested_line.get(key)
@@ -469,6 +472,46 @@ class CameraManager:
         if self.auto_save:
             self.save_cameras()
         
+        return True
+
+    def apply_roi_sync(
+        self,
+        camera_id: str,
+        *,
+        camera_line: Optional[dict] = None,
+        camera_roi: Optional[dict] = None,
+    ) -> bool:
+        """Apply ROI/line changes from backend roi-sync poll (overwrites current values)."""
+        camera = self.cameras.get(camera_id)
+        if not camera:
+            return False
+
+        line_obj: dict = {}
+        if isinstance(camera_line, dict):
+            line_obj.update(camera_line)
+        if isinstance(camera_roi, dict):
+            for key in (
+                "line_x1", "line_y1", "line_x2", "line_y2",
+                "inside_x", "inside_y", "line_active", "updated_at",
+            ):
+                if key in camera_roi and camera_roi.get(key) is not None:
+                    line_obj[key] = camera_roi[key]
+
+        updates = {}
+        for key in ("line_x1", "line_y1", "line_x2", "line_y2", "inside_x", "inside_y", "line_active"):
+            if key in line_obj:
+                updates[key] = line_obj[key]
+        if "updated_at" in line_obj and line_obj.get("updated_at"):
+            updates["roi_updated_at"] = str(line_obj["updated_at"])
+
+        if not updates:
+            return False
+
+        for key, value in updates.items():
+            setattr(camera, key, value)
+        if self.auto_save:
+            self.save_cameras()
+        print(f"[Camera Manager] ROI/line sync for camera {camera_id}: {list(updates.keys())}")
         return True
     
     def scan_usb_cameras(self, max_index: int = 10) -> List[int]:

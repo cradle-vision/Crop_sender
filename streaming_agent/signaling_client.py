@@ -10,6 +10,7 @@ from typing import Any
 from streaming_agent.config import AgentConfig
 from streaming_agent.health_monitor import collect_metrics
 from streaming_agent.mediamtx_client import MediaMTXClient
+from streaming_agent.roi_bridge import apply_roi_payload, request_snapshot_refresh
 from streaming_agent.stream_manager import StreamManager
 
 logger = logging.getLogger(__name__)
@@ -193,10 +194,35 @@ class SignalingClient:
             # Reserved for future SDP/ICE relay; browser typically uses WHEP URL from stream_status.
             logger.debug("webrtc_signal from backend: %s", msg)
             return
+        if t == "snapshot_refresh":
+            await self._handle_snapshot_refresh(msg)
+            return
+        if t == "roi_updated":
+            await self._handle_roi_updated(msg)
+            return
         logger.warning("unhandled backend message type=%s keys=%s", t, list(msg.keys()))
 
     async def on_stream_status(self, camera_id: str, data: dict[str, Any]) -> None:
         await self.send_json(data)
+
+    async def _handle_snapshot_refresh(self, msg: dict[str, Any]) -> None:
+        cam_id = msg.get("smartcamera_id")
+        try:
+            logger.info("snapshot_refresh camera=%s", cam_id)
+            await asyncio.to_thread(request_snapshot_refresh, cam_id)
+        except Exception as e:
+            logger.warning("snapshot_refresh failed camera=%s: %s", cam_id, e)
+
+    async def _handle_roi_updated(self, msg: dict[str, Any]) -> None:
+        """Apply ROI on sender-crop via local IPC function (no HTTP endpoint)."""
+        cam_id = msg.get("smartcamera_id")
+        try:
+            if msg.get("refresh_snapshot"):
+                await self._handle_snapshot_refresh(msg)
+            logger.info("roi_updated camera=%s", cam_id)
+            await asyncio.to_thread(apply_roi_payload, msg)
+        except Exception as e:
+            logger.warning("roi_updated failed camera=%s: %s", cam_id, e)
 
     def _next_backoff_sec(self, attempt: int) -> float:
         initial = max(1.0, float(self.cfg.reconnect_backoff_initial_sec))

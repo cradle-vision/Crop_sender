@@ -4,8 +4,9 @@ import time
 import signal
 import sys
 import threading
+from datetime import datetime, timezone
 from urllib.parse import urlparse, urlunparse
-from typing import Dict, Union
+from typing import Dict, Union, Optional
 
 import numpy as np
 
@@ -26,6 +27,7 @@ from kafka_sender_agent import KafkaSenderAgent
 from camera_manager import CameraManager
 from person_crop import detect_persons, crop_persons, is_available as person_detector_available
 from jpeg_utils import encode_jpeg_bgr
+from roi_command_server import RoiCommandServer
 
 _STREAM_TYPES = frozenset({"rtsp", "http", "file"})
 
@@ -88,6 +90,13 @@ class MainAgent:
         self._debug_miss_state: Dict[str, dict] = {}
         self._backend_bearer_token = None
         self.backend_snapshot_base_url = None
+        self._roi_poll_interval = _env_float('ROI_POLL_INTERVAL_SEC', 0.0)
+        self._roi_last_sync_at: Optional[str] = None
+        self._roi_sync_stop = threading.Event()
+        self._roi_sync_thread: Optional[threading.Thread] = None
+        self._roi_sync_lock = threading.Lock()
+        self._roi_command_server: Optional[RoiCommandServer] = None
+        self._roi_socket_path = _env('SENDER_ROI_SOCKET_PATH') or '/tmp/sender-roi.sock'
         backend_timeout = _env_float('BACKEND_CAMERAS_TIMEOUT', 10.0)
 
         # Camera manager: from backend API or from file
@@ -141,6 +150,8 @@ class MainAgent:
                 if fallback_path and os.path.isfile(fallback_path):
                     self.camera_manager.config_file = fallback_path
                     self.camera_manager.load_cameras()
+
+        self._roi_last_sync_at = self._initial_roi_sync_cursor()
 
         bootstrap_servers = (
             _env('KAFKA_BOOTSTRAP_SERVERS')
@@ -322,6 +333,8 @@ class MainAgent:
             return False
         
         self.running = True
+        self._start_roi_command_server()
+        self._start_roi_poll_fallback()
         print(f"[Main Agent] System started and running. Active cameras: {len(self.capture_agents)}")
         
         # Main loop
@@ -429,7 +442,139 @@ class MainAgent:
                 building_name,
                 camera_name,
             )
-    
+
+    def _initial_roi_sync_cursor(self) -> str:
+        latest = None
+        for camera in self.camera_manager.cameras.values():
+            ts = getattr(camera, "roi_updated_at", None)
+            if ts and (latest is None or str(ts) > str(latest)):
+                latest = str(ts)
+        if latest:
+            return latest
+        return datetime.now(timezone.utc).isoformat()
+
+    def _company_id_for_backend(self) -> Optional[str]:
+        for camera in self.camera_manager.get_enabled_cameras():
+            company_id = getattr(camera, "company_id", None)
+            if company_id:
+                return str(company_id).strip()
+        return None
+
+    def _backend_auth_headers(self) -> Dict[str, str]:
+        headers = {"Accept": "application/json"}
+        if self._backend_bearer_token:
+            headers["Authorization"] = f"Bearer {self._backend_bearer_token}"
+        return headers
+
+    def _start_roi_command_server(self) -> None:
+        if _env_bool('SENDER_ROI_IPC_ENABLED', True):
+            self._roi_command_server = RoiCommandServer(self, socket_path=self._roi_socket_path)
+            self._roi_command_server.start()
+
+    def _start_roi_poll_fallback(self) -> None:
+        if self._roi_poll_interval > 0:
+            self._start_roi_sync_thread()
+
+    def _start_roi_sync_thread(self) -> None:
+        if not self.backend_snapshot_base_url or not HAS_REQUESTS or not self._backend_bearer_token:
+            if self.backend_snapshot_base_url and not self._backend_bearer_token:
+                print("[Main Agent] ROI HTTP fallback disabled: no backend bearer token")
+            return
+        if self._roi_poll_interval <= 0:
+            return
+        if self._roi_sync_thread and self._roi_sync_thread.is_alive():
+            return
+        self._roi_sync_stop.clear()
+        self._roi_sync_thread = threading.Thread(
+            target=self._roi_sync_loop,
+            daemon=True,
+            name="roi-sync-fallback",
+        )
+        self._roi_sync_thread.start()
+        print(f"[Main Agent] ROI HTTP fallback polling every {self._roi_poll_interval:.0f}s")
+
+    def _roi_sync_loop(self) -> None:
+        while self.running and not self._roi_sync_stop.is_set():
+            try:
+                self._poll_roi_changes()
+            except Exception as e:
+                print(f"[Main Agent] ROI fallback poll error: {e}")
+            self._roi_sync_stop.wait(self._roi_poll_interval)
+
+    def _poll_roi_changes(self) -> None:
+        company_id = self._company_id_for_backend()
+        if not company_id or not self.backend_snapshot_base_url or not self._backend_bearer_token:
+            return
+        base = self.backend_snapshot_base_url.rstrip("/")
+        url = f"{base}/company/{company_id}/smartcamera/roi-sync"
+        params = {}
+        with self._roi_sync_lock:
+            if self._roi_last_sync_at:
+                params["since"] = self._roi_last_sync_at
+        timeout = max(5.0, _env_float('BACKEND_CAMERAS_TIMEOUT', 10.0))
+        resp = requests.get(
+            url,
+            headers=self._backend_auth_headers(),
+            params=params,
+            timeout=timeout,
+            verify=False,
+        )
+        if resp.status_code == 401:
+            print("[Main Agent] ROI sync unauthorized (check BACKEND_CAMERAS_TOKEN / username/password)")
+            return
+        if resp.status_code != 200:
+            print(f"[Main Agent] ROI sync poll failed: HTTP {resp.status_code}")
+            return
+        items = resp.json()
+        if not isinstance(items, list) or not items:
+            return
+
+        latest_sync = self._roi_last_sync_at
+        applied = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            cam_id = str(item.get("smartcamera_id", "")).strip()
+            if not cam_id:
+                continue
+            updated_at = item.get("updated_at")
+            if updated_at and (latest_sync is None or str(updated_at) > str(latest_sync)):
+                latest_sync = str(updated_at)
+            if self.apply_roi_from_payload(item):
+                applied += 1
+
+        if latest_sync:
+            with self._roi_sync_lock:
+                self._roi_last_sync_at = latest_sync
+        if applied:
+            print(f"[Main Agent] ROI poll: applied line for {applied} camera(s) (no snapshot)")
+
+    def apply_roi_from_payload(self, body: dict) -> bool:
+        """Apply ROI/line from backend payload (WS or HTTP poll). Does not refresh snapshot."""
+        if not isinstance(body, dict):
+            return False
+        cam_id = str(body.get("smartcamera_id", "")).strip()
+        if not cam_id:
+            return False
+        applied = self.camera_manager.apply_roi_sync(
+            cam_id,
+            camera_line=body.get("camera_line"),
+            camera_roi=body.get("camera_roi"),
+        )
+        if applied:
+            print(f"[Main Agent] ROI applied for camera {cam_id}")
+        return applied
+
+    def request_snapshot_refresh(self, camera_id: str) -> bool:
+        """Queue fresh snapshot upload to backend. Does not change ROI/line."""
+        cam_id = str(camera_id).strip()
+        if not cam_id:
+            return False
+        self._snapshot_sent.discard(cam_id)
+        self._snapshot_last_attempt.pop(cam_id, None)
+        print(f"[Main Agent] Snapshot refresh queued for camera {cam_id}")
+        return True
+
     def _initial_snapshot_worker(self, frame, timestamp: float, camera_id: str, camera) -> None:
         try:
             if self._send_initial_snapshot(frame, timestamp, camera_id, camera):
@@ -528,6 +673,11 @@ class MainAgent:
         """Stop all agents"""
         print("[Main Agent] Stopping system...")
         self.running = False
+        if self._roi_command_server:
+            self._roi_command_server.stop()
+        self._roi_sync_stop.set()
+        if self._roi_sync_thread and self._roi_sync_thread.is_alive():
+            self._roi_sync_thread.join(timeout=5.0)
         
         # Stop all capture agents
         for camera_id, capture_agent in self.capture_agents.items():
