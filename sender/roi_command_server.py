@@ -13,7 +13,10 @@ if TYPE_CHECKING:
 
 
 def roi_socket_path() -> str:
-    return os.getenv("SENDER_ROI_SOCKET_PATH", "/tmp/sender-roi.sock").strip() or "/tmp/sender-roi.sock"
+    return (
+        os.getenv("SENDER_ROI_SOCKET_PATH", "/app/config/sender-roi.sock").strip()
+        or "/app/config/sender-roi.sock"
+    )
 
 
 class RoiCommandServer:

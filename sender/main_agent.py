@@ -28,6 +28,7 @@ from camera_manager import CameraManager
 from person_crop import detect_persons, crop_persons, is_available as person_detector_available
 from jpeg_utils import encode_jpeg_bgr
 from roi_command_server import RoiCommandServer
+from roi_local_http import RoiLocalHttpServer
 
 _STREAM_TYPES = frozenset({"rtsp", "http", "file"})
 
@@ -96,7 +97,9 @@ class MainAgent:
         self._roi_sync_thread: Optional[threading.Thread] = None
         self._roi_sync_lock = threading.Lock()
         self._roi_command_server: Optional[RoiCommandServer] = None
-        self._roi_socket_path = _env('SENDER_ROI_SOCKET_PATH') or '/tmp/sender-roi.sock'
+        self._roi_http_server: Optional[RoiLocalHttpServer] = None
+        self._roi_socket_path = _env('SENDER_ROI_SOCKET_PATH') or '/app/config/sender-roi.sock'
+        self._roi_http_port = _env_int('SENDER_ROI_HTTP_PORT', 18765, 1, 65535)
         backend_timeout = _env_float('BACKEND_CAMERAS_TIMEOUT', 10.0)
 
         # Camera manager: from backend API or from file
@@ -469,7 +472,11 @@ class MainAgent:
     def _start_roi_command_server(self) -> None:
         if _env_bool('SENDER_ROI_IPC_ENABLED', True):
             self._roi_command_server = RoiCommandServer(self, socket_path=self._roi_socket_path)
-            self._roi_command_server.start()
+            if not self._roi_command_server.start():
+                print("[Main Agent] ROI unix socket failed; check config volume permissions")
+        if _env_bool('SENDER_ROI_HTTP_ENABLED', True):
+            self._roi_http_server = RoiLocalHttpServer(self, port=self._roi_http_port)
+            self._roi_http_server.start()
 
     def _start_roi_poll_fallback(self) -> None:
         if self._roi_poll_interval > 0:
@@ -675,6 +682,8 @@ class MainAgent:
         self.running = False
         if self._roi_command_server:
             self._roi_command_server.stop()
+        if self._roi_http_server:
+            self._roi_http_server.stop()
         self._roi_sync_stop.set()
         if self._roi_sync_thread and self._roi_sync_thread.is_alive():
             self._roi_sync_thread.join(timeout=5.0)

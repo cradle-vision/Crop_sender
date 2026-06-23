@@ -37,7 +37,7 @@ services:
       - mediamtx
     pids_limit: 4096
     volumes:
-      - ./config:/app/config:ro
+      - ./config:/app/config:rw
       - ./streaming_agent/streaming-agent.yaml.example:/app/streaming-agent.yaml:ro
     env_file:
       - .env
@@ -47,6 +47,6 @@ services:
       - STREAMING_UPSTREAM_TRANSCODE=${STREAMING_UPSTREAM_TRANSCODE:-true}
       - STREAMING_USE_SUBSTREAM=${STREAMING_USE_SUBSTREAM:-true}
       - MEDIAMTX_PUBLIC_WEBRTC_BASE=${MEDIAMTX_PUBLIC_WEBRTC_BASE:-http://127.0.0.1:8889}
-      - STREAMING_BACKEND_URL=${STREAMING_BACKEND_URL:-ws://127.0.0.1:8000/ws/agent}
+      - STREAMING_BACKEND_URL=${STREAMING_BACKEND_URL:-wss://api.retailsolution.ai/ws/agents}
     command: ["python3", "-m", "streaming_agent.main", "-c", "/app/streaming-agent.yaml"]
     network_mode: host
