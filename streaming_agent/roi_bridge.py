@@ -21,6 +21,16 @@ def _http_base() -> str:
     return os.getenv("SENDER_ROI_HTTP_BASE", "http://127.0.0.1:18765").rstrip("/")
 
 
+def _response_success(payload: Any) -> bool:
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return False
+    if "applied" in payload:
+        return bool(payload.get("applied"))
+    if "queued" in payload:
+        return bool(payload.get("queued"))
+    return True
+
+
 def _send_via_socket(body: dict[str, Any]) -> bool:
     path = _socket_path()
     data = (json.dumps(body, ensure_ascii=False) + "\n").encode("utf-8")
@@ -38,7 +48,7 @@ def _send_via_socket(body: dict[str, Any]) -> bool:
     if not line:
         return False
     resp = json.loads(line)
-    return bool(isinstance(resp, dict) and resp.get("ok"))
+    return _response_success(resp)
 
 
 def _send_via_http(url: str, body: dict[str, Any]) -> bool:
@@ -53,7 +63,7 @@ def _send_via_http(url: str, body: dict[str, Any]) -> bool:
         if resp.status != 200:
             return False
         payload = json.loads(resp.read().decode("utf-8"))
-        return bool(isinstance(payload, dict) and payload.get("ok"))
+        return _response_success(payload)
 
 
 def _send_command(body: dict[str, Any], *, http_path: str) -> bool:

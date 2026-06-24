@@ -206,21 +206,32 @@ class SignalingClient:
         await self.send_json(data)
 
     async def _handle_snapshot_refresh(self, msg: dict[str, Any]) -> None:
-        cam_id = msg.get("smartcamera_id")
+        cam_id = msg.get("smartcamera_id") or msg.get("camera_id")
         try:
             logger.info("snapshot_refresh camera=%s", cam_id)
-            await asyncio.to_thread(request_snapshot_refresh, cam_id)
+            ok = await asyncio.to_thread(request_snapshot_refresh, cam_id)
+            if ok:
+                logger.info("snapshot_refresh queued camera=%s", cam_id)
+            else:
+                logger.warning("snapshot_refresh not queued camera=%s", cam_id)
         except Exception as e:
             logger.warning("snapshot_refresh failed camera=%s: %s", cam_id, e)
 
     async def _handle_roi_updated(self, msg: dict[str, Any]) -> None:
-        """Apply ROI on sender-crop via local IPC function (no HTTP endpoint)."""
-        cam_id = msg.get("smartcamera_id")
+        """Apply ROI on sender-crop via local IPC (unix socket or HTTP fallback)."""
+        cam_id = msg.get("smartcamera_id") or msg.get("camera_id")
         try:
             if msg.get("refresh_snapshot"):
                 await self._handle_snapshot_refresh(msg)
-            logger.info("roi_updated camera=%s", cam_id)
-            await asyncio.to_thread(apply_roi_payload, msg)
+            logger.info("roi_updated camera=%s keys=%s", cam_id, list(msg.keys()))
+            ok = await asyncio.to_thread(apply_roi_payload, msg)
+            if ok:
+                logger.info("roi_updated applied camera=%s", cam_id)
+            else:
+                logger.warning(
+                    "roi_updated not applied camera=%s (unknown camera or empty line data)",
+                    cam_id,
+                )
         except Exception as e:
             logger.warning("roi_updated failed camera=%s: %s", cam_id, e)
 

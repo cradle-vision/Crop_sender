@@ -104,18 +104,20 @@ class RoiCommandServer:
                     self._reply(conn, {"ok": False, "error": "invalid json"})
                     return
                 action = str(body.get("action", "")).strip()
-                cam_id = str(body.get("smartcamera_id", "")).strip()
+                cam_id = str(
+                    body.get("smartcamera_id") or body.get("camera_id") or ""
+                ).strip()
                 if not cam_id:
                     self._reply(conn, {"ok": False, "error": "smartcamera_id required"})
                     return
                 agent = self._main_agent
                 if action == "snapshot_refresh":
                     ok = agent.request_snapshot_refresh(cam_id)
-                    self._reply(conn, {"ok": True, "queued": ok})
+                    self._reply(conn, {"ok": ok, "queued": ok})
                     return
                 if action == "roi_apply":
                     ok = agent.apply_roi_from_payload(body)
-                    self._reply(conn, {"ok": True, "applied": ok})
+                    self._reply(conn, {"ok": ok, "applied": ok})
                     return
                 self._reply(conn, {"ok": False, "error": f"unknown action: {action}"})
         except Exception as e:

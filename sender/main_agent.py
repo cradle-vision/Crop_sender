@@ -560,16 +560,37 @@ class MainAgent:
         """Apply ROI/line from backend payload (WS or HTTP poll). Does not refresh snapshot."""
         if not isinstance(body, dict):
             return False
-        cam_id = str(body.get("smartcamera_id", "")).strip()
+        cam_id = str(
+            body.get("smartcamera_id") or body.get("camera_id") or ""
+        ).strip()
         if not cam_id:
             return False
+        camera_line = body.get("camera_line") or body.get("line")
+        camera_roi = body.get("camera_roi")
+        if not isinstance(camera_line, dict) and not isinstance(camera_roi, dict):
+            line_keys = (
+                "line_x1", "line_y1", "line_x2", "line_y2",
+                "inside_x", "inside_y", "line_active", "updated_at",
+            )
+            flat = {k: body[k] for k in line_keys if k in body}
+            if flat:
+                camera_line = flat
+        updated_at = body.get("updated_at")
+        if updated_at:
+            if isinstance(camera_line, dict):
+                camera_line = dict(camera_line)
+                camera_line.setdefault("updated_at", updated_at)
+            elif isinstance(camera_roi, dict):
+                camera_roi = dict(camera_roi)
+                camera_roi.setdefault("updated_at", updated_at)
         applied = self.camera_manager.apply_roi_sync(
             cam_id,
-            camera_line=body.get("camera_line"),
-            camera_roi=body.get("camera_roi"),
+            camera_line=camera_line if isinstance(camera_line, dict) else None,
+            camera_roi=camera_roi if isinstance(camera_roi, dict) else None,
+            persist=True,
         )
         if applied:
-            print(f"[Main Agent] ROI applied for camera {cam_id}")
+            print(f"[Main Agent] ROI applied for camera {cam_id} (saved to {self.camera_manager.config_file})")
         return applied
 
     def request_snapshot_refresh(self, camera_id: str) -> bool:

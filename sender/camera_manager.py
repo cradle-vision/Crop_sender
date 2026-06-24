@@ -480,6 +480,7 @@ class CameraManager:
         *,
         camera_line: Optional[dict] = None,
         camera_roi: Optional[dict] = None,
+        persist: bool = False,
     ) -> bool:
         """Apply ROI/line changes from backend roi-sync poll (overwrites current values)."""
         camera = self.cameras.get(camera_id)
@@ -509,7 +510,7 @@ class CameraManager:
 
         for key, value in updates.items():
             setattr(camera, key, value)
-        if self.auto_save:
+        if persist or self.auto_save:
             self.save_cameras()
         print(f"[Camera Manager] ROI/line sync for camera {camera_id}: {list(updates.keys())}")
         return True

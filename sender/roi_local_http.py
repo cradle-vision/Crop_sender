@@ -30,17 +30,19 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             self.send_error(400)
             return
-        cam_id = str(body.get("smartcamera_id", "")).strip()
+        cam_id = str(
+            body.get("smartcamera_id") or body.get("camera_id") or ""
+        ).strip()
         if not cam_id:
             self.send_error(400)
             return
 
         if path == "/snapshot/refresh":
             ok = agent.request_snapshot_refresh(cam_id)
-            payload = {"ok": True, "queued": ok}
+            payload = {"ok": ok, "queued": ok}
         elif path == "/roi/apply":
             ok = agent.apply_roi_from_payload(body)
-            payload = {"ok": True, "applied": ok}
+            payload = {"ok": ok, "applied": ok}
         else:
             self.send_error(404)
             return
