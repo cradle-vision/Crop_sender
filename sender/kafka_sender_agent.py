@@ -17,9 +17,11 @@ except ImportError:
 
 try:
     from minio import Minio
+    import urllib3
     HAS_MINIO = True
 except ImportError:
     HAS_MINIO = False
+    urllib3 = None  # type: ignore[assignment,misc]
 
 
 class KafkaSenderAgent:
@@ -50,6 +52,8 @@ class KafkaSenderAgent:
         self._offline_log_sec = float(rc.get("offline_log_sec", 60))
         self._broker_check_sec = float(rc.get("broker_check_sec", 10))
         self._delivery_timeout_sec = float(rc.get("delivery_timeout_sec", 10))
+        self._minio_connect_timeout_sec = float(rc.get("minio_connect_timeout_sec", 10))
+        self._minio_read_timeout_sec = float(rc.get("minio_read_timeout_sec", 60))
         self._buffer_enabled = bool(rc.get("buffer_enabled", True))
         self._buffer_max_items = int(rc.get("buffer_max_items", 340000))
         self._buffer_dir = str(rc.get("buffer_dir", "/app/config/kafka_buffer"))
@@ -57,7 +61,7 @@ class KafkaSenderAgent:
         self._buffer_max_bytes = rc.get("buffer_max_bytes")
         if self._buffer_max_bytes is not None:
             self._buffer_max_bytes = int(self._buffer_max_bytes)
-        self._local_spill_enabled = bool(rc.get("local_spill_enabled", False))
+        self._local_spill_enabled = bool(rc.get("local_spill_enabled", True))
         self._local_spill_dir = str(rc.get("local_spill_dir", "/app/config/kafka_spill"))
 
         if self.bootstrap_servers:
@@ -127,6 +131,18 @@ class KafkaSenderAgent:
             )
         return True
 
+    def _minio_http_client(self) -> Any:
+        if urllib3 is None:
+            raise RuntimeError("urllib3 required for MinIO timeouts")
+        return urllib3.PoolManager(
+            timeout=urllib3.Timeout(
+                connect=self._minio_connect_timeout_sec,
+                read=self._minio_read_timeout_sec,
+            ),
+            maxsize=10,
+            cert_reqs="CERT_REQUIRED" if self._minio_config.get("secure") else "CERT_NONE",
+        )
+
     def _connect_minio(self) -> bool:
         if not self._use_minio:
             return False
@@ -143,6 +159,7 @@ class KafkaSenderAgent:
                 access_key=self._minio_config.get("access_key", "minioadmin"),
                 secret_key=self._minio_config.get("secret_key", "minioadmin"),
                 secure=secure,
+                http_client=self._minio_http_client(),
             )
             if not self._minio_client.bucket_exists(self._minio_bucket):
                 self._minio_client.make_bucket(self._minio_bucket)
@@ -218,6 +235,8 @@ class KafkaSenderAgent:
                     except Exception as e:
                         self._mark_kafka_unhealthy(str(e))
                 else:
+                    if self._use_minio and not self._minio_connected:
+                        self._connect_minio()
                     now = time.time()
                     if now - self._last_offline_log >= self._offline_log_sec:
                         pending = self._buffer_count()
@@ -566,8 +585,12 @@ class KafkaSenderAgent:
             payload["building_name"] = building_name
 
         uploaded = False
-        if self._minio_client or self._use_minio:
-            if not self._minio_client and self._use_minio:
+        # When spill is on and MinIO is down, skip per-crop reconnect (was 300s blocking detection).
+        should_try_minio = self._use_minio and (
+            self._minio_connected or not self._local_spill_enabled
+        )
+        if should_try_minio:
+            if not self._minio_client:
                 self._connect_minio()
             if self._minio_client:
                 try:
