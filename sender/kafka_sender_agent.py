@@ -7,6 +7,8 @@ import io
 import numpy as np
 from typing import Optional, Dict, Any, Tuple, List, Callable
 
+import yaml
+
 from jpeg_utils import encode_jpeg_bgr
 
 try:
@@ -63,6 +65,7 @@ class KafkaSenderAgent:
             self._buffer_max_bytes = int(self._buffer_max_bytes)
         self._local_spill_enabled = bool(rc.get("local_spill_enabled", True))
         self._local_spill_dir = str(rc.get("local_spill_dir", "/app/config/kafka_spill"))
+        self._drain_backlog_before_live = bool(rc.get("drain_backlog_before_live", True))
 
         if self.bootstrap_servers:
             self.bootstrap_servers = (
@@ -81,6 +84,9 @@ class KafkaSenderAgent:
         self._reconnect_stop = threading.Event()
         self._last_offline_log = 0.0
         self._kafka_unhealthy_reason = ""
+        self._was_draining_backlog = False
+        self._camera_prefix_cache: Dict[str, str] = {}
+        self._camera_prefix_cache_mtime: float = 0.0
 
     def _producer_config(self) -> dict:
         return {
@@ -109,8 +115,13 @@ class KafkaSenderAgent:
             self._ensure_buffer_dir()
             self._init_buffer_seq()
             pending = self._buffer_count()
-            if pending:
-                print(f"[Kafka Sender Agent] Found {pending} buffered crop(s) from previous run")
+            spill = self._spill_jpg_count()
+            if pending or spill:
+                print(
+                    f"[Kafka Sender Agent] Found backlog from previous run "
+                    f"({pending} buffered, {spill} spill file(s))"
+                )
+                self._was_draining_backlog = True
 
         minio_ok = self._connect_minio()
         if not minio_ok and not self._local_spill_enabled:
@@ -186,13 +197,45 @@ class KafkaSenderAgent:
             print(f"[Kafka Sender Agent] Kafka connect/check failed: {e}")
             return False
 
+    def _spill_jpg_count(self) -> int:
+        if not self._local_spill_enabled or not os.path.isdir(self._local_spill_dir):
+            return 0
+        total = 0
+        for root, _dirs, files in os.walk(self._local_spill_dir):
+            total += sum(
+                1 for name in files if name.endswith(".jpg") and not name.endswith(".tmp")
+            )
+        return total
+
+    def _has_backlog(self) -> bool:
+        return self._buffer_count() > 0 or self._spill_jpg_count() > 0
+
+    def _should_store_locally(self) -> bool:
+        """Keep new crops on disk while replay queue is non-empty (FIFO drain before live)."""
+        return self._drain_backlog_before_live and self._has_backlog()
+
+    def _check_backlog_drained(self) -> None:
+        draining = self._should_store_locally()
+        if self._was_draining_backlog and not draining:
+            print("[Kafka Sender Agent] Backlog drained — live publishing resumed")
+        self._was_draining_backlog = draining
+
     def _mark_kafka_healthy(self) -> None:
         with self._kafka_lock:
             was_unhealthy = not self._kafka_healthy
             self._kafka_healthy = True
             self._kafka_unhealthy_reason = ""
         if was_unhealthy:
-            print("[Kafka Sender Agent] Kafka recovered — publishing resumed")
+            if self._should_store_locally():
+                pending = self._buffer_count()
+                spill = self._spill_jpg_count()
+                print(
+                    "[Kafka Sender Agent] Kafka recovered — draining backlog before live "
+                    f"({pending} buffered, {spill} spill file(s))"
+                )
+                self._was_draining_backlog = True
+            else:
+                print("[Kafka Sender Agent] Kafka recovered — publishing resumed")
 
     def _mark_kafka_unhealthy(self, reason: str) -> None:
         with self._kafka_lock:
@@ -226,6 +269,11 @@ class KafkaSenderAgent:
     def _reconnect_loop(self) -> None:
         while not self._reconnect_stop.is_set():
             try:
+                if self._use_minio and not self._minio_connected:
+                    self._connect_minio()
+                if self._use_minio and self._minio_connected:
+                    self._replay_orphan_spill_batch()
+
                 if self._kafka_healthy:
                     try:
                         with self._kafka_lock:
@@ -235,8 +283,6 @@ class KafkaSenderAgent:
                     except Exception as e:
                         self._mark_kafka_unhealthy(str(e))
                 else:
-                    if self._use_minio and not self._minio_connected:
-                        self._connect_minio()
                     now = time.time()
                     if now - self._last_offline_log >= self._offline_log_sec:
                         pending = self._buffer_count()
@@ -413,6 +459,58 @@ class KafkaSenderAgent:
         if self._sent_count % 50 == 0:
             print(f"[Kafka Sender Agent] Published {self._sent_count} messages")
 
+    @staticmethod
+    def _slug(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = str(value or "").strip()
+        value = "".join(c for c in value if c.isprintable() or c.isspace()).strip()
+        if not value:
+            return None
+        value = value.lower().replace(" ", "-")
+        value = "".join(c for c in value if c.isalnum() or c in "-_")
+        return value or None
+
+    def _camera_crop_prefixes(self) -> Dict[str, str]:
+        path = os.getenv("CAMERAS_CONFIG_PATH", "/app/config/cameras.yaml")
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return self._camera_prefix_cache
+
+        if mtime == self._camera_prefix_cache_mtime and self._camera_prefix_cache:
+            return self._camera_prefix_cache
+
+        prefixes: Dict[str, str] = {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                doc = yaml.safe_load(f) or {}
+            cameras = doc.get("cameras") if isinstance(doc, dict) else doc
+            if not isinstance(cameras, list):
+                cameras = []
+            for cam in cameras:
+                if not isinstance(cam, dict):
+                    continue
+                camera_id = str(cam.get("camera_id") or "").strip()
+                if not camera_id:
+                    continue
+                path_parts = ["crops"]
+                cam_slug = self._slug(cam.get("name"))
+                if cam_slug:
+                    path_parts.append(cam_slug)
+                building_id = cam.get("building_id")
+                if building_id:
+                    path_parts.append(str(building_id))
+                path_parts.append(camera_id)
+                prefixes[camera_id] = "/".join(path_parts)
+        except Exception as e:
+            print(f"[Kafka Sender Agent] Camera prefix load failed: {e}")
+            return self._camera_prefix_cache
+
+        self._camera_prefix_cache = prefixes
+        self._camera_prefix_cache_mtime = mtime
+        return prefixes
+
     def _upload_spill_to_minio(self, payload: dict) -> None:
         local_path = payload.get("local_path")
         if not local_path or not os.path.isfile(local_path):
@@ -439,8 +537,100 @@ class KafkaSenderAgent:
             os.remove(local_path)
         except OSError:
             pass
+        meta_path = local_path + ".meta.json"
+        try:
+            os.remove(meta_path)
+        except OSError:
+            pass
         payload.pop("local_spill", None)
         payload.pop("local_path", None)
+
+    def _ensure_payload_in_minio(self, payload: dict) -> None:
+        """Upload spill files before Kafka; direct uploads are already in MinIO."""
+        if not self._use_minio:
+            return
+        if payload.get("local_spill"):
+            self._upload_spill_to_minio(payload)
+
+    def _replay_orphan_spill_batch(self) -> None:
+        """Upload spilled JPEGs that were never sent to MinIO (e.g. after a prior bug)."""
+        if not self._local_spill_enabled or not self._minio_client:
+            return
+        if not os.path.isdir(self._local_spill_dir):
+            return
+
+        prefixes = self._camera_crop_prefixes()
+        if not prefixes:
+            return
+
+        uploaded = 0
+        for camera_id in sorted(os.listdir(self._local_spill_dir)):
+            spill_dir = os.path.join(self._local_spill_dir, camera_id)
+            if not os.path.isdir(spill_dir):
+                continue
+            prefix = prefixes.get(camera_id)
+            if not prefix:
+                continue
+            names = sorted(
+                n for n in os.listdir(spill_dir)
+                if n.endswith(".jpg") and not n.endswith(".tmp")
+            )
+            for name in names[: self._buffer_replay_batch]:
+                local_path = os.path.join(spill_dir, name)
+                meta_path = local_path + ".meta.json"
+                object_key = None
+                bucket = self._minio_bucket
+                if os.path.isfile(meta_path):
+                    try:
+                        with open(meta_path, encoding="utf-8") as f:
+                            meta = json.load(f)
+                        object_key = meta.get("object_key")
+                        bucket = meta.get("bucket", bucket)
+                    except Exception:
+                        object_key = None
+                if not object_key and prefix:
+                    object_key = f"{prefix}/{name}"
+                if not object_key:
+                    continue
+                try:
+                    with open(local_path, "rb") as f:
+                        data = f.read()
+                    self._minio_client.put_object(
+                        bucket,
+                        object_key,
+                        data=io.BytesIO(data),
+                        length=len(data),
+                        content_type="image/jpeg",
+                    )
+                    os.remove(local_path)
+                    if os.path.isfile(meta_path):
+                        os.remove(meta_path)
+                    uploaded += 1
+                except Exception as e:
+                    print(
+                        f"[Kafka Sender Agent] Orphan spill upload stopped at "
+                        f"{object_key}: {e}"
+                    )
+                    self._minio_client = None
+                    self._minio_connected = False
+                    break
+            if not self._minio_connected:
+                break
+
+        if uploaded:
+            remaining = sum(
+                len([
+                    n for n in os.listdir(os.path.join(self._local_spill_dir, cid))
+                    if n.endswith(".jpg") and not n.endswith(".tmp")
+                ])
+                for cid in os.listdir(self._local_spill_dir)
+                if os.path.isdir(os.path.join(self._local_spill_dir, cid))
+            )
+            print(
+                f"[Kafka Sender Agent] Uploaded {uploaded} orphan spill crop(s) to MinIO "
+                f"({remaining} remaining locally)"
+            )
+        self._check_backlog_drained()
 
     def _replay_buffer(self) -> None:
         if not self._kafka_healthy:
@@ -474,6 +664,7 @@ class KafkaSenderAgent:
                 f"[Kafka Sender Agent] Replayed {replayed} buffered crop(s) "
                 f"({remaining} remaining)"
             )
+        self._check_backlog_drained()
 
     def send_snapshot(
         self,
@@ -494,14 +685,6 @@ class KafkaSenderAgent:
             value = "".join(c for c in value if c.isprintable() or c.isspace()).strip()
             return value or None
 
-        def _slug(value: Optional[str]) -> Optional[str]:
-            value = _sanitize(value)
-            if value is None:
-                return None
-            value = value.lower().replace(" ", "-")
-            value = "".join(c for c in value if c.isalnum() or c in "-_")
-            return value or None
-
         camera_id = _sanitize(camera_id) or "unknown"
         company_id = _sanitize(company_id)
         building_id = _sanitize(building_id)
@@ -519,7 +702,8 @@ class KafkaSenderAgent:
                 company_name=company_name,
                 building_name=building_name,
                 camera_name=camera_name,
-                _slug=_slug,
+                _slug=self._slug,
+                force_disk=self._should_store_locally(),
             )
         except Exception as e:
             print(f"[Kafka Sender Agent] Crop upload failed: {e}")
@@ -527,6 +711,21 @@ class KafkaSenderAgent:
 
         if payload is None:
             return False
+
+        if self._should_store_locally():
+            if self._enqueue_buffer(payload, camera_key):
+                self._was_draining_backlog = True
+                return True
+            return False
+
+        if self._use_minio:
+            try:
+                self._ensure_payload_in_minio(payload)
+            except Exception as e:
+                print(f"[Kafka Sender Agent] MinIO not ready for crop: {e}")
+                if self._enqueue_buffer(payload, camera_key):
+                    return True
+                return False
 
         if self._kafka_healthy:
             try:
@@ -551,6 +750,7 @@ class KafkaSenderAgent:
         building_name: Optional[str],
         camera_name: Optional[str],
         _slug: Callable[[Optional[str]], Optional[str]],
+        force_disk: bool = False,
     ) -> Tuple[Optional[dict], str]:
         data = encode_jpeg_bgr(frame, quality=self.jpeg_quality)
         if data is None:
@@ -566,7 +766,8 @@ class KafkaSenderAgent:
             path_parts.append(str(building_id))
         path_parts.append(camera_id)
         prefix = "/".join(path_parts)
-        object_name = f"{prefix}/{ts_ms}_{uuid.uuid4().hex[:8]}.jpg"
+        file_id = uuid.uuid4().hex[:8]
+        object_name = f"{prefix}/{ts_ms}_{file_id}.jpg"
 
         payload: Dict[str, Any] = {
             "camera_id": camera_id,
@@ -585,11 +786,7 @@ class KafkaSenderAgent:
             payload["building_name"] = building_name
 
         uploaded = False
-        # When spill is on and MinIO is down, skip per-crop reconnect (was 300s blocking detection).
-        should_try_minio = self._use_minio and (
-            self._minio_connected or not self._local_spill_enabled
-        )
-        if should_try_minio:
+        if self._use_minio and not force_disk:
             if not self._minio_client:
                 self._connect_minio()
             if self._minio_client:
@@ -602,6 +799,7 @@ class KafkaSenderAgent:
                         content_type="image/jpeg",
                     )
                     uploaded = True
+                    self._minio_connected = True
                 except Exception as e:
                     print(f"[Kafka Sender Agent] MinIO upload failed: {e}")
                     self._minio_client = None
@@ -612,11 +810,18 @@ class KafkaSenderAgent:
                 return None, camera_id
             spill_dir = os.path.join(self._local_spill_dir, camera_id)
             os.makedirs(spill_dir, exist_ok=True)
-            local_path = os.path.join(spill_dir, f"{ts_ms}_{uuid.uuid4().hex[:8]}.jpg")
+            local_path = os.path.join(spill_dir, f"{ts_ms}_{file_id}.jpg")
             tmp_path = local_path + ".tmp"
             with open(tmp_path, "wb") as f:
                 f.write(data)
             os.replace(tmp_path, local_path)
+            meta_path = local_path + ".meta.json"
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"object_key": object_name, "bucket": self._minio_bucket},
+                    f,
+                    ensure_ascii=False,
+                )
             payload["local_spill"] = True
             payload["local_path"] = local_path
 

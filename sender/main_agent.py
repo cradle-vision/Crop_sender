@@ -203,6 +203,7 @@ class MainAgent:
             'buffer_max_bytes': buffer_max_bytes,
             'local_spill_enabled': _env_bool('KAFKA_LOCAL_SPILL_ENABLED', True),
             'local_spill_dir': _env('KAFKA_LOCAL_SPILL_DIR') or '/app/config/kafka_spill',
+            'drain_backlog_before_live': _env_bool('KAFKA_DRAIN_BACKLOG_BEFORE_LIVE', True),
         }
         print(
             f"[Main Agent] Kafka buffer: enabled={resilience_config['buffer_enabled']}, "
