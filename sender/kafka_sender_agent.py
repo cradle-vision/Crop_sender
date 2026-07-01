@@ -59,7 +59,9 @@ class KafkaSenderAgent:
         self._buffer_enabled = bool(rc.get("buffer_enabled", True))
         self._buffer_max_items = int(rc.get("buffer_max_items", 340000))
         self._buffer_dir = str(rc.get("buffer_dir", "/app/config/kafka_buffer"))
-        self._buffer_replay_batch = int(rc.get("buffer_replay_batch", 20))
+        self._buffer_replay_batch = int(rc.get("buffer_replay_batch", 100))
+        self._buffer_replay_max_rounds = int(rc.get("buffer_replay_max_rounds", 30))
+        self._drain_poll_sec = float(rc.get("drain_poll_sec", 2))
         self._buffer_max_bytes = rc.get("buffer_max_bytes")
         if self._buffer_max_bytes is not None:
             self._buffer_max_bytes = int(self._buffer_max_bytes)
@@ -266,6 +268,20 @@ class KafkaSenderAgent:
         if self._reconnect_thread and self._reconnect_thread.is_alive():
             self._reconnect_thread.join(timeout=5)
 
+    def _drain_buffer_when_healthy(self) -> None:
+        """Replay multiple batches per wake cycle while Kafka is up."""
+        with self._kafka_lock:
+            if self._producer:
+                self._producer.list_topics(timeout=self._broker_check_sec)
+
+        rounds = 0
+        while self._kafka_healthy and self._has_backlog() and rounds < self._buffer_replay_max_rounds:
+            before = self._buffer_count()
+            self._replay_buffer()
+            rounds += 1
+            if self._buffer_count() >= before:
+                break
+
     def _reconnect_loop(self) -> None:
         while not self._reconnect_stop.is_set():
             try:
@@ -276,10 +292,7 @@ class KafkaSenderAgent:
 
                 if self._kafka_healthy:
                     try:
-                        with self._kafka_lock:
-                            if self._producer:
-                                self._producer.list_topics(timeout=self._broker_check_sec)
-                        self._replay_buffer()
+                        self._drain_buffer_when_healthy()
                     except Exception as e:
                         self._mark_kafka_unhealthy(str(e))
                 else:
@@ -294,11 +307,15 @@ class KafkaSenderAgent:
                         self._last_offline_log = now
                     if self._connect_kafka():
                         self._mark_kafka_healthy()
-                        self._replay_buffer()
+                        try:
+                            self._drain_buffer_when_healthy()
+                        except Exception as e:
+                            self._mark_kafka_unhealthy(str(e))
             except Exception as e:
                 print(f"[Kafka Sender Agent] Reconnect loop error: {e}")
 
-            self._reconnect_stop.wait(self._reconnect_sec)
+            sleep_sec = self._drain_poll_sec if self._has_backlog() else self._reconnect_sec
+            self._reconnect_stop.wait(sleep_sec)
 
     def disconnect(self) -> None:
         self.stop_auto_reconnect()
@@ -511,39 +528,51 @@ class KafkaSenderAgent:
         self._camera_prefix_cache_mtime = mtime
         return prefixes
 
+    def _clear_spill_payload_refs(self, payload: dict, local_path: Optional[str] = None) -> None:
+        payload.pop("local_spill", None)
+        payload.pop("local_path", None)
+        if local_path:
+            meta_path = local_path + ".meta.json"
+            try:
+                if os.path.isfile(meta_path):
+                    os.remove(meta_path)
+            except OSError:
+                pass
+
     def _upload_spill_to_minio(self, payload: dict) -> None:
         local_path = payload.get("local_path")
-        if not local_path or not os.path.isfile(local_path):
-            raise FileNotFoundError(f"Local spill file missing: {local_path}")
-        if not self._minio_client:
-            if not self._connect_minio():
-                raise RuntimeError("MinIO unavailable for spill upload")
-
         object_key = payload.get("object_key")
         bucket = payload.get("bucket", self._minio_bucket)
         if not object_key:
             raise ValueError("payload missing object_key for spill upload")
+        if not self._minio_client:
+            if not self._connect_minio():
+                raise RuntimeError("MinIO unavailable for spill upload")
 
-        with open(local_path, "rb") as f:
-            data = f.read()
-        self._minio_client.put_object(
-            bucket,
-            object_key,
-            data=io.BytesIO(data),
-            length=len(data),
-            content_type="image/jpeg",
-        )
-        try:
-            os.remove(local_path)
-        except OSError:
-            pass
-        meta_path = local_path + ".meta.json"
-        try:
-            os.remove(meta_path)
-        except OSError:
-            pass
-        payload.pop("local_spill", None)
-        payload.pop("local_path", None)
+        if local_path and os.path.isfile(local_path):
+            with open(local_path, "rb") as f:
+                data = f.read()
+            self._minio_client.put_object(
+                bucket,
+                object_key,
+                data=io.BytesIO(data),
+                length=len(data),
+                content_type="image/jpeg",
+            )
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
+            self._clear_spill_payload_refs(payload, local_path)
+            return
+
+        # Local file gone — orphan spill batch likely uploaded it already.
+        if local_path:
+            print(
+                f"[Kafka Sender Agent] Spill file already absent ({local_path}); "
+                f"assuming MinIO has {bucket}/{object_key}"
+            )
+        self._clear_spill_payload_refs(payload, local_path)
 
     def _ensure_payload_in_minio(self, payload: dict) -> None:
         """Upload spill files before Kafka; direct uploads are already in MinIO."""
@@ -552,13 +581,28 @@ class KafkaSenderAgent:
         if payload.get("local_spill"):
             self._upload_spill_to_minio(payload)
 
+    def _buffered_spill_paths(self) -> set:
+        paths: set = set()
+        for path in self._list_buffer_files():
+            try:
+                with open(path, encoding="utf-8") as f:
+                    record = json.load(f)
+                payload = record.get("payload") or {}
+                local_path = payload.get("local_path")
+                if payload.get("local_spill") and local_path:
+                    paths.add(os.path.normpath(str(local_path)))
+            except Exception:
+                continue
+        return paths
+
     def _replay_orphan_spill_batch(self) -> None:
-        """Upload spilled JPEGs that were never sent to MinIO (e.g. after a prior bug)."""
+        """Upload spilled JPEGs not referenced by pending kafka_buffer entries."""
         if not self._local_spill_enabled or not self._minio_client:
             return
         if not os.path.isdir(self._local_spill_dir):
             return
 
+        buffered_spill_paths = self._buffered_spill_paths()
         prefixes = self._camera_crop_prefixes()
         if not prefixes:
             return
@@ -577,6 +621,8 @@ class KafkaSenderAgent:
             )
             for name in names[: self._buffer_replay_batch]:
                 local_path = os.path.join(spill_dir, name)
+                if os.path.normpath(local_path) in buffered_spill_paths:
+                    continue
                 meta_path = local_path + ".meta.json"
                 object_key = None
                 bucket = self._minio_bucket
@@ -655,7 +701,9 @@ class KafkaSenderAgent:
                 replayed += 1
             except Exception as e:
                 print(f"[Kafka Sender Agent] Replay stopped at {os.path.basename(path)}: {e}")
-                self._mark_kafka_unhealthy(str(e))
+                # Missing spill JPEG is not a Kafka outage (often orphan upload raced ahead).
+                if not isinstance(e, FileNotFoundError):
+                    self._mark_kafka_unhealthy(str(e))
                 break
 
         if replayed:

@@ -190,7 +190,7 @@ class MainAgent:
                 buffer_max_bytes = None
 
         resilience_config = {
-            'reconnect_sec': max(5.0, _env_float('KAFKA_RECONNECT_SEC', 15.0)),
+            'reconnect_sec': max(2.0, _env_float('KAFKA_RECONNECT_SEC', 3.0)),
             'offline_log_sec': max(15.0, _env_float('KAFKA_OFFLINE_LOG_SEC', 60.0)),
             'broker_check_sec': max(3.0, _env_float('KAFKA_BROKER_CHECK_SEC', 10.0)),
             'delivery_timeout_sec': max(3.0, _env_float('KAFKA_DELIVERY_TIMEOUT_SEC', 10.0)),
@@ -199,7 +199,9 @@ class MainAgent:
             'buffer_enabled': _env_bool('KAFKA_BUFFER_ENABLED', True),
             'buffer_max_items': _env_int('KAFKA_BUFFER_MAX_ITEMS', 340000, 1, 10000000),
             'buffer_dir': _env('KAFKA_BUFFER_DIR') or '/app/config/kafka_buffer',
-            'buffer_replay_batch': _env_int('KAFKA_BUFFER_REPLAY_BATCH', 20, 1, 1000),
+            'buffer_replay_batch': _env_int('KAFKA_BUFFER_REPLAY_BATCH', 100, 1, 1000),
+            'buffer_replay_max_rounds': _env_int('KAFKA_BUFFER_REPLAY_MAX_ROUNDS', 30, 1, 500),
+            'drain_poll_sec': max(1.0, _env_float('KAFKA_DRAIN_POLL_SEC', 2.0)),
             'buffer_max_bytes': buffer_max_bytes,
             'local_spill_enabled': _env_bool('KAFKA_LOCAL_SPILL_ENABLED', True),
             'local_spill_dir': _env('KAFKA_LOCAL_SPILL_DIR') or '/app/config/kafka_spill',
@@ -208,6 +210,7 @@ class MainAgent:
         print(
             f"[Main Agent] Kafka buffer: enabled={resilience_config['buffer_enabled']}, "
             f"max_items={resilience_config['buffer_max_items']}, "
+            f"replay_batch={resilience_config['buffer_replay_batch']}, "
             f"dir={resilience_config['buffer_dir']}, "
             f"local_spill={resilience_config['local_spill_enabled']}"
         )
