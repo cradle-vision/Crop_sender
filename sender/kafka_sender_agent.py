@@ -380,6 +380,53 @@ class KafkaSenderAgent:
         self._buffer_seq += 1
         return self._buffer_seq
 
+    def _discard_corrupt_buffer_file(self, path: str, reason: str) -> None:
+        name = os.path.basename(path)
+        try:
+            os.remove(path)
+            print(f"[Kafka Sender Agent] Dropped corrupt buffer file {name}: {reason}")
+        except OSError as e:
+            print(f"[Kafka Sender Agent] Failed to drop corrupt buffer file {name}: {e}")
+
+    def _read_buffer_record(self, path: str) -> Optional[Tuple[dict, str]]:
+        """Load one buffer JSON; discard and return None when file is corrupt."""
+        try:
+            if os.path.getsize(path) <= 0:
+                self._discard_corrupt_buffer_file(path, "empty file")
+                return None
+            with open(path, encoding="utf-8") as f:
+                record = json.load(f)
+        except json.JSONDecodeError as e:
+            self._discard_corrupt_buffer_file(path, f"invalid JSON ({e})")
+            return None
+        except OSError as e:
+            print(f"[Kafka Sender Agent] Cannot read buffer file {os.path.basename(path)}: {e}")
+            return None
+
+        if not isinstance(record, dict):
+            self._discard_corrupt_buffer_file(path, "root is not an object")
+            return None
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            self._discard_corrupt_buffer_file(path, "missing payload object")
+            return None
+        camera_key = record.get("camera_key") or payload.get("camera_id", "unknown")
+        return payload, str(camera_key)
+
+    def _is_kafka_transport_error(self, exc: BaseException) -> bool:
+        if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+            return True
+        msg = str(exc).lower()
+        needles = (
+            "kafka",
+            "broker",
+            "transport",
+            "timed out",
+            "connection",
+            "disconnect",
+        )
+        return any(n in msg for n in needles)
+
     def _drop_oldest_buffered(self) -> None:
         files = self._list_buffer_files()
         if not files:
@@ -686,30 +733,39 @@ class KafkaSenderAgent:
             return
 
         replayed = 0
+        discarded = 0
         for path in files[: self._buffer_replay_batch]:
+            loaded = self._read_buffer_record(path)
+            if loaded is None:
+                discarded += 1
+                continue
+            payload, camera_key = loaded
             try:
-                with open(path, encoding="utf-8") as f:
-                    record = json.load(f)
-                payload = record["payload"]
-                camera_key = record.get("camera_key") or payload.get("camera_id", "unknown")
-
                 if payload.get("local_spill"):
                     self._upload_spill_to_minio(payload)
 
                 self._send_kafka_payload(payload, camera_key)
                 os.remove(path)
                 replayed += 1
+            except FileNotFoundError as e:
+                # Spill JPEG missing — drop metadata so queue can advance.
+                self._discard_corrupt_buffer_file(path, f"missing spill JPEG ({e})")
+                discarded += 1
             except Exception as e:
                 print(f"[Kafka Sender Agent] Replay stopped at {os.path.basename(path)}: {e}")
-                # Missing spill JPEG is not a Kafka outage (often orphan upload raced ahead).
-                if not isinstance(e, FileNotFoundError):
+                if self._is_kafka_transport_error(e):
                     self._mark_kafka_unhealthy(str(e))
                 break
 
-        if replayed:
+        if replayed or discarded:
             remaining = self._buffer_count()
+            parts = []
+            if replayed:
+                parts.append(f"replayed {replayed}")
+            if discarded:
+                parts.append(f"discarded {discarded} corrupt")
             print(
-                f"[Kafka Sender Agent] Replayed {replayed} buffered crop(s) "
+                f"[Kafka Sender Agent] Buffer drain: {', '.join(parts)} "
                 f"({remaining} remaining)"
             )
         self._check_backlog_drained()

@@ -32,3 +32,5 @@ README.md
 Dockerfile
 docker-compose.yml
 .dockerignore
+config/kafka_buffer/
+config/kafka_spill/
