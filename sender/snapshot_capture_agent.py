@@ -1,7 +1,7 @@
 """
 Snapshot Capture Agent
 Captures frames from camera via FFmpeg; samples with the fps filter (not -r on raw output).
-Capture thread reads as fast as FFmpeg emits; a worker thread runs the callback so the pipe
+Capture thread reads as fast as FFmpeg emits; worker thread(s) run the callback so the pipe
 does not stall.
 
 Processing queue: bounded backlog between capture and detection. Larger maxsize tolerates
@@ -24,7 +24,9 @@ _PROCESS_SENTINEL = object()
 
 _DEFAULT_CAPTURE_FPS = 5.0
 _MAX_PROCESSING_QUEUE = 500
-_DEFAULT_PROCESSING_QUEUE_MAX = 100
+_DEFAULT_PROCESSING_QUEUE_MAX = 200
+_MAX_PROCESSING_WORKERS = 16
+_DEFAULT_PROCESSING_WORKERS = 3
 _DEFAULT_RTSP_TIMEOUT_US = 5_000_000  # 5s socket I/O timeout (FFmpeg -timeout, microseconds)
 _DEFAULT_RECONNECT_SEC = 3.0
 _DEFAULT_FFPROBE_TIMEOUT_SEC = 8.0
@@ -129,6 +131,7 @@ class SnapshotCaptureAgent:
         camera_id: str = "camera_0",
         camera_type: str = "rtsp",
         processing_queue_max: int = _DEFAULT_PROCESSING_QUEUE_MAX,
+        processing_workers: int = _DEFAULT_PROCESSING_WORKERS,
     ):
         self.source = source
         self.fps = max(0.0, float(fps))
@@ -140,11 +143,13 @@ class SnapshotCaptureAgent:
 
         pq = int(processing_queue_max)
         self.processing_queue_max = min(_MAX_PROCESSING_QUEUE, max(1, pq))
+        pw = int(processing_workers)
+        self.processing_workers = min(_MAX_PROCESSING_WORKERS, max(1, pw))
 
         self._input_for_ffmpeg: Optional[str] = None
         self.is_running = False
         self.capture_thread: Optional[threading.Thread] = None
-        self.processing_thread: Optional[threading.Thread] = None
+        self.processing_threads: list[threading.Thread] = []
         self.processing_queue: Queue = Queue(maxsize=self.processing_queue_max)
         self.callback: Optional[Callable] = None
         self._ffmpeg_proc: Optional[subprocess.Popen] = None
@@ -167,8 +172,9 @@ class SnapshotCaptureAgent:
         self._watchdog_sec = max(30.0, watchdog) if watchdog > 0 else 0.0
         self._watchdog_thread: Optional[threading.Thread] = None
         print(
-            f"[Capture Agent {self.camera_id}] Processing queue depth: {self.processing_queue_max} "
-            f"(higher = more backlog tolerance, more latency/RAM if detection is slow)"
+            f"[Capture Agent {self.camera_id}] Processing queue depth: {self.processing_queue_max}, "
+            f"workers: {self.processing_workers} "
+            f"(higher queue = more backlog tolerance, more latency/RAM if detection is slow)"
         )
 
     def start(self, callback: Optional[Callable] = None):
@@ -196,8 +202,14 @@ class SnapshotCaptureAgent:
             )
             self._watchdog_thread.start()
         if self.callback is not None:
-            self.processing_thread = threading.Thread(target=self._processing_loop, daemon=True)
-            self.processing_thread.start()
+            for i in range(self.processing_workers):
+                thread = threading.Thread(
+                    target=self._processing_loop,
+                    name=f"capture-proc-{self.camera_id}-{i}",
+                    daemon=True,
+                )
+                thread.start()
+                self.processing_threads.append(thread)
         if self.fps > 0:
             print(f"[Capture Agent {self.camera_id}] Capture started (FFmpeg fps filter: {self.fps})")
         else:
@@ -211,18 +223,20 @@ class SnapshotCaptureAgent:
             self._watchdog_thread = None
         if self.capture_thread:
             self.capture_thread.join(timeout=3.0)
-        if self.processing_thread is not None:
-            while True:
-                try:
-                    self.processing_queue.put_nowait(_PROCESS_SENTINEL)
-                    break
-                except Full:
+        if self.processing_threads:
+            for _ in self.processing_threads:
+                while True:
                     try:
-                        self.processing_queue.get_nowait()
-                    except Empty:
-                        pass
-            self.processing_thread.join(timeout=10.0)
-            self.processing_thread = None
+                        self.processing_queue.put_nowait(_PROCESS_SENTINEL)
+                        break
+                    except Full:
+                        try:
+                            self.processing_queue.get_nowait()
+                        except Empty:
+                            pass
+            for thread in self.processing_threads:
+                thread.join(timeout=10.0)
+            self.processing_threads = []
         print(f"[Capture Agent {self.camera_id}] Capture stopped")
 
     def _rtsp_input_opts(self) -> list[str]:

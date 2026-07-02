@@ -237,10 +237,13 @@ class MainAgent:
 
         # Decode/sample rate: FFmpeg fps= filter from DEFAULT_FPS in .env. 0 = full stream rate (high CPU).
         self.capture_fps = max(0.0, _env_float("DEFAULT_FPS", 20.0))
-        self.processing_queue_max = _env_int("PROCESSING_QUEUE_MAX", 100, 1, 500)
+        self.processing_queue_max = _env_int("PROCESSING_QUEUE_MAX", 200, 1, 500)
+        self.processing_workers = _env_int("PROCESSING_WORKERS", 3, 1, 16)
         print(
             f"[Main Agent] DEFAULT_FPS={self.capture_fps} "
-            f"(FFmpeg fps filter; 0 = unlimited), PROCESSING_QUEUE_MAX={self.processing_queue_max}"
+            f"(FFmpeg fps filter; 0 = unlimited), "
+            f"PROCESSING_QUEUE_MAX={self.processing_queue_max}, "
+            f"PROCESSING_WORKERS={self.processing_workers}"
         )
         if self._sender_debug:
             print(
@@ -288,6 +291,7 @@ class MainAgent:
                 camera_id=camera.camera_id,
                 camera_type=_capture_transport_type(camera.type, source),
                 processing_queue_max=self.processing_queue_max,
+                processing_workers=self.processing_workers,
             )
             
             self.capture_agents[camera.camera_id] = capture_agent
