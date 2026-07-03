@@ -5,7 +5,8 @@ import time
 import uuid
 import io
 import numpy as np
-from typing import Optional, Dict, Any, Tuple, List, Callable
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional, Dict, Any, Tuple, List, Callable, Set
 
 import yaml
 
@@ -68,6 +69,9 @@ class KafkaSenderAgent:
         self._local_spill_enabled = bool(rc.get("local_spill_enabled", True))
         self._local_spill_dir = str(rc.get("local_spill_dir", "/app/config/kafka_spill"))
         self._drain_backlog_before_live = bool(rc.get("drain_backlog_before_live", True))
+        self._replay_minio_workers = int(rc.get("replay_minio_workers", 8))
+        self._replay_prefetch_ahead = int(rc.get("replay_prefetch_ahead", 32))
+        self._replay_minio_retries = int(rc.get("replay_minio_retries", 3))
 
         if self.bootstrap_servers:
             self.bootstrap_servers = (
@@ -144,7 +148,7 @@ class KafkaSenderAgent:
             )
         return True
 
-    def _minio_http_client(self) -> Any:
+    def _minio_http_client(self, maxsize: int = 10) -> Any:
         if urllib3 is None:
             raise RuntimeError("urllib3 required for MinIO timeouts")
         return urllib3.PoolManager(
@@ -152,30 +156,35 @@ class KafkaSenderAgent:
                 connect=self._minio_connect_timeout_sec,
                 read=self._minio_read_timeout_sec,
             ),
-            maxsize=10,
+            maxsize=max(4, maxsize),
             cert_reqs="CERT_REQUIRED" if self._minio_config.get("secure") else "CERT_NONE",
         )
+
+    def _create_minio_client(self, pool_size: Optional[int] = None) -> Any:
+        endpoint = (
+            self._minio_config.get("endpoint", "localhost:9000")
+            .replace("http://", "")
+            .replace("https://", "")
+            .rstrip("/")
+        )
+        secure = self._minio_config.get("secure", False)
+        http_max = pool_size if pool_size is not None else max(10, self._replay_minio_workers + 2)
+        client = Minio(
+            endpoint,
+            access_key=self._minio_config.get("access_key", "minioadmin"),
+            secret_key=self._minio_config.get("secret_key", "minioadmin"),
+            secure=secure,
+            http_client=self._minio_http_client(maxsize=http_max),
+        )
+        if not client.bucket_exists(self._minio_bucket):
+            client.make_bucket(self._minio_bucket)
+        return client
 
     def _connect_minio(self) -> bool:
         if not self._use_minio:
             return False
         try:
-            endpoint = (
-                self._minio_config.get("endpoint", "localhost:9000")
-                .replace("http://", "")
-                .replace("https://", "")
-                .rstrip("/")
-            )
-            secure = self._minio_config.get("secure", False)
-            self._minio_client = Minio(
-                endpoint,
-                access_key=self._minio_config.get("access_key", "minioadmin"),
-                secret_key=self._minio_config.get("secret_key", "minioadmin"),
-                secure=secure,
-                http_client=self._minio_http_client(),
-            )
-            if not self._minio_client.bucket_exists(self._minio_bucket):
-                self._minio_client.make_bucket(self._minio_bucket)
+            self._minio_client = self._create_minio_client()
             self._minio_connected = True
             return True
         except Exception as e:
@@ -586,20 +595,17 @@ class KafkaSenderAgent:
             except OSError:
                 pass
 
-    def _upload_spill_to_minio(self, payload: dict) -> None:
+    def _upload_spill_to_minio_with_client(self, payload: dict, client: Any) -> None:
         local_path = payload.get("local_path")
         object_key = payload.get("object_key")
         bucket = payload.get("bucket", self._minio_bucket)
         if not object_key:
             raise ValueError("payload missing object_key for spill upload")
-        if not self._minio_client:
-            if not self._connect_minio():
-                raise RuntimeError("MinIO unavailable for spill upload")
 
         if local_path and os.path.isfile(local_path):
             with open(local_path, "rb") as f:
                 data = f.read()
-            self._minio_client.put_object(
+            client.put_object(
                 bucket,
                 object_key,
                 data=io.BytesIO(data),
@@ -613,6 +619,9 @@ class KafkaSenderAgent:
             self._clear_spill_payload_refs(payload, local_path)
             return
 
+        if local_path and not os.path.isfile(local_path):
+            raise FileNotFoundError(f"spill JPEG missing: {local_path}")
+
         # Local file gone — orphan spill batch likely uploaded it already.
         if local_path:
             print(
@@ -620,6 +629,29 @@ class KafkaSenderAgent:
                 f"assuming MinIO has {bucket}/{object_key}"
             )
         self._clear_spill_payload_refs(payload, local_path)
+
+    def _upload_spill_to_minio(self, payload: dict) -> None:
+        if not self._minio_client:
+            if not self._connect_minio():
+                raise RuntimeError("MinIO unavailable for spill upload")
+        self._upload_spill_to_minio_with_client(payload, self._minio_client)
+
+    def _replay_minio_upload(self, payload: dict, client: Any) -> None:
+        """Upload one spill file during replay; retries without blocking other workers."""
+        if not payload.get("local_spill"):
+            return
+        last_err: Optional[BaseException] = None
+        attempts = max(1, self._replay_minio_retries)
+        for attempt in range(attempts):
+            try:
+                self._upload_spill_to_minio_with_client(payload, client)
+                return
+            except Exception as e:
+                last_err = e
+                if attempt + 1 < attempts:
+                    time.sleep(0.5 * (attempt + 1))
+        if last_err is not None:
+            raise last_err
 
     def _ensure_payload_in_minio(self, payload: dict) -> None:
         """Upload spill files before Kafka; direct uploads are already in MinIO."""
@@ -732,9 +764,30 @@ class KafkaSenderAgent:
         if not files:
             return
 
+        batch = files[: self._buffer_replay_batch]
+        if self._replay_minio_workers > 1 and self._use_minio:
+            self._replay_buffer_parallel(batch)
+        else:
+            self._replay_buffer_sequential(batch)
+
+    def _log_replay_batch_result(self, replayed: int, discarded: int) -> None:
+        if replayed or discarded:
+            remaining = self._buffer_count()
+            parts = []
+            if replayed:
+                parts.append(f"replayed {replayed}")
+            if discarded:
+                parts.append(f"discarded {discarded} corrupt")
+            print(
+                f"[Kafka Sender Agent] Buffer drain: {', '.join(parts)} "
+                f"({remaining} remaining)"
+            )
+        self._check_backlog_drained()
+
+    def _replay_buffer_sequential(self, files: List[str]) -> None:
         replayed = 0
         discarded = 0
-        for path in files[: self._buffer_replay_batch]:
+        for path in files:
             loaded = self._read_buffer_record(path)
             if loaded is None:
                 discarded += 1
@@ -748,7 +801,6 @@ class KafkaSenderAgent:
                 os.remove(path)
                 replayed += 1
             except FileNotFoundError as e:
-                # Spill JPEG missing — drop metadata so queue can advance.
                 self._discard_corrupt_buffer_file(path, f"missing spill JPEG ({e})")
                 discarded += 1
             except Exception as e:
@@ -757,18 +809,117 @@ class KafkaSenderAgent:
                     self._mark_kafka_unhealthy(str(e))
                 break
 
-        if replayed or discarded:
-            remaining = self._buffer_count()
-            parts = []
-            if replayed:
-                parts.append(f"replayed {replayed}")
-            if discarded:
-                parts.append(f"discarded {discarded} corrupt")
-            print(
-                f"[Kafka Sender Agent] Buffer drain: {', '.join(parts)} "
-                f"({remaining} remaining)"
-            )
-        self._check_backlog_drained()
+        self._log_replay_batch_result(replayed, discarded)
+
+    def _replay_buffer_parallel(self, files: List[str]) -> None:
+        """Parallel MinIO uploads; Kafka sends strictly in FIFO order."""
+        class _ReplayItem:
+            __slots__ = ("path", "payload", "camera_key", "minio_ready", "minio_error", "needs_minio")
+
+            def __init__(self, path: str, payload: dict, camera_key: str):
+                self.path = path
+                self.payload = payload
+                self.camera_key = camera_key
+                self.needs_minio = bool(payload.get("local_spill"))
+                self.minio_ready = threading.Event()
+                self.minio_error: Optional[BaseException] = None
+                if not self.needs_minio:
+                    self.minio_ready.set()
+
+        items: List[_ReplayItem] = []
+        discarded = 0
+        for path in files:
+            loaded = self._read_buffer_record(path)
+            if loaded is None:
+                discarded += 1
+                continue
+            payload, camera_key = loaded
+            items.append(_ReplayItem(path, payload, camera_key))
+
+        if not items:
+            self._log_replay_batch_result(0, discarded)
+            return
+
+        minio_wait_sec = self._minio_connect_timeout_sec + self._minio_read_timeout_sec + 15.0
+        minio_local = threading.local()
+        submit_lock = threading.Lock()
+        scheduled: Set[int] = set()
+        next_submit_idx = 0
+
+        def _worker_minio_client() -> Any:
+            client = getattr(minio_local, "client", None)
+            if client is None:
+                client = self._create_minio_client(pool_size=4)
+                minio_local.client = client
+            return client
+
+        def _minio_worker(item: _ReplayItem) -> None:
+            try:
+                self._replay_minio_upload(item.payload, _worker_minio_client())
+            except Exception as e:
+                item.minio_error = e
+            finally:
+                item.minio_ready.set()
+
+        def _schedule_prefetch(kafka_idx: int, executor: ThreadPoolExecutor) -> None:
+            nonlocal next_submit_idx
+            limit = min(len(items), kafka_idx + self._replay_prefetch_ahead)
+            with submit_lock:
+                while next_submit_idx < limit:
+                    idx = next_submit_idx
+                    next_submit_idx += 1
+                    if idx in scheduled:
+                        continue
+                    item = items[idx]
+                    if not item.needs_minio or item.minio_ready.is_set():
+                        continue
+                    scheduled.add(idx)
+                    executor.submit(_minio_worker, item)
+
+        replayed = 0
+        workers = max(2, self._replay_minio_workers)
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="replay-minio") as executor:
+            for kafka_idx, item in enumerate(items):
+                if not self._kafka_healthy:
+                    break
+
+                _schedule_prefetch(kafka_idx, executor)
+
+                if not item.minio_ready.wait(timeout=minio_wait_sec):
+                    print(
+                        f"[Kafka Sender Agent] Replay stopped at {os.path.basename(item.path)}: "
+                        f"MinIO upload timed out after {minio_wait_sec:.0f}s"
+                    )
+                    self._minio_connected = False
+                    break
+
+                if item.minio_error is not None:
+                    err = item.minio_error
+                    if isinstance(err, FileNotFoundError):
+                        self._discard_corrupt_buffer_file(
+                            item.path, f"missing spill JPEG ({err})"
+                        )
+                        discarded += 1
+                        continue
+                    print(
+                        f"[Kafka Sender Agent] Replay stopped at {os.path.basename(item.path)}: "
+                        f"{err}"
+                    )
+                    self._minio_client = None
+                    self._minio_connected = False
+                    break
+
+                try:
+                    self._send_kafka_payload(item.payload, item.camera_key)
+                    os.remove(item.path)
+                    replayed += 1
+                except Exception as e:
+                    print(f"[Kafka Sender Agent] Replay stopped at {os.path.basename(item.path)}: {e}")
+                    if self._is_kafka_transport_error(e):
+                        self._mark_kafka_unhealthy(str(e))
+                    break
+
+        self._log_replay_batch_result(replayed, discarded)
 
     def send_snapshot(
         self,
