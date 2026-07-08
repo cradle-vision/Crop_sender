@@ -595,6 +595,19 @@ class KafkaSenderAgent:
             except OSError:
                 pass
 
+    def _object_exists(self, client: Any, bucket: str, object_key: str) -> bool:
+        """True if object is in MinIO.
+
+        Uses list_objects(prefix=object_key) rather than stat/get_object: some
+        deployments grant PutObject + ListBucket but deny HeadObject/GetObject,
+        so stat_object would raise AccessDenied even for existing objects.
+        Transient errors propagate (caller retries/stops); a clean empty listing
+        means the object is genuinely absent (so the caller may discard)."""
+        for obj in client.list_objects(bucket, prefix=object_key, recursive=True):
+            if obj.object_name == object_key:
+                return True
+        return False
+
     def _upload_spill_to_minio_with_client(self, payload: dict, client: Any) -> None:
         local_path = payload.get("local_path")
         object_key = payload.get("object_key")
@@ -620,13 +633,25 @@ class KafkaSenderAgent:
             return
 
         if local_path and not os.path.isfile(local_path):
-            raise FileNotFoundError(f"spill JPEG missing: {local_path}")
+            # Local file gone. Either the upload already succeeded (and Kafka failed
+            # afterwards, so this is a retry) or the spill file was truly lost.
+            # Confirm against MinIO so we never drop metadata for an image that IS
+            # stored (which would orphan it) and never send Kafka for one that isn't.
+            if self._object_exists(client, bucket, object_key):
+                print(
+                    f"[Kafka Sender Agent] Spill file absent but {bucket}/{object_key} "
+                    f"already in MinIO; sending Kafka"
+                )
+                self._clear_spill_payload_refs(payload, local_path)
+                return
+            raise FileNotFoundError(
+                f"spill JPEG missing and not in MinIO: {local_path}"
+            )
 
-        # Local file gone — orphan spill batch likely uploaded it already.
-        if local_path:
-            print(
-                f"[Kafka Sender Agent] Spill file already absent ({local_path}); "
-                f"assuming MinIO has {bucket}/{object_key}"
+        # No local_path at all — orphan spill batch likely uploaded it already.
+        if object_key and not self._object_exists(client, bucket, object_key):
+            raise FileNotFoundError(
+                f"spill payload has no local file and {bucket}/{object_key} not in MinIO"
             )
         self._clear_spill_payload_refs(payload, local_path)
 
@@ -646,6 +671,9 @@ class KafkaSenderAgent:
             try:
                 self._upload_spill_to_minio_with_client(payload, client)
                 return
+            except FileNotFoundError:
+                # Definitive: file gone and object not in MinIO. Retrying won't help.
+                raise
             except Exception as e:
                 last_err = e
                 if attempt + 1 < attempts:
