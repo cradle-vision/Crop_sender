@@ -1,5 +1,6 @@
 services:
   sender-crop:
+    image: ${AGENT_IMAGE:-ghcr.io/cradle-vision/crop-sender:latest}
     build: .
     container_name: sender-crop
     restart: unless-stopped
@@ -7,6 +8,10 @@ services:
     pids_limit: 8192
     volumes:
       - ./config:/app/config:rw
+      - ./.env:/app/.env:rw
+      # Optional OTA: uncomment to allow software_update from admin
+      # - /var/run/docker.sock:/var/run/docker.sock
+      # - ./:/opt/crop_sender:ro
     env_file:
       - .env
     environment:
@@ -14,9 +19,14 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS:-localhost:9092}
       - SENDER_KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS:-localhost:9092}
       - SENDER_MINIO_ENDPOINT=${MINIO_ENDPOINT:-localhost:9000}
+      - AGENT_VERSION=${AGENT_VERSION:-latest}
+      - AGENT_ENV_PATH=/app/.env
+      - AGENT_CONTROL_ENABLED=${AGENT_CONTROL_ENABLED:-true}
+      # Streaming profile: streaming-agent claims config/.agent_ws_owner; sender skips WS automatically.
+      - AGENT_COMPOSE_DIR=${AGENT_COMPOSE_DIR:-/opt/crop_sender}
+      - AGENT_UPDATE_CMD=${AGENT_UPDATE_CMD:-}
     network_mode: host
 
-  # Local RTSP relay: one stable pull per camera; FFmpeg reads localhost (not camera directly).
   mediamtx:
     image: bluenviron/mediamtx:latest
     container_name: mediamtx
@@ -26,9 +36,8 @@ services:
       - ./mediamtx.yml:/mediamtx.yml:ro
     network_mode: host
 
-  # Optional live streaming — separate container/process from sender-crop.
-  # Start when needed: docker compose --profile streaming up -d
   streaming-agent:
+    image: ${AGENT_IMAGE:-ghcr.io/cradle-vision/crop-sender:latest}
     build: .
     container_name: streaming-agent
     restart: unless-stopped
@@ -38,7 +47,10 @@ services:
     pids_limit: 4096
     volumes:
       - ./config:/app/config:rw
+      - ./.env:/app/.env:rw
       - ./streaming_agent/streaming-agent.yaml.example:/app/streaming-agent.yaml:ro
+      # - /var/run/docker.sock:/var/run/docker.sock
+      # - ./:/opt/crop_sender:ro
     env_file:
       - .env
     environment:
@@ -48,5 +60,9 @@ services:
       - STREAMING_USE_SUBSTREAM=${STREAMING_USE_SUBSTREAM:-true}
       - MEDIAMTX_PUBLIC_WEBRTC_BASE=${MEDIAMTX_PUBLIC_WEBRTC_BASE:-http://127.0.0.1:8889}
       - STREAMING_BACKEND_URL=${STREAMING_BACKEND_URL:-wss://api.retailsolution.ai/ws/agents}
+      - AGENT_VERSION=${AGENT_VERSION:-latest}
+      - AGENT_ENV_PATH=/app/.env
+      - AGENT_COMPOSE_DIR=${AGENT_COMPOSE_DIR:-/opt/crop_sender}
+      - AGENT_UPDATE_CMD=${AGENT_UPDATE_CMD:-}
     command: ["python3", "-m", "streaming_agent.main", "-c", "/app/streaming-agent.yaml"]
     network_mode: host

@@ -357,6 +357,13 @@ class CameraManager:
         print(f"[Camera Manager] Backend response keys: {keys}, no known list found")
         return data
     
+    def reload(self) -> None:
+        """Reload cameras from config file (or leave to MainAgent for backend fetch)."""
+        if self.config_file and os.path.isfile(self.config_file):
+            self.load_cameras()
+        else:
+            raise RuntimeError("No cameras config file to reload")
+
     def load_cameras(self):
         """Load cameras from config file. If path is a directory (e.g. Docker mount), use ../config/cameras.yaml."""
         if not self.config_file:

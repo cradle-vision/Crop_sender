@@ -104,13 +104,35 @@ class RoiCommandServer:
                     self._reply(conn, {"ok": False, "error": "invalid json"})
                     return
                 action = str(body.get("action", "")).strip()
+                agent = self._main_agent
+                if action == "reload_cameras":
+                    try:
+                        agent._reload_cameras_from_backend()
+                        self._reply(
+                            conn,
+                            {
+                                "ok": True,
+                                "reloaded": True,
+                                "cameras": len(agent.capture_agents),
+                            },
+                        )
+                    except Exception as e:
+                        self._reply(conn, {"ok": False, "error": str(e)[:500]})
+                    return
+                if action == "restart":
+                    threading.Thread(
+                        target=agent._request_control_restart,
+                        daemon=True,
+                        name="control-restart",
+                    ).start()
+                    self._reply(conn, {"ok": True, "restarting": True})
+                    return
                 cam_id = str(
                     body.get("smartcamera_id") or body.get("camera_id") or ""
                 ).strip()
                 if not cam_id:
                     self._reply(conn, {"ok": False, "error": "smartcamera_id required"})
                     return
-                agent = self._main_agent
                 if action == "snapshot_refresh":
                     ok = agent.request_snapshot_refresh(cam_id)
                     self._reply(conn, {"ok": ok, "queued": ok})

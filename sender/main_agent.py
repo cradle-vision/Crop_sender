@@ -30,6 +30,16 @@ from jpeg_utils import encode_jpeg_bgr
 from roi_command_server import RoiCommandServer
 from roi_local_http import RoiLocalHttpServer
 
+# Project root on sys.path for agent_control (sender/main_agent.py entrypoint).
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+try:
+    from agent_control import AgentControlClient, ControlCallbacks
+except ImportError:
+    AgentControlClient = None  # type: ignore
+    ControlCallbacks = None  # type: ignore
+
 _STREAM_TYPES = frozenset({"rtsp", "http", "file"})
 
 
@@ -260,49 +270,202 @@ class MainAgent:
         # Capture agents for each camera
         self.capture_agents: Dict[str, SnapshotCaptureAgent] = {}
         self._init_cameras()
+        self._control_client = None
         
         # Signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
-    
+
+    def _maybe_start_agent_control(self) -> None:
+        """WS desired-state client when streaming-agent is not owning /ws/agents."""
+        if AgentControlClient is None:
+            return
+        enabled = _env_bool("AGENT_CONTROL_ENABLED", True)
+        if not enabled:
+            return
+        if not _env_bool("AGENT_CONTROL_FORCE", False):
+            # Allow streaming-agent (same compose up) to claim the shared marker first.
+            wait_sec = _env_float("AGENT_CONTROL_OWNER_WAIT_SEC", 3.0)
+            if wait_sec > 0:
+                time.sleep(wait_sec)
+            try:
+                from agent_control.ws_owner import current_ws_owner
+
+                owner = current_ws_owner()
+            except ImportError:
+                owner = None
+            if owner == "streaming":
+                print(
+                    "[Main Agent] agent control skipped (streaming-agent owns WS via marker); "
+                    "set AGENT_CONTROL_FORCE=1 to override"
+                )
+                return
+            if _env_bool("STREAMING_AGENT_ENABLED", False):
+                print(
+                    "[Main Agent] agent control skipped (STREAMING_AGENT_ENABLED); "
+                    "set AGENT_CONTROL_FORCE=1 to override"
+                )
+                return
+        agent_id = _env("STREAMING_AGENT_ID") or _env("AGENT_ID")
+        token = _env("STREAMING_AGENT_TOKEN") or _env("AGENT_TOKEN")
+        backend_url = _env("STREAMING_BACKEND_URL") or _env("AGENT_BACKEND_URL")
+        if not agent_id or not token or not backend_url:
+            print(
+                "[Main Agent] agent control disabled: set STREAMING_AGENT_ID, "
+                "STREAMING_AGENT_TOKEN, STREAMING_BACKEND_URL"
+            )
+            return
+        env_path = _env("AGENT_ENV_PATH") or os.path.join(_ROOT, ".env")
+        callbacks = ControlCallbacks(
+            on_reload_cameras=self._reload_cameras_from_backend,
+            request_restart=self._request_control_restart,
+        )
+        self._control_client = AgentControlClient(
+            backend_url=backend_url,
+            agent_id=agent_id,
+            auth_token=token,
+            env_path=env_path,
+            callbacks=callbacks,
+            heartbeat_interval_sec=_env_float("STREAMING_HEARTBEAT_INTERVAL_SEC", 15.0),
+        )
+        self._control_client.start_background()
+
+    def _watch_streaming_ws_owner(self) -> None:
+        """If streaming-agent starts later, drop our WS client to avoid dual sessions."""
+        try:
+            from agent_control.ws_owner import current_ws_owner
+        except ImportError:
+            return
+        while self.running:
+            time.sleep(5.0)
+            if current_ws_owner() != "streaming":
+                continue
+            if not self._control_client:
+                return
+            print(
+                "[Main Agent] streaming-agent claimed WS; stopping sender agent control"
+            )
+            try:
+                self._control_client.stop()
+            except Exception as e:
+                print(f"[Main Agent] Error stopping agent control: {e}")
+            self._control_client = None
+            return
+
+    def _request_control_restart(self) -> None:
+        """Exit after control apply so Docker restart policy reloads env."""
+        print("[Main Agent] control plane requested process restart")
+        try:
+            self.stop()
+        except Exception as e:
+            print(f"[Main Agent] stop before restart failed: {e}")
+        os._exit(0)
+
+    def _reload_cameras_from_backend(self) -> None:
+        """Re-fetch cameras from BACKEND_CAMERAS_URL or reload cameras.yaml, then sync capture."""
+        print("[Main Agent] reload_cameras requested")
+        backend_cameras_url = _env("BACKEND_CAMERAS_URL")
+        cameras_config = _env("CAMERAS_CONFIG_PATH") or "cameras.yaml"
+        cameras_config = self._resolve_path(cameras_config)
+        backend_timeout = _env_float("BACKEND_CAMERAS_TIMEOUT", 10.0)
+        if backend_cameras_url:
+            token = self._backend_bearer_token or _env("BACKEND_CAMERAS_TOKEN") or None
+            raw = CameraManager._fetch_cameras_from_backend_raw(
+                backend_cameras_url, backend_timeout, token
+            )
+            if raw is None:
+                raise RuntimeError("backend cameras fetch failed")
+            data = CameraManager._normalize_backend_response(raw)
+            self.camera_manager.load_cameras_from_data(data)
+            self.camera_manager.config_file = cameras_config
+            self.camera_manager.save_cameras()
+            print(f"[Main Agent] reload_cameras: {len(self.camera_manager.cameras)} camera(s) from backend")
+        else:
+            self.camera_manager.config_file = cameras_config
+            self.camera_manager.reload()
+            print(f"[Main Agent] reload_cameras: {len(self.camera_manager.cameras)} camera(s) from file")
+        self._sync_capture_agents()
+
+    def _frame_callback_for(self, camera_id: str):
+        def callback(frame, timestamp):
+            self._on_frame_captured(frame, timestamp, camera_id)
+        return callback
+
+    def _build_capture_agent(self, camera) -> Optional["SnapshotCaptureAgent"]:
+        transport = _capture_transport_type(camera.type, camera.source)
+        if transport in ("rtsp", "http"):
+            source = self.camera_manager._build_source_url(camera)
+        else:
+            source = camera.source
+        if not source or (isinstance(source, str) and not source.strip()):
+            print(
+                f"[Main Agent] Camera {camera.camera_id} has no stream URL, skipping capture "
+                "(add ddns_rtsp_url/ddns_stream_url in backend)"
+            )
+            return None
+        return SnapshotCaptureAgent(
+            source=source,
+            fps=self.capture_fps,
+            width=camera.width,
+            height=camera.height,
+            camera_id=camera.camera_id,
+            camera_type=_capture_transport_type(camera.type, source),
+            processing_queue_max=self.processing_queue_max,
+            processing_workers=self.processing_workers,
+        )
+
+    def _start_capture_agent(self, camera_id: str, capture_agent: "SnapshotCaptureAgent") -> None:
+        try:
+            capture_agent.start(callback=self._frame_callback_for(camera_id))
+            print(f"[Main Agent] Capture for camera {camera_id} started")
+        except Exception as e:
+            print(f"[Main Agent] Error starting camera {camera_id}: {e}")
+
+    def _sync_capture_agents(self) -> None:
+        """Start/stop/restart capture agents to match current camera_manager state."""
+        desired: Dict[str, SnapshotCaptureAgent] = {}
+        for camera in self.camera_manager.get_enabled_cameras():
+            if not camera.enabled:
+                continue
+            agent = self._build_capture_agent(camera)
+            if agent is None:
+                continue
+            desired[camera.camera_id] = agent
+
+        for camera_id in list(self.capture_agents.keys()):
+            if camera_id not in desired:
+                try:
+                    self.capture_agents[camera_id].stop()
+                except Exception as e:
+                    print(f"[Main Agent] Error stopping removed camera {camera_id}: {e}")
+                del self.capture_agents[camera_id]
+                print(f"[Main Agent] Removed capture for camera {camera_id}")
+
+        for camera_id, new_agent in desired.items():
+            existing = self.capture_agents.get(camera_id)
+            if existing is not None and str(existing.source) == str(new_agent.source):
+                continue
+            if existing is not None:
+                try:
+                    existing.stop()
+                except Exception as e:
+                    print(f"[Main Agent] Error restarting camera {camera_id}: {e}")
+                print(f"[Main Agent] Restarting capture for camera {camera_id} (source changed)")
+            self.capture_agents[camera_id] = new_agent
+            print(
+                f"[Main Agent] {'Updated' if existing else 'Initialized'} camera: {camera_id} "
+                f"(capture: {new_agent.camera_type}, source: {new_agent.source})"
+            )
+            if self.running:
+                self._start_capture_agent(camera_id, new_agent)
+
     def _init_cameras(self):
         """Initialize all cameras from CameraManager (cameras.yaml or backend)."""
         cameras = self.camera_manager.get_enabled_cameras()
         if not cameras:
             print("[Main Agent] WARNING: No cameras. Set CAMERAS_CONFIG_PATH or BACKEND_CAMERAS_URL and cameras.yaml")
-        
-        # Initialize capture agents
-        for camera in cameras:
-            if not camera.enabled:
-                print(f"[Main Agent] Camera {camera.camera_id} disabled")
-                continue
-            
-            transport = _capture_transport_type(camera.type, camera.source)
-            if transport in ("rtsp", "http"):
-                source = self.camera_manager._build_source_url(camera)
-            else:
-                source = camera.source
-            
-            # Skip capture for cameras without URL (saved in cameras.yaml; will work when backend adds ddns_rtsp_url/ddns_stream_url)
-            if not source or (isinstance(source, str) and not source.strip()):
-                print(f"[Main Agent] Camera {camera.camera_id} has no stream URL, skipping capture (add ddns_rtsp_url/ddns_stream_url in backend)")
-                continue
-            
-            capture_agent = SnapshotCaptureAgent(
-                source=source,
-                fps=self.capture_fps,
-                width=camera.width,
-                height=camera.height,
-                camera_id=camera.camera_id,
-                camera_type=_capture_transport_type(camera.type, source),
-                processing_queue_max=self.processing_queue_max,
-                processing_workers=self.processing_workers,
-            )
-            
-            self.capture_agents[camera.camera_id] = capture_agent
-            print(f"[Main Agent] Initialized camera: {camera.camera_id} "
-                  f"({camera.name}, type: {camera.type}, capture: {_capture_transport_type(camera.type, source)}, source: {source})")
-        
+        self._sync_capture_agents()
+
     def _resolve_path(self, path: str) -> str:
         """Resolve path: if relative and not found in cwd, try project root (parent of sender/)."""
         if os.path.isabs(path) and os.path.isfile(path):
@@ -331,26 +494,22 @@ class MainAgent:
             return False
 
         self.sender_agent.start_auto_reconnect()
+        self._maybe_start_agent_control()
 
         # Start capture for all cameras
         for camera_id, capture_agent in self.capture_agents.items():
-            try:
-                # Create callback with proper closure for camera_id
-                def make_callback(cam_id):
-                    def callback(frame, timestamp):
-                        self._on_frame_captured(frame, timestamp, cam_id)
-                    return callback
-                
-                capture_agent.start(callback=make_callback(camera_id))
-                print(f"[Main Agent] Capture for camera {camera_id} started")
-            except Exception as e:
-                print(f"[Main Agent] Error starting camera {camera_id}: {e}")
-        
+            self._start_capture_agent(camera_id, capture_agent)
         if not self.capture_agents:
             print("[Main Agent] No active cameras for capture")
             return False
         
         self.running = True
+        if self._control_client and not _env_bool("AGENT_CONTROL_FORCE", False):
+            threading.Thread(
+                target=self._watch_streaming_ws_owner,
+                daemon=True,
+                name="ws-owner-watch",
+            ).start()
         self._start_roi_command_server()
         self._start_roi_poll_fallback()
         print(f"[Main Agent] System started and running. Active cameras: {len(self.capture_agents)}")
@@ -716,6 +875,12 @@ class MainAgent:
         """Stop all agents"""
         print("[Main Agent] Stopping system...")
         self.running = False
+        if self._control_client:
+            try:
+                self._control_client.stop()
+            except Exception as e:
+                print(f"[Main Agent] Error stopping agent control: {e}")
+            self._control_client = None
         if self._roi_command_server:
             self._roi_command_server.stop()
         if self._roi_http_server:

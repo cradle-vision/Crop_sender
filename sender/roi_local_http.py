@@ -23,13 +23,32 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length) if length > 0 else b"{}"
-            body = json.loads(raw.decode("utf-8"))
+            body = json.loads(raw.decode("utf-8")) if raw else {}
         except (ValueError, json.JSONDecodeError):
             self.send_error(400)
             return
         if not isinstance(body, dict):
             self.send_error(400)
             return
+
+        if path == "/cameras/reload":
+            try:
+                agent._reload_cameras_from_backend()
+                payload = {"ok": True, "reloaded": True, "cameras": len(agent.capture_agents)}
+            except Exception as e:
+                payload = {"ok": False, "error": str(e)[:500]}
+            self._write_json(payload)
+            return
+
+        if path == "/control/restart":
+            threading.Thread(
+                target=agent._request_control_restart,
+                daemon=True,
+                name="control-restart",
+            ).start()
+            self._write_json({"ok": True, "restarting": True})
+            return
+
         cam_id = str(
             body.get("smartcamera_id") or body.get("camera_id") or ""
         ).strip()
@@ -47,6 +66,9 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
 
+        self._write_json(payload)
+
+    def _write_json(self, payload: dict) -> None:
         data = json.dumps(payload).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

@@ -1,0 +1,88 @@
+name: Release store agent image
+
+on:
+  push:
+    branches: [develop, main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: cradle-vision/crop-sender
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags
+        id: meta
+        run: |
+          SHA_SHORT="${GITHUB_SHA::12}"
+          echo "sha=${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+            CHANNEL=release
+          elif [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+            VERSION="main-${SHA_SHORT}"
+            CHANNEL=main
+          else
+            VERSION="develop-${SHA_SHORT}"
+            CHANNEL=develop
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "channel=${CHANNEL}" >> "$GITHUB_OUTPUT"
+          echo "image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.sha }}
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.channel }}
+          labels: |
+            org.opencontainers.image.source=${{ github.repositoryUrl }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+
+      - name: Smoke import check
+        run: |
+          docker run --rm "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}" \
+            python3 -c "import agent_control; from agent_control.env_file import compute_env_hash; print(compute_env_hash({}))"
+
+      - name: Register release on backend
+        continue-on-error: true
+        env:
+          API_URL: ${{ secrets.AGENT_RELEASE_API_URL }}
+          CI_TOKEN: ${{ secrets.AGENT_RELEASE_CI_TOKEN }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          IMAGE: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+          SHA: ${{ github.sha }}
+          CHANNEL: ${{ steps.meta.outputs.channel }}
+        run: |
+          if [ -z "${API_URL}" ] || [ -z "${CI_TOKEN}" ]; then
+            echo "Skipping release registration (AGENT_RELEASE_API_URL / AGENT_RELEASE_CI_TOKEN not set)"
+            exit 0
+          fi
+          curl -fsS -X POST "${API_URL%/}/api/stream/releases/ci" \
+            -H "Content-Type: application/json" \
+            -H "X-Agent-Release-Token: ${CI_TOKEN}" \
+            -d "{\"version\":\"${VERSION}\",\"image\":\"${IMAGE}\",\"sha\":\"${SHA}\",\"channel\":\"${CHANNEL}\"}"

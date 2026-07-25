@@ -89,3 +89,13 @@ def apply_roi_payload(payload: dict[str, Any]) -> bool:
     body = dict(payload)
     body["action"] = "roi_apply"
     return _send_command(body, http_path="/roi/apply")
+
+
+def request_reload_cameras() -> bool:
+    """Ask sender-crop to re-fetch cameras and sync capture agents."""
+    return _send_command({"action": "reload_cameras"}, http_path="/cameras/reload")
+
+
+def request_sender_restart() -> bool:
+    """Ask sender-crop to exit so Docker restart policy reloads env."""
+    return _send_command({"action": "restart"}, http_path="/control/restart")

@@ -20,6 +20,13 @@ Camera -> person detection (CPU binary) -> crop -> MinIO -> Kafka metadata -> ba
 ./setup.sh
 ```
 
+## Fleet CI/CD + remote env
+
+Remote env updates and image rollout from the admin panel are documented in:
+
+- [docs/CI_CD_FLEET.md](docs/CI_CD_FLEET.md)
+- Backend: `Retail_Backend/docs/STORE_AGENT_FLEET_API.md`
+
 ## Configuration
 
 - `.env` is the runtime config source (copy `.env.example` -> `.env`).

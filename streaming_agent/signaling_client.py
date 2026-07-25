@@ -7,10 +7,18 @@ import json
 import logging
 from typing import Any
 
+from agent_control.client import apply_env_message
+from agent_control.env_file import compute_env_hash, read_env_file
+from agent_control.update import run_software_update
 from streaming_agent.config import AgentConfig
 from streaming_agent.health_monitor import collect_metrics
 from streaming_agent.mediamtx_client import MediaMTXClient
-from streaming_agent.roi_bridge import apply_roi_payload, request_snapshot_refresh
+from streaming_agent.roi_bridge import (
+    apply_roi_payload,
+    request_reload_cameras,
+    request_sender_restart,
+    request_snapshot_refresh,
+)
 from streaming_agent.stream_manager import StreamManager
 
 logger = logging.getLogger(__name__)
@@ -20,6 +28,24 @@ try:
     from websockets.exceptions import ConnectionClosed
 except ImportError as e:
     raise ImportError("Install package 'websockets' for Streaming Agent") from e
+
+
+def _env_path() -> str:
+    import os
+
+    return os.getenv("AGENT_ENV_PATH") or os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", ".env")
+    )
+
+
+def _agent_version() -> str:
+    import os
+
+    return (
+        os.getenv("AGENT_VERSION")
+        or os.getenv("IMAGE_TAG")
+        or "unknown"
+    )
 
 
 def _is_connection_error(exc: BaseException) -> bool:
@@ -53,6 +79,7 @@ class SignalingClient:
         self._send_lock = asyncio.Lock()
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._stopped = asyncio.Event()
+        self._update_status = "idle"
 
     def _connect_kwargs(self) -> dict[str, Any]:
         headers: list[tuple[str, str]] = []
@@ -111,6 +138,9 @@ class SignalingClient:
                 "cpu": m.get("cpu", 0),
                 "ram": m.get("ram", 0),
                 "streams_active": m.get("streams_active", 0),
+                "version": _agent_version(),
+                "env_hash": compute_env_hash(read_env_file(_env_path())),
+                "update_status": getattr(self, "_update_status", "idle"),
             }
         )
 
@@ -200,7 +230,110 @@ class SignalingClient:
         if t == "roi_updated":
             await self._handle_roi_updated(msg)
             return
+        if t == "apply_env":
+            await self._handle_apply_env(msg)
+            return
+        if t == "software_update":
+            await self._handle_software_update(msg)
+            return
+        if t == "reload_cameras":
+            await self._handle_reload_cameras(msg)
+            return
         logger.warning("unhandled backend message type=%s keys=%s", t, list(msg.keys()))
+
+    async def _handle_reload_cameras(self, msg: dict[str, Any]) -> None:
+        """Sender fetches/saves cameras + syncs capture; then streaming reloads yaml."""
+        sender_ok = True
+        sender_err: str | None = None
+        try:
+            sender_ok = await asyncio.to_thread(request_reload_cameras)
+            if not sender_ok:
+                sender_err = "sender-crop reload returned not ok"
+        except Exception as e:
+            sender_ok = False
+            sender_err = str(e)[:500]
+            logger.warning("reload_cameras via sender IPC failed: %s", e)
+
+        stream_ok = await asyncio.to_thread(self.stream_manager.reload_cameras_from_config)
+        ok = sender_ok and stream_ok
+        err_parts = []
+        if sender_err:
+            err_parts.append(f"sender: {sender_err}")
+        if not stream_ok:
+            err_parts.append("streaming config reload failed")
+        await self.send_json(
+            {
+                "type": "config_applied",
+                "ok": ok,
+                "update_status": "ok" if ok else "error",
+                "error": "; ".join(err_parts) if err_parts else None,
+            }
+        )
+        if ok:
+            logger.info("reload_cameras ok (sender + streaming)")
+        else:
+            logger.warning("reload_cameras partial/failed: %s", "; ".join(err_parts))
+
+    async def _handle_apply_env(self, msg: dict[str, Any]) -> None:
+        self._update_status = "applying"
+        ok, detail, reported = await asyncio.to_thread(apply_env_message, _env_path(), msg)
+        self._update_status = "ok" if ok else "error"
+        await self.send_json(
+            {
+                "type": "config_applied",
+                "ok": ok,
+                "config_revision": msg.get("config_revision"),
+                "env_hash": detail if ok else None,
+                "version": _agent_version(),
+                "update_status": self._update_status,
+                "error": None if ok else detail,
+                "reported_env": reported if ok else None,
+            }
+        )
+        if ok:
+            # Restart sender-crop too so both pick up new env_file values.
+            try:
+                await asyncio.to_thread(request_sender_restart)
+            except Exception as e:
+                logger.warning("sender restart after apply_env failed: %s", e)
+            logger.info("apply_env ok revision=%s — exiting for restart", msg.get("config_revision"))
+            await asyncio.sleep(1.0)
+            os_exit = __import__("os")._exit
+            os_exit(0)
+
+    async def _handle_software_update(self, msg: dict[str, Any]) -> None:
+        version = str(msg.get("version") or "").strip()
+        image = msg.get("image")
+        if not version:
+            await self.send_json(
+                {
+                    "type": "config_applied",
+                    "ok": False,
+                    "update_status": "error",
+                    "error": "missing version",
+                }
+            )
+            return
+        self._update_status = "applying"
+        ok, detail = await asyncio.to_thread(
+            run_software_update,
+            version=version,
+            image=str(image) if image else None,
+        )
+        self._update_status = "ok" if ok else "error"
+        await self.send_json(
+            {
+                "type": "config_applied",
+                "ok": ok,
+                "version": version if ok else _agent_version(),
+                "env_hash": compute_env_hash(read_env_file(_env_path())),
+                "update_status": self._update_status,
+                "error": None if ok else detail,
+            }
+        )
+        if ok:
+            await asyncio.sleep(2.0)
+            __import__("os")._exit(0)
 
     async def on_stream_status(self, camera_id: str, data: dict[str, Any]) -> None:
         await self.send_json(data)
@@ -261,6 +394,9 @@ class SignalingClient:
                             "type": "register",
                             "agent_id": self.cfg.agent_id,
                             "cameras": cams,
+                            "version": _agent_version(),
+                            "env_hash": compute_env_hash(read_env_file(_env_path())),
+                            "update_status": getattr(self, "_update_status", "idle"),
                         }
                     )
                     logger.info(
