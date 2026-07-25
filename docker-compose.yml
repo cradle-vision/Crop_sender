@@ -8,6 +8,7 @@ services:
     pids_limit: 8192
     volumes:
       - ./config:/app/config:rw
+      # File bind-mount keeps host .env in sync with remote apply_env (write is in-place).
       - ./.env:/app/.env:rw
       # Optional OTA: uncomment to allow software_update from admin
       # - /var/run/docker.sock:/var/run/docker.sock

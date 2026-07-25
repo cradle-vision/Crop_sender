@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -72,47 +73,73 @@ def read_env_file(path: str) -> Dict[str, str]:
     return result
 
 
+def _render_env_content(
+    env: Dict[str, str],
+    *,
+    existing_lines: list[str],
+    preserve_unknown: bool,
+) -> str:
+    lines: list[str] = []
+    written: Set[str] = set()
+    if preserve_unknown and existing_lines:
+        for line in existing_lines:
+            stripped = line.strip()
+            match = _LINE_RE.match(stripped)
+            if not match:
+                lines.append(line if line.endswith("\n") else line + "\n")
+                continue
+            key = match.group(1)
+            if key in env:
+                lines.append(f"{key}={_quote(env[key])}\n")
+                written.add(key)
+            else:
+                lines.append(line if line.endswith("\n") else line + "\n")
+    for key, value in env.items():
+        if key in written:
+            continue
+        lines.append(f"{key}={_quote(value)}\n")
+    return "".join(lines)
+
+
 def write_env_file(path: str, env: Dict[str, str], *, preserve_unknown: bool = True) -> None:
     existing_lines: list[str] = []
-    existing_keys: Set[str] = set()
     if preserve_unknown and os.path.isfile(path):
         with open(path, "r", encoding="utf-8") as fh:
             existing_lines = fh.readlines()
-        for line in existing_lines:
-            match = _LINE_RE.match(line.strip())
-            if match:
-                existing_keys.add(match.group(1))
 
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
+    content = _render_env_content(
+        env, existing_lines=existing_lines, preserve_unknown=preserve_unknown
+    )
+
+    # Prefer atomic replace when possible. Bind-mounted files (docker
+    # `./.env:/app/.env`) reject rename/replace with EBUSY — write in place.
     fd, tmp_path = tempfile.mkstemp(prefix=".env.", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as out:
-            written: Set[str] = set()
-            if preserve_unknown and existing_lines:
-                for line in existing_lines:
-                    stripped = line.strip()
-                    match = _LINE_RE.match(stripped)
-                    if not match:
-                        out.write(line if line.endswith("\n") else line + "\n")
-                        continue
-                    key = match.group(1)
-                    if key in env:
-                        out.write(f"{key}={_quote(env[key])}\n")
-                        written.add(key)
-                    else:
-                        out.write(line if line.endswith("\n") else line + "\n")
-            for key, value in env.items():
-                if key in written:
-                    continue
-                out.write(f"{key}={_quote(value)}\n")
-        os.replace(tmp_path, path)
-    except Exception:
+            out.write(content)
+            out.flush()
+            os.fsync(out.fileno())
         try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+            os.replace(tmp_path, path)
+            tmp_path = ""
+            return
+        except OSError as e:
+            busy = e.errno in (errno.EBUSY, errno.EXDEV) or getattr(e, "errno", None) == 16
+            if not busy:
+                raise
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    with open(path, "w", encoding="utf-8") as out:
+        out.write(content)
+        out.flush()
+        os.fsync(out.fileno())
 
 
 def merge_env_file(path: str, patch: Dict[str, object]) -> Dict[str, str]:
