@@ -27,3 +27,4 @@ cameras.yaml
 backend_cameras.json
 config/kafka_buffer/
 config/kafka_spill/
+.agent_ws_owner

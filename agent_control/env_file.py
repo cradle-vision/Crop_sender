@@ -9,34 +9,18 @@ import re
 import tempfile
 from typing import Dict, Iterable, Optional, Set
 
-# Remotely managed keys only. All other settings use agent code defaults /.env.example.
+# Remotely managed keys only (per-store). Infra/ROI/streaming delivery are code defaults.
 ALLOWED_ENV_KEYS: Set[str] = {
-    # Cloud connectivity
-    "KAFKA_BOOTSTRAP_SERVERS",
-    "KAFKA_TOPIC",
-    "SENDER_KAFKA_BOOTSTRAP_SERVERS",
-    "MINIO_ENABLED",
-    "MINIO_ENDPOINT",
-    "MINIO_BUCKET",
-    "MINIO_ACCESS_KEY",
-    "MINIO_SECRET_KEY",
-    "MINIO_SECURE",
-    "SENDER_MINIO_ENDPOINT",
-    # Backend cameras / auth
+    # Backend cameras / auth (per store)
     "BACKEND_CAMERAS_URL",
     "BACKEND_CAMERAS_TOKEN",
     "BACKEND_CAMERAS_USERNAME",
     "BACKEND_CAMERAS_PASSWORD",
     "BACKEND_TOKEN_URL",
-    # Agent identity (WS control / streaming)
+    # Agent identity (unique per store)
     "STREAMING_AGENT_ID",
-    "STREAMING_BACKEND_URL",
     "STREAMING_AGENT_TOKEN",
-    "STREAMING_DELIVERY",
-    "STREAMING_UPSTREAM_RTMP_URL_TEMPLATE",
-    "STREAMING_UPSTREAM_PLAYBACK_URL_TEMPLATE",
-    "MEDIAMTX_PUBLIC_WEBRTC_BASE",
-    # Light per-store tuning
+    # Per-store capture rate
     "DEFAULT_FPS",
     # OTA pin
     "AGENT_VERSION",
@@ -44,8 +28,6 @@ ALLOWED_ENV_KEYS: Set[str] = {
 }
 
 SECRET_ENV_KEYS: Set[str] = {
-    "MINIO_SECRET_KEY",
-    "MINIO_ACCESS_KEY",
     "BACKEND_CAMERAS_PASSWORD",
     "BACKEND_CAMERAS_TOKEN",
     "STREAMING_AGENT_TOKEN",

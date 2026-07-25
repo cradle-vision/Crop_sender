@@ -550,10 +550,10 @@ def load_config(
     delivery = str(
         data.get("delivery")
         or _env("STREAMING_DELIVERY")
-        or "local_webrtc"
+        or "upstream_rtmp"
     ).strip().lower()
     if delivery not in ("local_webrtc", "upstream_rtmp", "both"):
-        delivery = "local_webrtc"
+        delivery = "upstream_rtmp"
 
     cameras: list[CameraEntry] = []
     raw_cams = data.get("cameras") or []
@@ -573,7 +573,7 @@ def load_config(
         backend_url=str(
             data.get("backend_url")
             or _env("STREAMING_BACKEND_URL")
-            or "ws://127.0.0.1:8000/ws/agent"
+            or "wss://api.retailsolution.ai/ws/agents"
         ),
         auth_token=str(data.get("auth_token") or _env("STREAMING_AGENT_TOKEN") or ""),
         heartbeat_interval_sec=_env_float(
@@ -627,12 +627,12 @@ def load_config(
             rtmp_url_template=str(
                 up.get("rtmp_url_template")
                 or _env("STREAMING_UPSTREAM_RTMP_URL_TEMPLATE")
-                or ""
+                or "rtmp://64.227.62.36:1935/live/{stream_key}"
             ),
             playback_url_template=str(
                 up.get("playback_url_template")
                 or _env("STREAMING_UPSTREAM_PLAYBACK_URL_TEMPLATE")
-                or ""
+                or "https://stream.retailsolution.ai/live/{stream_key}/index.m3u8"
             ),
             ffmpeg_path=str(up.get("ffmpeg_path") or _env("STREAMING_FFMPEG_PATH") or "ffmpeg"),
             ffmpeg_extra_args=list(up.get("ffmpeg_extra_args") or []),

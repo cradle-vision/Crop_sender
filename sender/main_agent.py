@@ -169,7 +169,7 @@ class MainAgent:
         bootstrap_servers = (
             _env('KAFKA_BOOTSTRAP_SERVERS')
             or _env('SENDER_KAFKA_BOOTSTRAP_SERVERS')
-            or 'localhost:9092'
+            or '64.227.62.36:9092'
         )
         bootstrap_servers = str(bootstrap_servers).replace('http://', '').replace('https://', '').rstrip('/')
 
@@ -180,8 +180,12 @@ class MainAgent:
         minio_enabled = _env_bool('MINIO_ENABLED', True)
         minio_config = {
             'enabled': minio_enabled,
-            'endpoint': _env('SENDER_MINIO_ENDPOINT') or _env('MINIO_ENDPOINT') or 'localhost:9000',
-            'bucket': _env('MINIO_BUCKET') or 'crops',
+            'endpoint': (
+                _env('SENDER_MINIO_ENDPOINT')
+                or _env('MINIO_ENDPOINT')
+                or '64.227.62.36:9005'
+            ),
+            'bucket': _env('MINIO_BUCKET') or 'visitorstorage',
             'access_key': _env('MINIO_ACCESS_KEY') or 'minioadmin',
             'secret_key': _env('MINIO_SECRET_KEY') or 'minioadmin',
             'secure': _env_bool('MINIO_SECURE', False),
@@ -200,7 +204,7 @@ class MainAgent:
                 buffer_max_bytes = None
 
         resilience_config = {
-            'reconnect_sec': max(2.0, _env_float('KAFKA_RECONNECT_SEC', 3.0)),
+            'reconnect_sec': max(2.0, _env_float('KAFKA_RECONNECT_SEC', 15.0)),
             'offline_log_sec': max(15.0, _env_float('KAFKA_OFFLINE_LOG_SEC', 60.0)),
             'broker_check_sec': max(3.0, _env_float('KAFKA_BROKER_CHECK_SEC', 10.0)),
             'delivery_timeout_sec': max(3.0, _env_float('KAFKA_DELIVERY_TIMEOUT_SEC', 10.0)),
@@ -209,7 +213,7 @@ class MainAgent:
             'buffer_enabled': _env_bool('KAFKA_BUFFER_ENABLED', True),
             'buffer_max_items': _env_int('KAFKA_BUFFER_MAX_ITEMS', 340000, 1, 10000000),
             'buffer_dir': _env('KAFKA_BUFFER_DIR') or '/app/config/kafka_buffer',
-            'buffer_replay_batch': _env_int('KAFKA_BUFFER_REPLAY_BATCH', 1000, 1, 1000),
+            'buffer_replay_batch': _env_int('KAFKA_BUFFER_REPLAY_BATCH', 20, 1, 1000),
             'buffer_replay_max_rounds': _env_int('KAFKA_BUFFER_REPLAY_MAX_ROUNDS', 30, 1, 500),
             'drain_poll_sec': max(1.0, _env_float('KAFKA_DRAIN_POLL_SEC', 2.0)),
             'buffer_max_bytes': buffer_max_bytes,
@@ -239,8 +243,8 @@ class MainAgent:
         )
 
         # Detection: CPU person detection only (person_detect binary)
-        self.person_conf = _env_float('PERSON_CONF', 0.4)
-        self.person_iou = _env_float('PERSON_IOU', 0.5)
+        self.person_conf = _env_float('PERSON_CONF', 0.60)
+        self.person_iou = _env_float('PERSON_IOU', 0.30)
         self.person_model_path = _env('PERSON_MODEL_PATH') or None
         if not person_detector_available():
             raise RuntimeError(
@@ -250,8 +254,8 @@ class MainAgent:
         print("[Main Agent] Using person detection (cpu-person-detection binary)")
         print("[Main Agent] RTSP capture: using FFmpeg pipe only")
 
-        # Decode/sample rate: FFmpeg fps= filter from DEFAULT_FPS in .env. 0 = full stream rate (high CPU).
-        self.capture_fps = max(0.0, _env_float("DEFAULT_FPS", 20.0))
+        # Decode/sample rate: FFmpeg fps= filter from DEFAULT_FPS in .env (per-store). 0 = unlimited.
+        self.capture_fps = max(0.0, _env_float("DEFAULT_FPS", 3.0))
         self.processing_queue_max = _env_int("PROCESSING_QUEUE_MAX", 200, 1, 500)
         self.processing_workers = _env_int("PROCESSING_WORKERS", 3, 1, 16)
         print(
@@ -308,11 +312,15 @@ class MainAgent:
                 return
         agent_id = _env("STREAMING_AGENT_ID") or _env("AGENT_ID")
         token = _env("STREAMING_AGENT_TOKEN") or _env("AGENT_TOKEN")
-        backend_url = _env("STREAMING_BACKEND_URL") or _env("AGENT_BACKEND_URL")
-        if not agent_id or not token or not backend_url:
+        backend_url = (
+            _env("STREAMING_BACKEND_URL")
+            or _env("AGENT_BACKEND_URL")
+            or "wss://api.retailsolution.ai/ws/agents"
+        )
+        if not agent_id or not token:
             print(
                 "[Main Agent] agent control disabled: set STREAMING_AGENT_ID, "
-                "STREAMING_AGENT_TOKEN, STREAMING_BACKEND_URL"
+                "STREAMING_AGENT_TOKEN"
             )
             return
         env_path = _env("AGENT_ENV_PATH") or os.path.join(_ROOT, ".env")
