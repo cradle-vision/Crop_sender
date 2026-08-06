@@ -23,6 +23,12 @@ ALLOWED_ENV_KEYS: Set[str] = {
     "STREAMING_AGENT_TOKEN",
     # Per-store capture rate
     "DEFAULT_FPS",
+    # Indoor store tracking
+    "TRACKING_ENABLED",
+    "TRACKING_POSITIONS_TOPIC",
+    "FACE_PIPELINE_TOPIC",
+    "TRACKING_INTERVAL_MS",
+    "FACE_RESEND_SEC",
     # OTA pin
     "AGENT_VERSION",
     "AGENT_IMAGE",

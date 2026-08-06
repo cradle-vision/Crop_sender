@@ -2,6 +2,8 @@
 
 Camera -> person detection (CPU binary) -> crop -> MinIO -> Kafka metadata -> backend -> Triton.
 
+Additionally (indoor store tracking): IoU tracker -> `store_tracking_positions` + face upper-third -> `triton_face_pipeline`. See [EDGE_INTEGRATION.md](EDGE_INTEGRATION.md).
+
 ## Current Sender Pipeline
 
 1. Camera frame capture (`sender/snapshot_capture_agent.py`)
@@ -13,6 +15,10 @@ Camera -> person detection (CPU binary) -> crop -> MinIO -> Kafka metadata -> ba
 4. JPEG encoding (`sender/jpeg_utils.py`)
    - TurboJPEG-only (single path).
 5. Upload to MinIO + publish Kafka metadata (`sender/kafka_sender_agent.py`)
+6. Store tracking (`sender/iou_tracker.py`, `sender/store_tracking.py`)
+   - Greedy IoU tracks with stable `track_id`
+   - Positions → `TRACKING_POSITIONS_TOPIC` (default `store_tracking_positions`), throttled per track
+   - Face upper-third crop → MinIO → `FACE_PIPELINE_TOPIC` (default `triton_face_pipeline`)
 
 ## Installation
 
@@ -26,6 +32,19 @@ Remote env updates and image rollout from the admin panel are documented in:
 
 - [docs/CI_CD_FLEET.md](docs/CI_CD_FLEET.md)
 - Backend: `Retail_Backend/docs/STORE_AGENT_FLEET_API.md`
+
+## Indoor store tracking
+
+Contract and verification: [EDGE_INTEGRATION.md](EDGE_INTEGRATION.md).
+
+```
+TRACKING_ENABLED=true
+TRACKING_POSITIONS_TOPIC=store_tracking_positions
+FACE_PIPELINE_TOPIC=triton_face_pipeline
+TRACKING_INTERVAL_MS=700
+```
+
+Requires `company_id` + `building_id` on each camera. After camera calibration, check `GET /company/{cid}/building/{bid}/positions/current`.
 
 ## Configuration
 
@@ -43,6 +62,7 @@ Common env vars (see `.env.example`):
 - `PERSON_CONF`
 - `PERSON_IOU`
 - `DEFAULT_FPS`, `CAM1_FPS`, ...
+- `TRACKING_ENABLED`, `TRACKING_POSITIONS_TOPIC`, `FACE_PIPELINE_TOPIC`, `TRACKING_INTERVAL_MS`
 
 Person detector assets required:
 - `cpu-person-detection/person_detection_linux_x64/bin/detect_main`
