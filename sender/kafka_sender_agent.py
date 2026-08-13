@@ -498,7 +498,7 @@ class KafkaSenderAgent:
                 )
             return True
 
-    def _send_kafka_payload(self, payload: dict, camera_key: str, topic: Optional[str] = None) -> None:
+    def _send_kafka_payload(self, payload: dict, camera_key: str) -> None:
         if not self._producer:
             raise RuntimeError("Kafka producer not connected")
 
@@ -511,10 +511,9 @@ class KafkaSenderAgent:
             delivery_done.set()
 
         value = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        dest = topic or self.topic
         with self._kafka_lock:
             self._producer.produce(
-                dest,
+                self.topic,
                 value=value,
                 key=camera_key.encode("utf-8"),
                 callback=_on_delivery,
@@ -532,101 +531,6 @@ class KafkaSenderAgent:
         self._sent_count += 1
         if self._sent_count % 50 == 0:
             print(f"[Kafka Sender Agent] Published {self._sent_count} messages")
-
-    def send_tracking_position(
-        self,
-        *,
-        topic: str,
-        camera_id: str,
-        company_id: str,
-        building_id: str,
-        track_id: str,
-        local_x: float,
-        local_y: float,
-        timestamp_ms: int,
-    ) -> bool:
-        """Publish foot-point position to store_tracking_positions (no MinIO, no disk buffer)."""
-        if not self._kafka_healthy:
-            return False
-        payload = {
-            "camera_id": str(camera_id),
-            "company_id": str(company_id),
-            "building_id": str(building_id),
-            "track_id": str(track_id)[:128],
-            "local_x": float(local_x),
-            "local_y": float(local_y),
-            "timestamp": int(timestamp_ms),
-        }
-        key = f"{camera_id}:{track_id}"
-        try:
-            self._send_kafka_payload(payload, key, topic=topic)
-            return True
-        except Exception as e:
-            self._mark_kafka_unhealthy(str(e))
-            return False
-
-    def send_face_pipeline(
-        self,
-        *,
-        topic: str,
-        frame: np.ndarray,
-        timestamp: float,
-        camera_id: str,
-        company_id: str,
-        building_id: str,
-        track_id: str,
-    ) -> bool:
-        """Upload face crop to MinIO and publish triton_face_pipeline metadata (+ track_id)."""
-        data = encode_jpeg_bgr(frame, quality=self.jpeg_quality)
-        if data is None:
-            return False
-
-        ts_ms = int(timestamp * 1000)
-        file_id = uuid.uuid4().hex[:8]
-        object_name = f"faces/{building_id}/{camera_id}/{ts_ms}_{file_id}.jpg"
-
-        uploaded = False
-        if self._use_minio:
-            if not self._minio_client:
-                self._connect_minio()
-            if self._minio_client:
-                try:
-                    self._minio_client.put_object(
-                        self._minio_bucket,
-                        object_name,
-                        data=io.BytesIO(data),
-                        length=len(data),
-                        content_type="image/jpeg",
-                    )
-                    uploaded = True
-                    self._minio_connected = True
-                except Exception as e:
-                    print(f"[Kafka Sender Agent] Face MinIO upload failed: {e}")
-                    self._minio_client = None
-                    self._minio_connected = False
-        if not uploaded:
-            return False
-
-        if not self._kafka_healthy:
-            return False
-
-        payload = {
-            "entity_type": "visitor",
-            "camera_id": str(camera_id),
-            "company_id": str(company_id),
-            "building_id": str(building_id),
-            "track_id": str(track_id)[:128],
-            "bucket": self._minio_bucket,
-            "object_key": object_name,
-            "timestamp": ts_ms,
-        }
-        key = f"{camera_id}:{track_id}"
-        try:
-            self._send_kafka_payload(payload, key, topic=topic)
-            return True
-        except Exception as e:
-            self._mark_kafka_unhealthy(str(e))
-            return False
 
     @staticmethod
     def _slug(value: Optional[str]) -> Optional[str]:

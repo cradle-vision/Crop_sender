@@ -29,7 +29,6 @@ from person_crop import detect_persons, crop_persons, is_available as person_det
 from jpeg_utils import encode_jpeg_bgr
 from roi_command_server import RoiCommandServer
 from roi_local_http import RoiLocalHttpServer
-from store_tracking import StoreTrackingPublisher
 
 # Project root on sys.path for agent_control (sender/main_agent.py entrypoint).
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -242,7 +241,6 @@ class MainAgent:
             minio_config=minio_config if minio_config.get('enabled') else None,
             resilience_config=resilience_config,
         )
-        self.store_tracking = StoreTrackingPublisher(self.sender_agent)
 
         # Detection: CPU person detection only (person_detect binary)
         self.person_conf = _env_float('PERSON_CONF', 0.60)
@@ -579,27 +577,6 @@ class MainAgent:
         crops = crop_persons(frame, rects)
         h, w = frame.shape[:2]
 
-        # Optional company/building/camera metadata for MinIO path and Kafka payload
-        company_id = getattr(camera, "company_id", None) if camera else None
-        building_id = getattr(camera, "building_id", None) if camera else None
-        company_name = getattr(camera, "company_name", None) if camera else None
-        building_name = getattr(camera, "building_name", None) if camera else None
-        camera_name = getattr(camera, "name", None) if camera else None
-
-        # Indoor tracking: IoU tracks → store_tracking_positions + triton_face_pipeline.
-        # Bboxes are already in original frame pixels (detect_persons stdin-bgr, no resize).
-        try:
-            self.store_tracking.process_frame(
-                frame,
-                timestamp,
-                camera_id,
-                company_id,
-                building_id,
-                rects,
-            )
-        except Exception as e:
-            print(f"[Main Agent] store tracking error camera={camera_id}: {e}")
-
         if self._sender_debug:
             if crops:
                 print(
@@ -629,6 +606,13 @@ class MainAgent:
                     )
                     st["since_log"] = now
                     st["frames"] = 0
+
+        # Optional company/building/camera metadata for MinIO path and Kafka payload
+        company_id = getattr(camera, "company_id", None) if camera else None
+        building_id = getattr(camera, "building_id", None) if camera else None
+        company_name = getattr(camera, "company_name", None) if camera else None
+        building_name = getattr(camera, "building_name", None) if camera else None
+        camera_name = getattr(camera, "name", None) if camera else None
 
         if not crops:
             return
