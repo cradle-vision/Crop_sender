@@ -44,6 +44,38 @@ if [[ -n "$IMAGE" ]]; then
 fi
 rm -f "${ENV_FILE}.bak"
 
+# Private GHCR: one org pull token (read:packages). Set via apply_env — not per-agent login.
+_load_env_val() {
+  local key="$1"
+  if [[ -n "${!key:-}" ]]; then
+    printf '%s' "${!key}"
+    return
+  fi
+  [[ -f "$ENV_FILE" ]] || return 0
+  local line
+  line="$(grep -E "^${key}=" "$ENV_FILE" | head -n1 || true)"
+  [[ -n "$line" ]] || return 0
+  line="${line#*=}"
+  line="${line%\"}"
+  line="${line#\"}"
+  printf '%s' "$line"
+}
+
+GHCR_TOKEN_VAL="$(_load_env_val GHCR_TOKEN)"
+if [[ -z "$GHCR_TOKEN_VAL" ]]; then
+  GHCR_TOKEN_VAL="$(_load_env_val GITHUB_TOKEN)"
+fi
+GHCR_USER_VAL="$(_load_env_val GHCR_USERNAME)"
+if [[ -z "$GHCR_USER_VAL" ]]; then
+  GHCR_USER_VAL="$(_load_env_val GITHUB_USERNAME)"
+fi
+GHCR_USER_VAL="${GHCR_USER_VAL:-token}"
+
+if [[ -n "$GHCR_TOKEN_VAL" ]]; then
+  echo "Logging in to ghcr.io as ${GHCR_USER_VAL}"
+  printf '%s' "$GHCR_TOKEN_VAL" | docker login ghcr.io -u "$GHCR_USER_VAL" --password-stdin
+fi
+
 echo "Pulling and restarting store agent version=${VERSION}"
 docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" pull
 docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --remove-orphans

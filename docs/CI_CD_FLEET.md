@@ -18,3 +18,18 @@ docker compose pull && docker compose up -d
 ```
 
 If admin sends only `version` (no `image`), the agent retags `AGENT_IMAGE` / default `ghcr.io/cradle-vision/crop-sender:<version>`.
+
+## GHCR pull (100 agents, no per-PC login)
+
+Package `crop-sender` is **private**; org policy disables Public/Internal visibility. Agents therefore cannot `docker compose pull` anonymously.
+
+Do **not** log in on each mini-PC. Use one org PAT (`read:packages`) and push it once via admin `apply_env`:
+
+```
+GHCR_USERNAME=<github user that owns the PAT>
+GHCR_TOKEN=<PAT with read:packages>
+```
+
+OTA (`software_update` / `scripts/update-agent.sh`) runs `docker login ghcr.io` before pull.
+
+To allow anonymous pull instead: org admin → Settings → Packages → enable public packages, then Change package visibility → Public.

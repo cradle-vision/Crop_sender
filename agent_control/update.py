@@ -13,6 +13,31 @@ logger = logging.getLogger(__name__)
 _DEFAULT_IMAGE_REPO = "ghcr.io/cradle-vision/crop-sender"
 
 
+def _ghcr_login() -> Tuple[bool, str]:
+    """Login to GHCR when the package is private. No-op if token missing."""
+    token = (os.getenv("GHCR_TOKEN") or os.getenv("GITHUB_TOKEN") or "").strip()
+    if not token:
+        return True, "skip"
+    user = (os.getenv("GHCR_USERNAME") or os.getenv("GITHUB_USERNAME") or "token").strip()
+    if not shutil.which("docker"):
+        return False, "docker CLI not found (needed for ghcr login)"
+    try:
+        completed = subprocess.run(
+            ["docker", "login", "ghcr.io", "-u", user, "--password-stdin"],
+            input=token,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except Exception as exc:
+        return False, f"ghcr login failed: {exc}"
+    if completed.returncode != 0:
+        err = (completed.stderr or completed.stdout or "ghcr login failed").strip()
+        return False, err[:500]
+    return True, "ok"
+
+
 def resolve_agent_image(version: str, image: Optional[str] = None) -> str:
     """
     Prefer explicit image; else retag AGENT_IMAGE / AGENT_IMAGE_REPO with version.
@@ -48,6 +73,9 @@ def run_software_update(
         return False, "missing version"
 
     resolved_image = resolve_agent_image(version, image)
+    login_ok, login_detail = _ghcr_login()
+    if not login_ok:
+        return False, f"ghcr login: {login_detail}"
     custom = (os.getenv("AGENT_UPDATE_CMD") or "").strip()
     if custom:
         env = os.environ.copy()

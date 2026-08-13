@@ -26,12 +26,16 @@ ALLOWED_ENV_KEYS: Set[str] = {
     # OTA pin
     "AGENT_VERSION",
     "AGENT_IMAGE",
+    # Private GHCR pull (same token for all stores — not a per-agent login)
+    "GHCR_TOKEN",
+    "GHCR_USERNAME",
 }
 
 SECRET_ENV_KEYS: Set[str] = {
     "BACKEND_CAMERAS_PASSWORD",
     "BACKEND_CAMERAS_TOKEN",
     "STREAMING_AGENT_TOKEN",
+    "GHCR_TOKEN",
 }
 
 _LINE_RE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
