@@ -1,6 +1,6 @@
 services:
   sender-crop:
-    image: ${AGENT_IMAGE:-ghcr.io/cradle-vision/crop-sender:latest}
+    image: ${AGENT_IMAGE:-ghcr.io/cradle-vision/crop-sender:main}
     build: .
     container_name: sender-crop
     restart: unless-stopped
@@ -38,7 +38,7 @@ services:
     network_mode: host
 
   streaming-agent:
-    image: ${AGENT_IMAGE:-ghcr.io/cradle-vision/crop-sender:latest}
+    image: ${AGENT_IMAGE:-ghcr.io/cradle-vision/crop-sender:main}
     build: .
     container_name: streaming-agent
     restart: unless-stopped
