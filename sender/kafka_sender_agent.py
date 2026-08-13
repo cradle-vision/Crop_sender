@@ -60,7 +60,7 @@ class KafkaSenderAgent:
         self._buffer_enabled = bool(rc.get("buffer_enabled", True))
         self._buffer_max_items = int(rc.get("buffer_max_items", 340000))
         self._buffer_dir = str(rc.get("buffer_dir", "/app/config/kafka_buffer"))
-        self._buffer_replay_batch = int(rc.get("buffer_replay_batch", 100))
+        self._buffer_replay_batch = int(rc.get("buffer_replay_batch", 1000))
         self._buffer_replay_max_rounds = int(rc.get("buffer_replay_max_rounds", 30))
         self._drain_poll_sec = float(rc.get("drain_poll_sec", 2))
         self._buffer_max_bytes = rc.get("buffer_max_bytes")
