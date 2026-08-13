@@ -8,7 +8,7 @@ import logging
 from typing import Any
 
 from agent_control.client import apply_env_message
-from agent_control.env_file import compute_env_hash, read_env_file
+from agent_control.env_file import compute_env_hash, filter_allowed_env, read_env_file
 from agent_control.update import run_software_update
 from streaming_agent.config import AgentConfig
 from streaming_agent.health_monitor import collect_metrics
@@ -276,7 +276,11 @@ class SignalingClient:
 
     async def _handle_apply_env(self, msg: dict[str, Any]) -> None:
         self._update_status = "applying"
-        ok, detail, reported = await asyncio.to_thread(apply_env_message, _env_path(), msg)
+        env_path = _env_path()
+        before = filter_allowed_env(read_env_file(env_path))
+        ok, detail, reported = await asyncio.to_thread(apply_env_message, env_path, msg)
+        after = filter_allowed_env(read_env_file(env_path))
+        changed = before != after
         self._update_status = "ok" if ok else "error"
         await self.send_json(
             {
@@ -290,16 +294,23 @@ class SignalingClient:
                 "reported_env": reported if ok else None,
             }
         )
-        if ok:
-            # Restart sender-crop too so both pick up new env_file values.
-            try:
-                await asyncio.to_thread(request_sender_restart)
-            except Exception as e:
-                logger.warning("sender restart after apply_env failed: %s", e)
-            logger.info("apply_env ok revision=%s — exiting for restart", msg.get("config_revision"))
-            await asyncio.sleep(1.0)
-            os_exit = __import__("os")._exit
-            os_exit(0)
+        if not ok:
+            return
+        if not changed:
+            logger.info(
+                "apply_env ok revision=%s — env unchanged, skip restart",
+                msg.get("config_revision"),
+            )
+            return
+        # Restart sender-crop too so both pick up new env_file values.
+        try:
+            await asyncio.to_thread(request_sender_restart)
+        except Exception as e:
+            logger.warning("sender restart after apply_env failed: %s", e)
+        logger.info("apply_env ok revision=%s — exiting for restart", msg.get("config_revision"))
+        await asyncio.sleep(1.0)
+        os_exit = __import__("os")._exit
+        os_exit(0)
 
     async def _handle_software_update(self, msg: dict[str, Any]) -> None:
         version = str(msg.get("version") or "").strip()
