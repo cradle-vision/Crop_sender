@@ -244,8 +244,8 @@ class MainAgent:
         )
 
         # Detection: CPU person detection only (person_detect binary)
-        self.person_conf = _env_float('PERSON_CONF', 0.60)
-        self.person_iou = _env_float('PERSON_IOU', 0.30)
+        self.person_conf = _env_float('PERSON_CONF', 0.4)
+        self.person_iou = _env_float('PERSON_IOU', 0.5)
         self.person_model_path = _env('PERSON_MODEL_PATH') or None
         if not person_detector_available():
             raise RuntimeError(

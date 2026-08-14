@@ -2,11 +2,16 @@
 Person detection via CPU person detection binary.
 Prefers bin/detect_main + LD_LIBRARY_PATH (no bash wrapper) to avoid fork storms:
 the shell script uses process substitution 2> >(grep ...) and exhausts PID limits under load.
+
+Keeps a long-lived detect_main per worker thread so the ONNX session is loaded once.
 """
 
+import atexit
 import os
 import re
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -70,6 +75,11 @@ _STDIN_MODE_CACHE: dict[str, bool] = {}
 _STDIN_MODE_WARNED = False
 _STDIN_MODE_ERROR: Optional[str] = None
 _TIMEOUT_SEC = float(os.environ.get("PERSON_DETECT_TIMEOUT_SEC", "120"))
+_FRAME_END = "__DETECT_END__"
+_tls = threading.local()
+_all_sessions: list["_PersistentDetector"] = []
+_all_sessions_lock = threading.Lock()
+_persistent_logged = False
 
 
 def _supports_stdin_bgr(binary: Path, lib_dir: Optional[Path]) -> bool:
@@ -102,6 +112,216 @@ def _supports_stdin_bgr(binary: Path, lib_dir: Optional[Path]) -> bool:
     return supported
 
 
+def _parse_rects(stdout_text: str, w: int, h: int, conf_threshold: float) -> List[Tuple[int, int, int, int]]:
+    rects: List[Tuple[int, int, int, int]] = []
+    for m in _BBOX_PATTERN.finditer(stdout_text):
+        x1, y1, x2, y2 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+        score = float(m.group(5))
+        if score < conf_threshold:
+            continue
+        x1 = max(0, min(x1, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        x2 = max(0, min(x2, w))
+        y2 = max(0, min(y2, h))
+        if x2 > x1 and y2 > y1:
+            rects.append((x1, y1, x2, y2))
+    return rects
+
+
+def _detect_cmd(
+    binary: Path,
+    model: Path,
+    w: int,
+    h: int,
+    line_params: Optional[Tuple[int, int, int, int, int, int]],
+    conf_threshold: float,
+    iou_threshold: float,
+) -> list:
+    cmd = [
+        str(binary),
+        str(model),
+        "--stdin-bgr",
+        "--width",
+        str(w),
+        "--height",
+        str(h),
+    ]
+    if line_params is not None:
+        x1, y1, x2, y2, ix, iy = line_params
+        cmd.extend(
+            [
+                "--line",
+                str(int(x1)),
+                str(int(y1)),
+                str(int(x2)),
+                str(int(y2)),
+                "--inside_point",
+                str(int(ix)),
+                str(int(iy)),
+            ]
+        )
+    cmd.extend([str(conf_threshold), str(iou_threshold)])
+    return cmd
+
+
+class _PersistentDetector:
+    """One detect_main process: load ONNX once, infer many frames."""
+
+    def __init__(
+        self,
+        binary: Path,
+        lib_dir: Optional[Path],
+        model: Path,
+        w: int,
+        h: int,
+        line_params: Optional[Tuple[int, int, int, int, int, int]],
+        conf_threshold: float,
+        iou_threshold: float,
+    ):
+        self.key = (w, h, line_params, conf_threshold, iou_threshold)
+        self.w = w
+        self.h = h
+        self.conf_threshold = conf_threshold
+        cmd = _detect_cmd(binary, model, w, h, line_params, conf_threshold, iou_threshold)
+        self.proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=_cwd_for_executable(binary),
+            env=_env_with_bundled_lib(lib_dir),
+            bufsize=0,
+        )
+        self._stderr_chunks: list[bytes] = []
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
+        self._lock = threading.Lock()
+
+    def _drain_stderr(self) -> None:
+        try:
+            assert self.proc.stderr is not None
+            while True:
+                block = self.proc.stderr.read(4096)
+                if not block:
+                    break
+                self._stderr_chunks.append(block)
+                if sum(len(c) for c in self._stderr_chunks) > 16000:
+                    del self._stderr_chunks[:-4]
+        except Exception:
+            pass
+
+    def _stderr_tail(self) -> str:
+        return _filter_stderr(b"".join(self._stderr_chunks).decode("utf-8", errors="replace").strip())
+
+    def alive(self) -> bool:
+        return self.proc.poll() is None and self.proc.stdin is not None and self.proc.stdout is not None
+
+    def close(self) -> None:
+        proc = self.proc
+        if proc.stdin:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    def detect(self, frame: np.ndarray) -> Optional[List[Tuple[int, int, int, int]]]:
+        """Returns rects, or None if the process died / protocol failed (caller should respawn)."""
+        if not self.alive():
+            return None
+        payload = np.ascontiguousarray(frame, dtype=np.uint8).tobytes()
+        expected = self.w * self.h * 3
+        if len(payload) != expected:
+            return []
+        with self._lock:
+            try:
+                assert self.proc.stdin is not None
+                assert self.proc.stdout is not None
+                self.proc.stdin.write(payload)
+                self.proc.stdin.flush()
+            except BrokenPipeError:
+                return None
+            deadline = time.monotonic() + _TIMEOUT_SEC
+            lines: list[str] = []
+            while time.monotonic() < deadline:
+                if self.proc.poll() is not None:
+                    err = self._stderr_tail()
+                    if err:
+                        print(f"[PersonDetector] detect_main exited: {err[:500]}")
+                    return None
+                line = self.proc.stdout.readline()
+                if not line:
+                    return None
+                text = line.decode("utf-8", errors="replace").strip()
+                if text == _FRAME_END:
+                    return _parse_rects("\n".join(lines), self.w, self.h, self.conf_threshold)
+                if text:
+                    lines.append(text)
+            print(
+                f"[PersonDetector] person_detect timeout after {_TIMEOUT_SEC}s "
+                f"for frame {self.w}x{self.h} (persistent worker)"
+            )
+            self.close()
+            return None
+
+
+def _close_all_sessions() -> None:
+    with _all_sessions_lock:
+        sessions = list(_all_sessions)
+        _all_sessions.clear()
+    for s in sessions:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+atexit.register(_close_all_sessions)
+
+
+def _session_for(
+    binary: Path,
+    lib_dir: Optional[Path],
+    model: Path,
+    w: int,
+    h: int,
+    line_params: Optional[Tuple[int, int, int, int, int, int]],
+    conf_threshold: float,
+    iou_threshold: float,
+) -> _PersistentDetector:
+    key = (w, h, line_params, conf_threshold, iou_threshold)
+    sess: Optional[_PersistentDetector] = getattr(_tls, "detector", None)
+    if sess is not None and sess.key == key and sess.alive():
+        return sess
+    if sess is not None:
+        sess.close()
+        with _all_sessions_lock:
+            if sess in _all_sessions:
+                _all_sessions.remove(sess)
+    sess = _PersistentDetector(
+        binary, lib_dir, model, w, h, line_params, conf_threshold, iou_threshold
+    )
+    _tls.detector = sess
+    with _all_sessions_lock:
+        _all_sessions.append(sess)
+    global _persistent_logged
+    if not _persistent_logged:
+        _persistent_logged = True
+        print(
+            "[PersonDetector] Persistent detect_main (ONNX loaded once per worker, "
+            f"reuse stdin frames). First worker {w}x{h}"
+        )
+    return sess
+
+
 def detect_persons(
     frame: np.ndarray,
     model_path: Optional[str] = None,
@@ -110,8 +330,7 @@ def detect_persons(
     line_params: Optional[Tuple[int, int, int, int, int, int]] = None,
 ) -> List[Tuple[int, int, int, int]]:
     """
-    Detect persons using detect_main.
-    Sends raw BGR frame through stdin to detect_main, parses stdout.
+    Detect persons using a long-lived detect_main (model loaded once per worker).
     Returns list of (x1, y1, x2, y2).
     """
     binary, lib_dir = _resolve_detect_executable()
@@ -143,71 +362,19 @@ def detect_persons(
     h, w = frame.shape[:2]
     if w == 0 or h == 0:
         return []
-    frame_input = np.ascontiguousarray(frame, dtype=np.uint8)
-    cmd = [
-        str(binary),
-        str(model),
-        "--stdin-bgr",
-        "--width",
-        str(w),
-        "--height",
-        str(h),
-    ]
-    if line_params is not None:
-        x1, y1, x2, y2, ix, iy = line_params
-        cmd.extend(
-            [
-                "--line",
-                str(int(x1)),
-                str(int(y1)),
-                str(int(x2)),
-                str(int(y2)),
-                "--inside_point",
-                str(int(ix)),
-                str(int(iy)),
-            ]
-        )
-    cmd.extend([str(conf_threshold), str(iou_threshold)])
 
-    try:
-        out = subprocess.run(
-            cmd,
-            input=frame_input.tobytes(),
-            capture_output=True,
-            text=False,
-            timeout=_TIMEOUT_SEC,
-            cwd=_cwd_for_executable(binary),
-            env=_env_with_bundled_lib(lib_dir),
-        )
-    except subprocess.TimeoutExpired:
-        print(
-            f"[PersonDetector] person_detect timeout after {_TIMEOUT_SEC}s "
-            f"for frame {w}x{h}. "
-            "Set PERSON_DETECT_TIMEOUT_SEC or use lower-resolution camera stream if CPU is overloaded."
-        )
-        return []
-    if out.returncode != 0:
-        stderr_text = (out.stderr or b"").decode("utf-8", errors="replace")
-        stdout_text = (out.stdout or b"").decode("utf-8", errors="replace")
-        err = _filter_stderr((stderr_text or stdout_text).strip())
-        if err:
-            print(f"[PersonDetector] person_detect failed (code {out.returncode}): {err[:500]}")
-        return []
-
-    stdout_text = (out.stdout or b"").decode("utf-8", errors="replace")
-    rects = []
-    for m in _BBOX_PATTERN.finditer(stdout_text):
-        x1, y1, x2, y2 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
-        score = float(m.group(5))
-        if score < conf_threshold:
-            continue
-        x1 = max(0, min(x1, w - 1))
-        y1 = max(0, min(y1, h - 1))
-        x2 = max(0, min(x2, w))
-        y2 = max(0, min(y2, h))
-        if x2 > x1 and y2 > y1:
-            rects.append((x1, y1, x2, y2))
-    return rects
+    sess = _session_for(binary, lib_dir, model, w, h, line_params, conf_threshold, iou_threshold)
+    rects = sess.detect(frame)
+    if rects is not None:
+        return rects
+    sess.close()
+    with _all_sessions_lock:
+        if sess in _all_sessions:
+            _all_sessions.remove(sess)
+    _tls.detector = None
+    sess = _session_for(binary, lib_dir, model, w, h, line_params, conf_threshold, iou_threshold)
+    rects = sess.detect(frame)
+    return rects if rects is not None else []
 
 
 def crop_persons(

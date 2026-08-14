@@ -3,7 +3,8 @@
  * Uses YOLOv8 ONNX (person only), CPU.
  * Default: input image -> print bbox (x1,y1,x2,y2) and score to stdout.
  * With --draw: input image -> output image with boxes drawn.
- * With --stdin-bgr: raw BGR frame from stdin (--width/--height required).
+ * With --stdin-bgr: raw BGR frames from stdin until EOF (--width/--height required).
+ * Model is loaded once; each frame is followed by a __DETECT_END__ line on stdout.
  * Optional: --line x1 y1 x2 y2 --inside_point ix iy (store-front / tripwire filter).
  * With --benchmark <input_dir>: run on all images in folder, report FPS.
  * Usage: detect_main <model.onnx> <input_image> [--draw <out>] [--line ... --inside_point ...] [conf] [iou]
@@ -178,7 +179,8 @@ int main(int argc, char* argv[]) {
               << "       " << argv[0] << " <model.onnx> --benchmark <input_dir> [conf] [iou]\n"
               << "  Default: print bbox (x1,y1,x2,y2) and score to stdout.\n"
               << "  --draw: draw boxes and save to <output_image>.\n"
-              << "  --stdin-bgr: read one raw BGR frame from stdin.\n"
+              << "  --stdin-bgr: read raw BGR frames from stdin until EOF (model loaded once).\n"
+              << "    After each frame, print detections then a __DETECT_END__ line.\n"
               << "  Optional store-front filter (image or stdin): --line x1 y1 x2 y2 --inside_point ix iy\n"
               << "    Keeps only persons whose bbox bottom-center is on the same side as --inside_point.\n"
               << "  --benchmark: run on all images in <input_dir>, report FPS.\n"
@@ -290,19 +292,6 @@ int main(int argc, char* argv[]) {
 
     const size_t frame_size = static_cast<size_t>(width) * static_cast<size_t>(height) * 3;
     std::vector<unsigned char> buf(frame_size);
-    std::cin.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(frame_size));
-    const auto read_count = static_cast<size_t>(std::cin.gcount());
-    if (read_count != frame_size) {
-      std::cerr << "[main] Failed to read raw frame from stdin: expected "
-                << frame_size << " bytes, got " << read_count << std::endl;
-      return 1;
-    }
-
-    cv::Mat image(height, width, CV_8UC3, buf.data());
-    if (image.empty()) {
-      std::cerr << "[main] Failed to construct BGR image from stdin buffer" << std::endl;
-      return 1;
-    }
 
     Detector detector;
     if (!detector.load(model_path)) {
@@ -311,16 +300,47 @@ int main(int argc, char* argv[]) {
     }
     detector.setConfidenceThreshold(conf);
     detector.setIouThreshold(iou);
+    std::cerr << "[main] model loaded; reading stdin frames " << width << "x" << height << std::endl;
 
-    std::vector<Detection> detections = detector.detect(image);
-    applyStoreLineFilter(detections, has_store_line, has_inside_point, store_line, inside_sign);
-    for (size_t i = 0; i < detections.size(); ++i) {
-      const auto& d = detections[i];
-      std::cout << "bbox (x1,y1,x2,y2)=(" << static_cast<int>(d.x1) << ","
-                << static_cast<int>(d.y1) << "," << static_cast<int>(d.x2) << ","
-                << static_cast<int>(d.y2) << ") score=" << d.score << std::endl;
+    auto read_exact = [&](size_t n) -> bool {
+      size_t got = 0;
+      while (got < n) {
+        std::cin.read(reinterpret_cast<char*>(buf.data() + got),
+                      static_cast<std::streamsize>(n - got));
+        auto chunk = static_cast<size_t>(std::cin.gcount());
+        if (chunk == 0) {
+          return false;
+        }
+        got += chunk;
+      }
+      return true;
+    };
+
+    while (true) {
+      if (!read_exact(frame_size)) {
+        if (std::cin.eof() || std::cin.fail()) {
+          return 0;
+        }
+        std::cerr << "[main] Failed to read raw frame from stdin\n";
+        return 1;
+      }
+
+      cv::Mat image(height, width, CV_8UC3, buf.data());
+      if (image.empty()) {
+        std::cerr << "[main] Failed to construct BGR image from stdin buffer" << std::endl;
+        return 1;
+      }
+
+      std::vector<Detection> detections = detector.detect(image);
+      applyStoreLineFilter(detections, has_store_line, has_inside_point, store_line, inside_sign);
+      for (size_t i = 0; i < detections.size(); ++i) {
+        const auto& d = detections[i];
+        std::cout << "bbox (x1,y1,x2,y2)=(" << static_cast<int>(d.x1) << ","
+                  << static_cast<int>(d.y1) << "," << static_cast<int>(d.x2) << ","
+                  << static_cast<int>(d.y2) << ") score=" << d.score << "\n";
+      }
+      std::cout << "__DETECT_END__\n" << std::flush;
     }
-    return 0;
   }
 
   const std::string input_path = arg2;
