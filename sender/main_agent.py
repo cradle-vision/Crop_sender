@@ -25,6 +25,7 @@ except ImportError:
 from snapshot_capture_agent import SnapshotCaptureAgent
 from kafka_sender_agent import KafkaSenderAgent
 from camera_manager import CameraManager
+from camera_net import find_ip_for_mac, learn_mac_for_ip, normalize_mac
 from person_crop import detect_persons, crop_persons, is_available as person_detector_available
 from jpeg_utils import encode_jpeg_bgr
 from roi_command_server import RoiCommandServer
@@ -110,13 +111,26 @@ class MainAgent:
         self._roi_http_server: Optional[RoiLocalHttpServer] = None
         self._roi_socket_path = _env('SENDER_ROI_SOCKET_PATH') or '/app/config/sender-roi.sock'
         self._roi_http_port = _env_int('SENDER_ROI_HTTP_PORT', 18765, 1, 65535)
+        self._health_interval = max(60.0, _env_float("CAMERA_HEALTH_INTERVAL_SEC", 21600.0))
+        self._health_tick_sec = max(15.0, _env_float("CAMERA_HEALTH_TICK_SEC", 60.0))
+        self._mac_learn = _env_bool("CAMERA_MAC_LEARN", True)
+        self._mac_recovery = _env_bool("CAMERA_MAC_RECOVERY", True)
+        self._mac_scan_cooldown = max(30.0, _env_float("CAMERA_MAC_SCAN_COOLDOWN_SEC", 300.0))
+        self._health_stop = threading.Event()
+        self._health_thread: Optional[threading.Thread] = None
+        self._mac_scan_last: Dict[str, float] = {}
+        self._recovered_ip: Dict[str, str] = {}
+        self._health_endpoint_missing = False
+        self._network_endpoint_missing = False
+        self._agent_http_unauthorized = False
+        self._network_conflict_cams: Dict[str, str] = {}
         backend_timeout = _env_float('BACKEND_CAMERAS_TIMEOUT', 10.0)
 
         # Camera manager: from backend API or from file
         backend_cameras_url = _env('BACKEND_CAMERAS_URL')
         cameras_config = _env('CAMERAS_CONFIG_PATH') or cameras_config_path or 'cameras.yaml'
         cameras_config = self._resolve_path(cameras_config)
-        self.camera_manager = CameraManager(config_file=cameras_config if not backend_cameras_url else "", auto_save=False)
+        self.camera_manager = CameraManager(config_file=cameras_config, auto_save=False)
         if backend_cameras_url:
             token = _env('BACKEND_CAMERAS_TOKEN')
             if not token:
@@ -389,6 +403,7 @@ class MainAgent:
             self.camera_manager.config_file = cameras_config
             self.camera_manager.save_cameras()
             print(f"[Main Agent] reload_cameras: {len(self.camera_manager.cameras)} camera(s) from backend")
+            self._reapply_recovered_ips()
         else:
             self.camera_manager.config_file = cameras_config
             self.camera_manager.reload()
@@ -521,6 +536,7 @@ class MainAgent:
             ).start()
         self._start_roi_command_server()
         self._start_roi_poll_fallback()
+        self._start_camera_health_loop()
         print(f"[Main Agent] System started and running. Active cameras: {len(self.capture_agents)}")
         
         # Main loop
@@ -638,6 +654,309 @@ class MainAgent:
         if latest:
             return latest
         return datetime.now(timezone.utc).isoformat()
+
+    def _start_camera_health_loop(self) -> None:
+        if not self._mac_learn and not self._mac_recovery and self._health_interval <= 0:
+            return
+        print(
+            f"[Main Agent] Camera MAC learn={self._mac_learn} recovery={self._mac_recovery}; "
+            f"health report every {self._health_interval:.0f}s"
+        )
+        if not self._agent_auth_headers() or not self._agent_id():
+            print(
+                "[Main Agent] MAC/health HTTP disabled until STREAMING_AGENT_ID and "
+                "STREAMING_AGENT_TOKEN are set (same key as /ws/agents)"
+            )
+        self._health_thread = threading.Thread(
+            target=self._camera_health_loop,
+            name="camera-health",
+            daemon=True,
+        )
+        self._health_thread.start()
+
+    def _camera_health_loop(self) -> None:
+        first_report_at = time.monotonic() + min(120.0, max(30.0, self._health_tick_sec * 2))
+        next_report_at = first_report_at
+        while self.running and not self._health_stop.wait(self._health_tick_sec):
+            try:
+                self._learn_camera_macs()
+                if self._mac_recovery:
+                    self._recover_cameras_by_mac()
+                now = time.monotonic()
+                if now >= next_report_at:
+                    self._post_camera_health()
+                    next_report_at = now + self._health_interval
+            except Exception as e:
+                print(f"[Main Agent] Camera health loop error: {e}")
+
+    def _learn_camera_macs(self) -> None:
+        if not self._mac_learn:
+            return
+        changed = False
+        for camera in self.camera_manager.get_enabled_cameras():
+            if normalize_mac(getattr(camera, "mac_address", None)):
+                continue
+            agent = self.capture_agents.get(camera.camera_id)
+            if agent is None or not getattr(agent, "_stream_healthy", False):
+                continue
+            ip = (camera.ip_address or "").strip()
+            if not ip:
+                continue
+            mac = learn_mac_for_ip(
+                ip,
+                port=int(camera.port or 554),
+                username=camera.username,
+                password=camera.password,
+            )
+            if not mac:
+                continue
+            camera.mac_address = mac
+            changed = True
+            print(f"[Main Agent] Saved MAC for camera {camera.camera_id}: {mac}")
+            self._post_camera_network(camera, reason="mac_learned", previous_ip=ip)
+        if changed:
+            self.camera_manager.save_cameras()
+
+    def _recover_cameras_by_mac(self) -> None:
+        now = time.monotonic()
+        skip_ips = {
+            str(c.ip_address).strip()
+            for c in self.camera_manager.get_enabled_cameras()
+            if c.ip_address
+        }
+        for camera in self.camera_manager.get_enabled_cameras():
+            agent = self.capture_agents.get(camera.camera_id)
+            if agent is None or getattr(agent, "_stream_healthy", False):
+                continue
+            mac = normalize_mac(getattr(camera, "mac_address", None))
+            if not mac:
+                continue
+            last = self._mac_scan_last.get(camera.camera_id, 0.0)
+            if now - last < self._mac_scan_cooldown:
+                continue
+            self._mac_scan_last[camera.camera_id] = now
+            print(
+                f"[Main Agent] Camera {camera.camera_id} offline; "
+                f"scanning LAN for MAC {mac}"
+            )
+            new_ip = find_ip_for_mac(
+                mac,
+                hint_ip=camera.ip_address,
+                port=int(camera.port or 554),
+                skip_ips=skip_ips - {str(camera.ip_address or "").strip()},
+            )
+            if not new_ip:
+                print(f"[Main Agent] Camera {camera.camera_id}: MAC {mac} not found on LAN")
+                continue
+            if new_ip == (camera.ip_address or "").strip():
+                continue
+            old_ip = camera.ip_address
+            if not self.camera_manager.apply_discovered_ip(camera.camera_id, new_ip, mac):
+                continue
+            self._recovered_ip[camera.camera_id] = new_ip
+            skip_ips.add(new_ip)
+            self.camera_manager.save_cameras()
+            print(
+                f"[Main Agent] Camera {camera.camera_id} recovered {old_ip} -> {new_ip}; "
+                "restarting capture and notifying backend"
+            )
+            self._sync_capture_agents()
+            self._post_camera_network(camera, reason="mac_rediscovery", previous_ip=old_ip)
+
+    def _reapply_recovered_ips(self) -> None:
+        for camera_id, new_ip in list(self._recovered_ip.items()):
+            camera = self.camera_manager.get_camera(camera_id)
+            if not camera:
+                continue
+            if (camera.ip_address or "").strip() == new_ip:
+                continue
+            old_ip = camera.ip_address
+            print(
+                f"[Main Agent] Backend still has old IP for camera {camera_id}; "
+                f"keeping recovered {new_ip}"
+            )
+            self.camera_manager.apply_discovered_ip(
+                camera_id, new_ip, getattr(camera, "mac_address", None)
+            )
+            self.camera_manager.save_cameras()
+            self._post_camera_network(camera, reason="mac_rediscovery_repeat", previous_ip=old_ip)
+
+    def _camera_health_items(self) -> list:
+        items = []
+        now = time.time()
+        for camera in self.camera_manager.get_enabled_cameras():
+            agent = self.capture_agents.get(camera.camera_id)
+            healthy = bool(agent and getattr(agent, "_stream_healthy", False))
+            last_frame = getattr(agent, "last_frame_unix", 0.0) if agent else 0.0
+            last_error = getattr(agent, "last_error", "") if agent else "capture not started"
+            if not agent:
+                status = "not_healthy"
+                reason = "capture agent not running"
+            elif healthy:
+                status = "healthy"
+                reason = None
+            else:
+                status = "not_healthy"
+                reason = last_error or "rtsp unreachable"
+            items.append({
+                "smartcamera_id": self._json_camera_id(camera.camera_id),
+                "name": camera.name,
+                "healthy": healthy,
+                "status": status,
+                "reason": reason,
+                "ip_address": camera.ip_address,
+                "mac_address": normalize_mac(getattr(camera, "mac_address", None)),
+                "last_frame_at": (
+                    datetime.fromtimestamp(last_frame, tz=timezone.utc).isoformat()
+                    if last_frame
+                    else None
+                ),
+                "offline_seconds": None if healthy or not last_frame else max(0, int(now - last_frame)),
+            })
+        return items
+
+    def _agent_id(self) -> str:
+        return _env("STREAMING_AGENT_ID") or _env("AGENT_ID")
+
+    def _agent_auth_headers(self) -> Optional[Dict[str, str]]:
+        token = _env("STREAMING_AGENT_TOKEN") or _env("AGENT_TOKEN")
+        if not token:
+            return None
+        return {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
+
+    @staticmethod
+    def _json_camera_id(camera_id) -> Union[int, str]:
+        s = str(camera_id).strip()
+        return int(s) if s.isdigit() else s
+
+    @staticmethod
+    def _path_camera_id(camera_id) -> str:
+        s = str(camera_id).strip()
+        return str(int(s)) if s.isdigit() else s
+
+    def _post_camera_health(self) -> None:
+        if self._health_endpoint_missing or self._agent_http_unauthorized or not HAS_REQUESTS:
+            return
+        headers = self._agent_auth_headers()
+        agent_id = self._agent_id()
+        if not headers or not agent_id:
+            return
+        company_id = self._company_id_for_backend()
+        if not company_id or not self.backend_snapshot_base_url:
+            return
+        url = (
+            _env("BACKEND_CAMERA_HEALTH_URL")
+            or f"{self.backend_snapshot_base_url.rstrip('/')}/company/{company_id}/camera/smartcamera/health"
+        )
+        payload = {
+            "agent_id": agent_id,
+            "reported_at": datetime.now(timezone.utc).isoformat(),
+            "cameras": self._camera_health_items(),
+        }
+        try:
+            resp = requests.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=max(5.0, _env_float("BACKEND_CAMERAS_TIMEOUT", 10.0)),
+                verify=False,
+            )
+        except Exception as e:
+            print(f"[Main Agent] Camera health POST failed: {e}")
+            return
+        if resp.status_code in (401, 403):
+            self._agent_http_unauthorized = True
+            print(
+                "[Main Agent] Camera health/network rejected agent token "
+                f"(HTTP {resp.status_code}). Check STREAMING_AGENT_ID / STREAMING_AGENT_TOKEN."
+            )
+            return
+        if resp.status_code in (404, 405):
+            self._health_endpoint_missing = True
+            print(
+                f"[Main Agent] Camera health endpoint not available ({resp.status_code}). "
+                "Local tracking continues."
+            )
+            return
+        if resp.status_code >= 400:
+            print(f"[Main Agent] Camera health POST HTTP {resp.status_code}: {resp.text[:200]}")
+            return
+        healthy_n = sum(1 for c in payload["cameras"] if c.get("healthy"))
+        print(
+            f"[Main Agent] Camera health reported: {healthy_n}/{len(payload['cameras'])} healthy"
+        )
+
+    def _post_camera_network(self, camera, *, reason: str, previous_ip: Optional[str]) -> None:
+        if self._network_endpoint_missing or self._agent_http_unauthorized or not HAS_REQUESTS:
+            return
+        cam_key = str(camera.camera_id)
+        if cam_key in self._network_conflict_cams:
+            return
+        headers = self._agent_auth_headers()
+        agent_id = self._agent_id()
+        if not headers or not agent_id:
+            return
+        company_id = getattr(camera, "company_id", None) or self._company_id_for_backend()
+        if not company_id or not self.backend_snapshot_base_url:
+            return
+        path_id = self._path_camera_id(camera.camera_id)
+        url = (
+            _env("BACKEND_CAMERA_NETWORK_URL")
+            or (
+                f"{self.backend_snapshot_base_url.rstrip('/')}"
+                f"/company/{company_id}/smartcamera/{path_id}/network"
+            )
+        )
+        payload = {
+            "mac_address": normalize_mac(getattr(camera, "mac_address", None)),
+            "ip_address": camera.ip_address,
+            "previous_ip_address": previous_ip,
+            "reason": reason,
+            "agent_id": agent_id,
+            "reported_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            resp = requests.patch(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=max(5.0, _env_float("BACKEND_CAMERAS_TIMEOUT", 10.0)),
+                verify=False,
+            )
+        except Exception as e:
+            print(f"[Main Agent] Camera network PATCH failed: {e}")
+            return
+        if resp.status_code in (401, 403):
+            self._agent_http_unauthorized = True
+            print(
+                "[Main Agent] Camera network rejected agent token "
+                f"(HTTP {resp.status_code}). Check STREAMING_AGENT_ID / STREAMING_AGENT_TOKEN."
+            )
+            return
+        if resp.status_code in (404, 405):
+            self._network_endpoint_missing = True
+            print(
+                f"[Main Agent] Camera network endpoint not available ({resp.status_code}). "
+                "Local cameras.yaml still has the new IP/MAC."
+            )
+            return
+        if resp.status_code == 409:
+            self._network_conflict_cams[cam_key] = payload.get("mac_address") or ""
+            print(
+                f"[Main Agent] Camera {path_id} network update conflict (409): "
+                f"{(resp.text or '')[:200]}. Local IP/MAC kept; not overwriting backend MAC."
+            )
+            return
+        if resp.status_code >= 400:
+            print(f"[Main Agent] Camera network PATCH HTTP {resp.status_code}: {resp.text[:200]}")
+            return
+        print(
+            f"[Main Agent] Backend network update for camera {path_id}: "
+            f"{previous_ip} -> {camera.ip_address} mac={payload['mac_address']}"
+        )
 
     def _company_id_for_backend(self) -> Optional[str]:
         for camera in self.camera_manager.get_enabled_cameras():
@@ -897,6 +1216,9 @@ class MainAgent:
         self._roi_sync_stop.set()
         if self._roi_sync_thread and self._roi_sync_thread.is_alive():
             self._roi_sync_thread.join(timeout=5.0)
+        self._health_stop.set()
+        if self._health_thread and self._health_thread.is_alive():
+            self._health_thread.join(timeout=5.0)
         
         # Stop all capture agents
         for camera_id, capture_agent in self.capture_agents.items():

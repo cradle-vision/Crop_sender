@@ -11,6 +11,7 @@ cameras:
     source: "rtsp://admin:password123@192.168.1.100:554/stream1"
     type: "rtsp"
     ip_address: "192.168.1.100"
+    mac_address: "aa:bb:cc:dd:ee:ff"   # optional; sender also learns and persists this
     port: 554
     rtsp_path: "/stream1"
     username: "admin"

@@ -17,6 +17,7 @@ class CameraInfo:
     source: Union[int, str]  # URL/path for stream source
     type: str  # 'rtsp', 'http', 'file'
     ip_address: Optional[str] = None
+    mac_address: Optional[str] = None
     port: Optional[int] = None
     username: Optional[str] = None
     password: Optional[str] = None
@@ -61,6 +62,11 @@ class CameraManager:
     
     def load_cameras_from_data(self, data: dict) -> None:
         """Load cameras from dict (same structure as YAML or API: { 'cameras': [ {...}, ... ] })."""
+        previous_macs = {
+            cid: getattr(cam, "mac_address", None)
+            for cid, cam in self.cameras.items()
+            if getattr(cam, "mac_address", None)
+        }
         self.cameras = {}
         cameras_list = data.get('cameras')
         if not isinstance(cameras_list, list):
@@ -160,6 +166,15 @@ class CameraManager:
             # ip_address: backend uses device_ip
             if 'device_ip' in out and out.get('device_ip') and not out.get('ip_address'):
                 out['ip_address'] = str(out['device_ip']).strip()
+            mac_raw = _pick(out, (
+                "mac_address", "macAddress", "device_mac", "deviceMac", "mac", "mac_addr",
+            ))
+            if mac_raw:
+                try:
+                    from camera_net import normalize_mac
+                    out["mac_address"] = normalize_mac(str(mac_raw))
+                except Exception:
+                    out["mac_address"] = str(mac_raw).strip() or None
             # username / password: backend uses login / password
             if 'login' in out and out.get('login') and not out.get('username'):
                 out['username'] = str(out['login']).strip()
@@ -235,10 +250,12 @@ class CameraManager:
                 filtered['type'] = 'rtsp'
             if not filtered.get('name'):
                 filtered['name'] = filtered.get('camera_id') or 'camera'
+            if not filtered.get("mac_address"):
+                filtered["mac_address"] = previous_macs.get(str(filtered.get("camera_id")))
             try:
                 camera = CameraInfo(**filtered)
                 self.cameras[camera.camera_id] = camera
-                print(f"[Camera Manager] Mapped backend camera: id={camera.camera_id}, name={camera.name}, source={repr(camera.source)[:60]}")
+                print(f"[Camera Manager] Mapped backend camera: id={camera.camera_id}, name={camera.name}, ip={camera.ip_address}, mac={getattr(camera, 'mac_address', None) or '-'}")
             except Exception as e:
                 print(f"[Camera Manager] Skip camera {cam_data.get('camera_id', '?')}: {e}")
         if len(self.cameras) == 0 and cameras_list:
@@ -479,6 +496,34 @@ class CameraManager:
         if self.auto_save:
             self.save_cameras()
         
+        return True
+
+    def apply_discovered_ip(self, camera_id: str, new_ip: str, mac_address: Optional[str] = None) -> bool:
+        """Rewrite local RTSP/HTTP source after MAC-based IP rediscovery."""
+        camera = self.cameras.get(camera_id)
+        if not camera:
+            return False
+        new_ip = str(new_ip or "").strip()
+        if not new_ip:
+            return False
+        try:
+            from camera_net import normalize_mac, replace_host_in_url
+        except ImportError:
+            from sender.camera_net import normalize_mac, replace_host_in_url  # type: ignore
+        old_ip = camera.ip_address
+        camera.ip_address = new_ip
+        if isinstance(camera.source, str) and camera.source:
+            camera.source = replace_host_in_url(camera.source, old_ip, new_ip)
+        else:
+            camera.source = self._build_source_url(camera)
+        if mac_address:
+            camera.mac_address = normalize_mac(mac_address) or camera.mac_address
+        if self.auto_save:
+            self.save_cameras()
+        print(
+            f"[Camera Manager] Camera {camera_id} IP updated {old_ip} -> {new_ip} "
+            f"mac={camera.mac_address or '-'}"
+        )
         return True
 
     def apply_roi_sync(

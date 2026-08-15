@@ -164,6 +164,8 @@ class SnapshotCaptureAgent:
         else:
             self._frame_stall_sec = 25.0
         self._stream_healthy = False
+        self.last_error = ""
+        self.last_frame_unix = 0.0
         self._last_offline_log = 0.0
         self._last_frame_at = time.monotonic()
         self._last_good_resolution: Tuple[int, int] = (0, 0)
@@ -455,6 +457,7 @@ class SnapshotCaptureAgent:
             )
 
     def _mark_stream_lost(self, reason: str) -> None:
+        self.last_error = reason or "stream lost"
         if self._stream_healthy:
             print(f"[Capture Agent {self.camera_id}] Stream lost ({reason})")
         self._stream_healthy = False
@@ -463,6 +466,8 @@ class SnapshotCaptureAgent:
         if not self._stream_healthy:
             print(f"[Capture Agent {self.camera_id}] Stream restored — camera back online")
         self._stream_healthy = True
+        self.last_error = ""
+        self.last_frame_unix = time.time()
         self._last_offline_log = 0.0
 
     def _capture_loop_ffmpeg(self):
@@ -509,6 +514,7 @@ class SnapshotCaptureAgent:
                         self._last_good_resolution = (w, h)
                     self._mark_stream_restored()
                     current_time = time.time()
+                    self.last_frame_unix = current_time
                     if self.callback is not None:
                         frame = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3)).copy()
                         self._offer_processing((current_time, frame))
