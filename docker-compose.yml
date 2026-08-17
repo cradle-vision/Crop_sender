@@ -10,9 +10,11 @@ services:
       - ./config:/app/config:rw
       # File bind-mount keeps host .env in sync with remote apply_env (write is in-place).
       - ./.env:/app/.env:rw
-      # Optional OTA: uncomment to allow software_update from admin
-      # - /var/run/docker.sock:/var/run/docker.sock
-      # - ./:/opt/crop_sender:ro
+      # OTA: host docker CLI + sock so software_update can pull/recreate
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/docker:/usr/bin/docker:ro
+      - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro
+      - ./:/opt/crop_sender:ro
     env_file:
       - .env
     environment:
@@ -25,7 +27,7 @@ services:
       - AGENT_CONTROL_ENABLED=${AGENT_CONTROL_ENABLED:-true}
       # Streaming profile: streaming-agent claims config/.agent_ws_owner; sender skips WS automatically.
       - AGENT_COMPOSE_DIR=${AGENT_COMPOSE_DIR:-/opt/crop_sender}
-      - AGENT_UPDATE_CMD=${AGENT_UPDATE_CMD:-}
+      - AGENT_UPDATE_CMD=${AGENT_UPDATE_CMD:-bash /opt/crop_sender/scripts/update-agent.sh}
     network_mode: host
 
   mediamtx:
@@ -50,8 +52,10 @@ services:
       - ./config:/app/config:rw
       - ./.env:/app/.env:rw
       - ./streaming_agent/streaming-agent.yaml.example:/app/streaming-agent.yaml:ro
-      # - /var/run/docker.sock:/var/run/docker.sock
-      # - ./:/opt/crop_sender:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/docker:/usr/bin/docker:ro
+      - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro
+      - ./:/opt/crop_sender:ro
     env_file:
       - .env
     environment:
@@ -64,6 +68,6 @@ services:
       - AGENT_VERSION=${AGENT_VERSION:-latest}
       - AGENT_ENV_PATH=/app/.env
       - AGENT_COMPOSE_DIR=${AGENT_COMPOSE_DIR:-/opt/crop_sender}
-      - AGENT_UPDATE_CMD=${AGENT_UPDATE_CMD:-}
+      - AGENT_UPDATE_CMD=${AGENT_UPDATE_CMD:-bash /opt/crop_sender/scripts/update-agent.sh}
     command: ["python3", "-m", "streaming_agent.main", "-c", "/app/streaming-agent.yaml"]
     network_mode: host
