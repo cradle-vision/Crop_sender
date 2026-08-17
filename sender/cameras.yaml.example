@@ -29,6 +29,11 @@ cameras:
     inside_x: 640
     inside_y: 150
     line_active: true
+    # Optional exclude zones (pixel rects). Backend sync preferred over env.
+    # exclude_zones:
+    #   - [0, 0, 320, 1080]
+    #   - [1610, 0, 1920, 1080]
+    # exclude_zones_active: true
   
   - camera_id: "ip_camera_2"
     name: "IP Camera Backyard"

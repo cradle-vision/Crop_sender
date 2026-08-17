@@ -370,10 +370,22 @@ class SignalingClient:
             logger.info("roi_updated camera=%s keys=%s", cam_id, list(msg.keys()))
             ok = await asyncio.to_thread(apply_roi_payload, msg)
             if ok:
-                logger.info("roi_updated applied camera=%s", cam_id)
+                roi = msg.get("camera_roi") if isinstance(msg.get("camera_roi"), dict) else {}
+                zones = msg.get("exclude_zones")
+                if zones is None:
+                    zones = roi.get("exclude_zones")
+                active = msg.get("exclude_zones_active")
+                if active is None:
+                    active = roi.get("exclude_zones_active")
+                logger.info(
+                    "roi_updated applied camera=%s exclude_zones=%s active=%s",
+                    cam_id,
+                    len(zones or []),
+                    active,
+                )
             else:
                 logger.warning(
-                    "roi_updated not applied camera=%s (unknown camera or empty line data)",
+                    "roi_updated not applied camera=%s (unknown camera or empty ROI data)",
                     cam_id,
                 )
         except Exception as e:

@@ -15,6 +15,8 @@ services:
       - /usr/bin/docker:/usr/bin/docker:ro
       - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro
       - ./:/opt/crop_sender:ro
+      # Run local sender code until the next GHCR image includes exclude zones.
+      - ./sender:/app/sender:ro
     env_file:
       - .env
     environment:
@@ -56,6 +58,9 @@ services:
       - /usr/bin/docker:/usr/bin/docker:ro
       - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro
       - ./:/opt/crop_sender:ro
+      - ./sender:/app/sender:ro
+      - ./streaming_agent:/app/streaming_agent:ro
+      - ./agent_control:/app/agent_control:ro
     env_file:
       - .env
     environment:

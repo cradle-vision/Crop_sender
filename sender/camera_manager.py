@@ -41,6 +41,9 @@ class CameraInfo:
     inside_y: Optional[int] = None
     line_active: Optional[bool] = None
     roi_updated_at: Optional[str] = None
+    # Exclude zones (pixel rects); applied when exclude_zones_active is not False
+    exclude_zones: Optional[List] = None
+    exclude_zones_active: Optional[bool] = None
 
 
 class CameraManager:
@@ -155,8 +158,26 @@ class CameraManager:
                 out.setdefault("line_y2", merged_line["line_y2"])
                 out.setdefault("inside_x", merged_line["inside_x"])
                 out.setdefault("inside_y", merged_line["inside_y"])
-                if "line_active" not in out and merged_line.get("line_active") is not None:
+            if "line_active" not in out and merged_line.get("line_active") is not None:
                     out["line_active"] = merged_line["line_active"]
+            # Exclude zones from camera_roi / top-level (bootstrap from cameras API)
+            roi_obj = out.get("camera_roi") if isinstance(out.get("camera_roi"), dict) else {}
+            ez = out.get("exclude_zones")
+            if ez is None and isinstance(roi_obj, dict):
+                ez = roi_obj.get("exclude_zones")
+            if ez is not None:
+                try:
+                    from person_crop import parse_exclude_zones
+                except ImportError:
+                    from sender.person_crop import parse_exclude_zones  # type: ignore
+                out["exclude_zones"] = [list(z) for z in parse_exclude_zones(ez)]
+            eza = out.get("exclude_zones_active")
+            if eza is None and isinstance(roi_obj, dict):
+                eza = roi_obj.get("exclude_zones_active")
+            if eza is not None:
+                parsed = _parse_bool(eza)
+                if parsed is not None:
+                    out["exclude_zones_active"] = parsed
             # camera_id: БЕРЁМ ИМЕННО id из backend (основной ключ камеры),
             # а device_id используем только как fallback, если id нет.
             if 'id' in out:
@@ -532,9 +553,11 @@ class CameraManager:
         *,
         camera_line: Optional[dict] = None,
         camera_roi: Optional[dict] = None,
+        exclude_zones=None,
+        exclude_zones_active=None,
         persist: bool = False,
     ) -> bool:
-        """Apply ROI/line changes from backend roi-sync poll (overwrites current values)."""
+        """Apply ROI/line/exclude-zone changes from backend (overwrites current values)."""
         camera = self.cameras.get(camera_id)
         if not camera:
             return False
@@ -556,6 +579,32 @@ class CameraManager:
                 updates[key] = line_obj[key]
         if "updated_at" in line_obj and line_obj.get("updated_at"):
             updates["roi_updated_at"] = str(line_obj["updated_at"])
+
+        # Prefer top-level exclude fields; fallback to camera_roi
+        ez = exclude_zones
+        eza = exclude_zones_active
+        if ez is None and isinstance(camera_roi, dict) and "exclude_zones" in camera_roi:
+            ez = camera_roi.get("exclude_zones")
+        if eza is None and isinstance(camera_roi, dict) and "exclude_zones_active" in camera_roi:
+            eza = camera_roi.get("exclude_zones_active")
+
+        if ez is not None:
+            try:
+                from person_crop import parse_exclude_zones
+            except ImportError:
+                from sender.person_crop import parse_exclude_zones  # type: ignore
+            updates["exclude_zones"] = [list(z) for z in parse_exclude_zones(ez)]
+        if eza is not None:
+            if isinstance(eza, bool):
+                updates["exclude_zones_active"] = eza
+            elif isinstance(eza, str):
+                s = eza.strip().lower()
+                if s in ("1", "true", "yes", "y", "on"):
+                    updates["exclude_zones_active"] = True
+                elif s in ("0", "false", "no", "n", "off"):
+                    updates["exclude_zones_active"] = False
+            else:
+                updates["exclude_zones_active"] = bool(eza)
 
         if not updates:
             return False

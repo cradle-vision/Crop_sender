@@ -26,7 +26,12 @@ from snapshot_capture_agent import SnapshotCaptureAgent
 from kafka_sender_agent import KafkaSenderAgent
 from camera_manager import CameraManager
 from camera_net import find_ip_for_mac, learn_mac_for_ip, normalize_mac
-from person_crop import detect_persons, crop_persons, is_available as person_detector_available
+from person_crop import (
+    detect_persons,
+    crop_persons,
+    is_available as person_detector_available,
+    resolve_exclude_zones,
+)
 from jpeg_utils import encode_jpeg_bgr
 from roi_command_server import RoiCommandServer
 from roi_local_http import RoiLocalHttpServer
@@ -178,7 +183,8 @@ class MainAgent:
                     self.camera_manager.config_file = fallback_path
                     self.camera_manager.load_cameras()
 
-        self._roi_last_sync_at = self._initial_roi_sync_cursor()
+        # List API may omit exclude_zones (null). Pull full roi-sync once so yaml gets zones.
+        self._bootstrap_roi_from_backend()
 
         bootstrap_servers = (
             _env('KAFKA_BOOTSTRAP_SERVERS')
@@ -584,12 +590,14 @@ class MainAgent:
                     line_params = tuple(int(v) for v in vals)
             except Exception as e:
                 print(f"[Main Agent] Line config parse error for camera {camera_id}: {e}")
+        exclude_zones = resolve_exclude_zones(camera, camera_id)
         rects = detect_persons(
             frame,
             model_path=self.person_model_path,
             conf_threshold=self.person_conf,
             iou_threshold=self.person_iou,
             line_params=line_params,
+            exclude_zones=exclude_zones,
         )
         crops = crop_persons(frame, rects)
         h, w = frame.shape[:2]
@@ -980,6 +988,20 @@ class MainAgent:
             self._roi_http_server = RoiLocalHttpServer(self, port=self._roi_http_port)
             self._roi_http_server.start()
 
+    def _bootstrap_roi_from_backend(self) -> None:
+        """One-shot GET /smartcamera/roi-sync (no since) to apply line + exclude zones."""
+        if not HAS_REQUESTS or not self.backend_snapshot_base_url or not self._backend_bearer_token:
+            self._roi_last_sync_at = self._initial_roi_sync_cursor()
+            return
+        self._roi_last_sync_at = None
+        try:
+            self._poll_roi_changes()
+            print("[Main Agent] ROI bootstrap sync done")
+        except Exception as e:
+            print(f"[Main Agent] ROI bootstrap sync failed: {e}")
+        if not self._roi_last_sync_at:
+            self._roi_last_sync_at = self._initial_roi_sync_cursor()
+
     def _start_roi_poll_fallback(self) -> None:
         if self._roi_poll_interval > 0:
             self._start_roi_sync_thread()
@@ -1059,7 +1081,7 @@ class MainAgent:
             print(f"[Main Agent] ROI poll: applied line for {applied} camera(s) (no snapshot)")
 
     def apply_roi_from_payload(self, body: dict) -> bool:
-        """Apply ROI/line from backend payload (WS or HTTP poll). Does not refresh snapshot."""
+        """Apply ROI/line/exclude zones from backend payload (WS or HTTP poll). Does not refresh snapshot."""
         if not isinstance(body, dict):
             return False
         cam_id = str(
@@ -1069,6 +1091,11 @@ class MainAgent:
             return False
         camera_line = body.get("camera_line") or body.get("line")
         camera_roi = body.get("camera_roi")
+        has_exclude = "exclude_zones" in body or "exclude_zones_active" in body
+        if isinstance(camera_roi, dict) and (
+            "exclude_zones" in camera_roi or "exclude_zones_active" in camera_roi
+        ):
+            has_exclude = True
         if not isinstance(camera_line, dict) and not isinstance(camera_roi, dict):
             line_keys = (
                 "line_x1", "line_y1", "line_x2", "line_y2",
@@ -1077,6 +1104,8 @@ class MainAgent:
             flat = {k: body[k] for k in line_keys if k in body}
             if flat:
                 camera_line = flat
+            elif not has_exclude:
+                return False
         updated_at = body.get("updated_at")
         if updated_at:
             if isinstance(camera_line, dict):
@@ -1085,10 +1114,16 @@ class MainAgent:
             elif isinstance(camera_roi, dict):
                 camera_roi = dict(camera_roi)
                 camera_roi.setdefault("updated_at", updated_at)
+        exclude_zones = body.get("exclude_zones") if "exclude_zones" in body else None
+        exclude_zones_active = (
+            body.get("exclude_zones_active") if "exclude_zones_active" in body else None
+        )
         applied = self.camera_manager.apply_roi_sync(
             cam_id,
             camera_line=camera_line if isinstance(camera_line, dict) else None,
             camera_roi=camera_roi if isinstance(camera_roi, dict) else None,
+            exclude_zones=exclude_zones,
+            exclude_zones_active=exclude_zones_active,
             persist=True,
         )
         if applied:

@@ -136,7 +136,7 @@ On startup, sender uploads one initial full-frame snapshot per camera to backend
 - Multipart form field: `file` (JPEG).
 - On HTTP 200, snapshot is marked sent for that camera.
 
-## ROI / Tripwire Parameters
+## ROI / Tripwire / Exclude Zones
 
 If camera line settings are present and active, sender passes them to detector:
 - `line_x1`, `line_y1`, `line_x2`, `line_y2`
@@ -146,3 +146,8 @@ If camera line settings are present and active, sender passes them to detector:
 Detector receives:
 - `--line x1 y1 x2 y2`
 - `--inside_point ix iy`
+
+**Exclude zones** (`exclude_zones`, `exclude_zones_active`) arrive on the same `roi_updated` /
+`roi-sync` path as the tripwire line. Edge strips are pre-cropped before detect; mid-frame
+rects drop detections whose bbox is **fully inside** a zone. Env fallback:
+`PERSON_EXCLUDE_ZONES` / `PERSON_EXCLUDE_ZONES_<camera_id>` only when backend zones are unset.

@@ -13,9 +13,12 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+ExcludeZone = Tuple[int, int, int, int]
+BBox = Tuple[int, int, int, int]
 
 # Paths relative to project root (parent of sender/)
 def _project_root() -> Path:
@@ -322,16 +325,173 @@ def _session_for(
     return sess
 
 
+def parse_exclude_zones(raw: Any) -> List[ExcludeZone]:
+    """Normalize zones to (x1,y1,x2,y2) int tuples. Accepts dicts or sequences."""
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        return _parse_exclude_zones_env_string(raw)
+    out: List[ExcludeZone] = []
+    if not isinstance(raw, (list, tuple)):
+        return out
+    for item in raw:
+        zone = _normalize_one_zone(item)
+        if zone is not None:
+            out.append(zone)
+    return out[:20]
+
+
+def _normalize_one_zone(item: Any) -> Optional[ExcludeZone]:
+    x1 = y1 = x2 = y2 = None
+    if isinstance(item, dict):
+        x1 = item.get("x1", item.get("left"))
+        y1 = item.get("y1", item.get("top"))
+        x2 = item.get("x2", item.get("right"))
+        y2 = item.get("y2", item.get("bottom"))
+    elif isinstance(item, (list, tuple)) and len(item) >= 4:
+        x1, y1, x2, y2 = item[0], item[1], item[2], item[3]
+    else:
+        return None
+    try:
+        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+    except (TypeError, ValueError):
+        return None
+    if x1 > x2:
+        x1, x2 = x2, x1
+    if y1 > y2:
+        y1, y2 = y2, y1
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def _parse_exclude_zones_env_string(s: str) -> List[ExcludeZone]:
+    """Format: x1,y1,x2,y2;x1,y1,x2,y2"""
+    out: List[ExcludeZone] = []
+    for part in s.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        nums = [p.strip() for p in part.replace(" ", ",").split(",") if p.strip()]
+        if len(nums) < 4:
+            continue
+        zone = _normalize_one_zone(nums[:4])
+        if zone is not None:
+            out.append(zone)
+    return out[:20]
+
+
+def exclude_zones_from_env(camera_id: Optional[str] = None) -> List[ExcludeZone]:
+    """PERSON_EXCLUDE_ZONES_<camera_id> then PERSON_EXCLUDE_ZONES."""
+    if camera_id:
+        key = f"PERSON_EXCLUDE_ZONES_{str(camera_id).strip()}"
+        raw = (os.environ.get(key) or "").strip()
+        if raw:
+            return _parse_exclude_zones_env_string(raw)
+    raw = (os.environ.get("PERSON_EXCLUDE_ZONES") or "").strip()
+    if raw:
+        return _parse_exclude_zones_env_string(raw)
+    return []
+
+
+def resolve_exclude_zones(
+    camera: Any = None,
+    camera_id: Optional[str] = None,
+) -> List[ExcludeZone]:
+    """
+    Backend camera.exclude_zones wins; env only if backend zones are unset (None).
+    exclude_zones_active=false → apply nothing (keep stored zones).
+    """
+    cid = camera_id or (getattr(camera, "camera_id", None) if camera is not None else None)
+    if camera is not None:
+        active = getattr(camera, "exclude_zones_active", None)
+        if active is False:
+            return []
+        zones = getattr(camera, "exclude_zones", None)
+        if zones is not None:
+            return parse_exclude_zones(zones)
+    return exclude_zones_from_env(str(cid) if cid is not None else None)
+
+
+def bbox_fully_inside_zone(bbox: BBox, zone: ExcludeZone) -> bool:
+    bx1, by1, bx2, by2 = bbox
+    zx1, zy1, zx2, zy2 = zone
+    return zx1 <= bx1 and zy1 <= by1 and bx2 <= zx2 and by2 <= zy2
+
+
+def filter_rects_by_exclude_zones(
+    rects: Sequence[BBox],
+    zones: Sequence[ExcludeZone],
+) -> List[BBox]:
+    """Drop detections whose bbox is fully contained in any exclude zone."""
+    if not zones:
+        return list(rects)
+    out: List[BBox] = []
+    for r in rects:
+        if not any(bbox_fully_inside_zone(r, z) for z in zones):
+            out.append(r)
+    return out
+
+
+def _split_edge_strips(
+    zones: Sequence[ExcludeZone],
+    w: int,
+    h: int,
+    tol: int = 2,
+) -> Tuple[int, int, int, int, List[ExcludeZone]]:
+    """Return (left, top, right, bottom) crop margins + mid-frame zones for post-filter."""
+    left = top = right = bottom = 0
+    mid: List[ExcludeZone] = []
+    for x1, y1, x2, y2 in zones:
+        full_h = y1 <= tol and y2 >= h - 1 - tol
+        full_w = x1 <= tol and x2 >= w - 1 - tol
+        if full_h and x1 <= tol and x2 < w - tol:
+            left = max(left, x2)
+        elif full_h and x2 >= w - 1 - tol and x1 > tol:
+            right = max(right, w - x1)
+        elif full_w and y1 <= tol and y2 < h - tol:
+            top = max(top, y2)
+        elif full_w and y2 >= h - 1 - tol and y1 > tol:
+            bottom = max(bottom, h - y1)
+        else:
+            mid.append((x1, y1, x2, y2))
+    if left + right >= w or top + bottom >= h:
+        return 0, 0, 0, 0, list(zones)
+    return left, top, right, bottom, mid
+
+
+def _shift_line_params(
+    line_params: Optional[Tuple[int, int, int, int, int, int]],
+    left: int,
+    top: int,
+    cw: int,
+    ch: int,
+) -> Optional[Tuple[int, int, int, int, int, int]]:
+    if line_params is None:
+        return None
+    x1, y1, x2, y2, ix, iy = line_params
+    return (
+        max(0, min(int(x1) - left, cw - 1)),
+        max(0, min(int(y1) - top, ch - 1)),
+        max(0, min(int(x2) - left, cw - 1)),
+        max(0, min(int(y2) - top, ch - 1)),
+        max(0, min(int(ix) - left, cw - 1)),
+        max(0, min(int(iy) - top, ch - 1)),
+    )
+
+
 def detect_persons(
     frame: np.ndarray,
     model_path: Optional[str] = None,
     conf_threshold: float = 0.4,
     iou_threshold: float = 0.5,
     line_params: Optional[Tuple[int, int, int, int, int, int]] = None,
+    exclude_zones: Optional[Sequence[ExcludeZone]] = None,
 ) -> List[Tuple[int, int, int, int]]:
     """
     Detect persons using a long-lived detect_main (model loaded once per worker).
-    Returns list of (x1, y1, x2, y2).
+    Returns list of (x1, y1, x2, y2) in **full-frame** coordinates.
+    Edge exclude strips are pre-cropped; mid-frame zones post-filter when bbox is fully inside.
     """
     binary, lib_dir = _resolve_detect_executable()
     if not binary:
@@ -363,18 +523,47 @@ def detect_persons(
     if w == 0 or h == 0:
         return []
 
-    sess = _session_for(binary, lib_dir, model, w, h, line_params, conf_threshold, iou_threshold)
-    rects = sess.detect(frame)
-    if rects is not None:
-        return rects
-    sess.close()
-    with _all_sessions_lock:
-        if sess in _all_sessions:
-            _all_sessions.remove(sess)
-    _tls.detector = None
-    sess = _session_for(binary, lib_dir, model, w, h, line_params, conf_threshold, iou_threshold)
-    rects = sess.detect(frame)
-    return rects if rects is not None else []
+    zones = parse_exclude_zones(exclude_zones) if exclude_zones else []
+    left = top = right = bottom = 0
+    mid_zones: List[ExcludeZone] = []
+    detect_frame = frame
+    detect_line = line_params
+    if zones:
+        left, top, right, bottom, mid_zones = _split_edge_strips(zones, w, h)
+        if left or top or right or bottom:
+            detect_frame = frame[top : h - bottom, left : w - right]
+            ch, cw = detect_frame.shape[:2]
+            if cw <= 0 or ch <= 0:
+                return []
+            detect_line = _shift_line_params(line_params, left, top, cw, ch)
+        else:
+            mid_zones = list(zones)
+
+    dh, dw = detect_frame.shape[:2]
+    sess = _session_for(
+        binary, lib_dir, model, dw, dh, detect_line, conf_threshold, iou_threshold
+    )
+    rects = sess.detect(detect_frame)
+    if rects is None:
+        sess.close()
+        with _all_sessions_lock:
+            if sess in _all_sessions:
+                _all_sessions.remove(sess)
+        _tls.detector = None
+        sess = _session_for(
+            binary, lib_dir, model, dw, dh, detect_line, conf_threshold, iou_threshold
+        )
+        rects = sess.detect(detect_frame)
+    if not rects:
+        return []
+
+    if left or top:
+        rects = [
+            (x1 + left, y1 + top, x2 + left, y2 + top) for (x1, y1, x2, y2) in rects
+        ]
+    if mid_zones:
+        rects = filter_rects_by_exclude_zones(rects, mid_zones)
+    return rects
 
 
 def crop_persons(
