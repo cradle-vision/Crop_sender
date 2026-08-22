@@ -141,17 +141,28 @@ class StreamManager:
                         )
                     )
                 elif p:
-                    merged.append(
-                        CameraEntry(
-                            id=c.id,
-                            rtsp_url=p.rtsp_url,
-                            main_rtsp_url=(c.main_rtsp_url or c.rtsp_url).strip(),
-                            streaming_rtsp_url=p.streaming_rtsp_url,
-                            rtsp_vendor=c.rtsp_vendor or p.rtsp_vendor,
-                            streaming_scale_filter=p.streaming_scale_filter,
-                            streaming_rtsp_transport=p.streaming_rtsp_transport,
+                    new_main = (c.main_rtsp_url or c.rtsp_url).strip()
+                    old_main = (p.main_rtsp_url or p.rtsp_url).strip()
+                    if new_main != old_main:
+                        merged.append(
+                            _resolve_streaming_rtsp_url(
+                                c,
+                                use_substream=cfg.use_substream,
+                                ffmpeg_path=cfg.upstream.ffmpeg_path,
+                            )
                         )
-                    )
+                    else:
+                        merged.append(
+                            CameraEntry(
+                                id=c.id,
+                                rtsp_url=p.rtsp_url,
+                                main_rtsp_url=new_main,
+                                streaming_rtsp_url=p.streaming_rtsp_url,
+                                rtsp_vendor=c.rtsp_vendor or p.rtsp_vendor,
+                                streaming_scale_filter=p.streaming_scale_filter,
+                                streaming_rtsp_transport=p.streaming_rtsp_transport,
+                            )
+                        )
                 else:
                     merged.append(
                         _resolve_streaming_rtsp_url(

@@ -9,6 +9,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
 
@@ -432,8 +433,63 @@ def _parse_camera(obj: dict[str, Any]) -> CameraEntry | None:
     cid = str(cid).strip()
     url = obj.get("rtsp_url") or obj.get("source") or obj.get("url")
     if not url or not str(url).strip():
+        url = _resolve_main_rtsp_url(obj)
+    else:
+        url = _resolve_main_rtsp_url({**obj, "source": str(url).strip()})
+    if not url:
         return None
     return _camera_entry_from_yaml_item(obj, str(url).strip())
+
+
+def _resolve_main_rtsp_url(cam: dict[str, Any], *, lan_scan: bool = True) -> str:
+    """
+    Build main RTSP URL using the same LAN/IP resolver as sender-crop.
+    Keeps streaming and capture on the same camera host.
+    """
+    base_url = _build_rtsp_url_from_camera_yaml(cam)
+    if not base_url:
+        return ""
+
+    try:
+        from sender.camera_net import replace_host_in_url, resolve_effective_ip
+    except ImportError:
+        import sys
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent
+        sender_dir = str(root / "sender")
+        if sender_dir not in sys.path:
+            sys.path.insert(0, sender_dir)
+        from camera_net import replace_host_in_url, resolve_effective_ip  # type: ignore
+
+    parsed = urlparse(base_url)
+    current_ip = parsed.hostname or cam.get("ip_address") or cam.get("device_ip") or ""
+    health_ip = cam.get("health_ip_address") or cam.get("healthIpAddress")
+    username = cam.get("username") or cam.get("login") or parsed.username or ""
+    password = cam.get("password")
+    if password is None and parsed.password is not None:
+        password = parsed.password
+    port = cam.get("port") or parsed.port or 554
+    path = parsed.path or cam.get("rtsp_path") or "/"
+
+    effective_ip = resolve_effective_ip(
+        ip=str(current_ip or "").strip() or None,
+        health_ip=str(health_ip or "").strip() or None,
+        username=str(username or "") or None,
+        password=str(password or "") if password is not None else None,
+        port=int(port or 554),
+        path=str(path or "/"),
+        mac=cam.get("mac_address") or cam.get("macAddress"),
+        lan_scan=lan_scan,
+    )
+    if effective_ip and effective_ip != str(current_ip or "").strip():
+        resolved = replace_host_in_url(base_url, str(current_ip or "").strip() or None, effective_ip)
+        print(
+            f"[Streaming Config] camera {cam.get('camera_id') or cam.get('id')}: "
+            f"resolved host {current_ip} -> {effective_ip}"
+        )
+        return resolved
+    return base_url
 
 
 def _build_rtsp_url_from_camera_yaml(cam: dict[str, Any]) -> str:
@@ -499,7 +555,7 @@ def _load_cameras_from_sender_cameras_yaml(path: str | Path) -> list[CameraEntry
         if not cid_str:
             continue
 
-        rtsp_url = _build_rtsp_url_from_camera_yaml(item)
+        rtsp_url = _resolve_main_rtsp_url(item)
         if not rtsp_url:
             continue
 

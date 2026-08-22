@@ -171,6 +171,22 @@ class MainAgent:
                 data = CameraManager._normalize_backend_response(raw)
                 self.camera_manager.load_cameras_from_data(data)
                 self.camera_manager.config_file = cameras_config
+                resolved = self.camera_manager.resolve_connectivity()
+                if resolved:
+                    print(
+                        f"[Main Agent] Resolved RTSP IP for camera(s): "
+                        f"{', '.join(camera_id for camera_id, _, _ in resolved)}"
+                    )
+                    for camera_id, old_ip, new_ip in resolved:
+                        camera = self.camera_manager.get_camera(camera_id)
+                        if not camera:
+                            continue
+                        self._recovered_ip[camera_id] = new_ip
+                        self._post_camera_network(
+                            camera,
+                            reason="mac_rediscovery",
+                            previous_ip=old_ip or None,
+                        )
                 n = len(self.camera_manager.cameras)
                 if self.camera_manager.save_cameras():
                     print(f"[Main Agent] OK: {n} camera(s) from backend saved to {cameras_config}")
@@ -407,6 +423,21 @@ class MainAgent:
             data = CameraManager._normalize_backend_response(raw)
             self.camera_manager.load_cameras_from_data(data)
             self.camera_manager.config_file = cameras_config
+            resolved = self.camera_manager.resolve_connectivity()
+            if resolved:
+                print(
+                    f"[Main Agent] reload_cameras: resolved RTSP IP for "
+                    f"{', '.join(camera_id for camera_id, _, _ in resolved)}"
+                )
+                for camera_id, old_ip, new_ip in resolved:
+                    camera = self.camera_manager.get_camera(camera_id)
+                    if camera:
+                        self._recovered_ip[camera_id] = new_ip
+                        self._post_camera_network(
+                            camera,
+                            reason="mac_rediscovery",
+                            previous_ip=old_ip or None,
+                        )
             self.camera_manager.save_cameras()
             print(f"[Main Agent] reload_cameras: {len(self.camera_manager.cameras)} camera(s) from backend")
             self._reapply_recovered_ips()
