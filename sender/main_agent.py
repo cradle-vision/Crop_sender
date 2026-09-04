@@ -29,6 +29,8 @@ from camera_net import find_ip_for_mac, learn_mac_for_ip, normalize_mac
 from person_crop import (
     detect_persons,
     crop_persons,
+    crop_persons_with_rects,
+    foot_point,
     is_available as person_detector_available,
     resolve_exclude_zones,
 )
@@ -105,9 +107,10 @@ class MainAgent:
         self._sender_debug = _env_bool("SENDER_DEBUG", False)
         self._debug_no_person_interval = max(2.0, _env_float("SENDER_DEBUG_NO_PERSON_INTERVAL_SEC", 15.0))
         self._debug_miss_state: Dict[str, dict] = {}
+        self._track_seq: Dict[str, int] = {}
         self._backend_bearer_token = None
         self.backend_snapshot_base_url = None
-        self._roi_poll_interval = _env_float('ROI_POLL_INTERVAL_SEC', 0.0)
+        self._roi_poll_interval = _env_float('ROI_POLL_INTERVAL_SEC', 60.0)
         self._roi_last_sync_at: Optional[str] = None
         self._roi_sync_stop = threading.Event()
         self._roi_sync_thread: Optional[threading.Thread] = None
@@ -132,56 +135,18 @@ class MainAgent:
         backend_timeout = _env_float('BACKEND_CAMERAS_TIMEOUT', 10.0)
 
         # Camera manager: from backend API or from file
-        backend_cameras_url = _env('BACKEND_CAMERAS_URL')
         cameras_config = _env('CAMERAS_CONFIG_PATH') or cameras_config_path or 'cameras.yaml'
         cameras_config = self._resolve_path(cameras_config)
         self.camera_manager = CameraManager(config_file=cameras_config, auto_save=False)
-        if backend_cameras_url:
-            token = _env('BACKEND_CAMERAS_TOKEN')
-            if not token:
-                username = _env('BACKEND_CAMERAS_USERNAME')
-                password = _env('BACKEND_CAMERAS_PASSWORD')
-                if username and password:
-                    parsed = urlparse(backend_cameras_url)
-                    token_url = _env('BACKEND_TOKEN_URL') or urlunparse((parsed.scheme, parsed.netloc, '/token', '', '', ''))
-                    if token_url:
-                        token = CameraManager.fetch_backend_token(
-                            token_url, username.strip(), password.strip(),
-                            timeout=backend_timeout,
-                            scope=_env('BACKEND_TOKEN_SCOPE') or 'camera:read',
-                        )
-            if token:
-                self._backend_bearer_token = str(token).strip()
-            raw = CameraManager._fetch_cameras_from_backend_raw(backend_cameras_url, backend_timeout, token or None)
-            try:
-                parsed_for_snapshot = urlparse(backend_cameras_url)
-                if parsed_for_snapshot.scheme and parsed_for_snapshot.netloc:
-                    self.backend_snapshot_base_url = f"{parsed_for_snapshot.scheme}://{parsed_for_snapshot.netloc}"
-            except Exception:
-                self.backend_snapshot_base_url = None
-            if raw is not None:
-                _cameras_dir = os.path.dirname(cameras_config)
-                _raw_path = os.path.join(_cameras_dir, 'backend_cameras.json') if _cameras_dir else 'backend_cameras.json'
-                try:
-                    with open(_raw_path, 'w', encoding='utf-8') as f:
-                        json.dump(raw, f, ensure_ascii=False, indent=2)
-                    print(f"[Main Agent] Raw backend response saved to {_raw_path}")
-                except Exception as e:
-                    print(f"[Main Agent] Could not save raw JSON to {_raw_path}: {e}")
-                data = CameraManager._normalize_backend_response(raw)
-                self.camera_manager.load_cameras_from_data(data)
-                self.camera_manager.config_file = cameras_config
-                n = len(self.camera_manager.cameras)
-                if self.camera_manager.save_cameras():
-                    print(f"[Main Agent] OK: {n} camera(s) from backend saved to {cameras_config}")
-                else:
-                    print(f"[Main Agent] Cameras loaded from backend ({n}), save to {cameras_config} failed")
-            else:
-                print(f"[Main Agent] Backend request failed (no response). Check URL and token.")
-                fallback_path = os.path.normpath(os.path.join(os.path.dirname(cameras_config), 'config', 'cameras.yaml')) if cameras_config and os.path.isdir(cameras_config) else cameras_config
-                if fallback_path and os.path.isfile(fallback_path):
-                    self.camera_manager.config_file = fallback_path
-                    self.camera_manager.load_cameras()
+        if self._load_cameras_from_backend(cameras_config, backend_timeout):
+            pass
+        else:
+            fallback_path = os.path.normpath(
+                os.path.join(os.path.dirname(cameras_config), 'config', 'cameras.yaml')
+            ) if cameras_config and os.path.isdir(cameras_config) else cameras_config
+            if fallback_path and os.path.isfile(fallback_path):
+                self.camera_manager.config_file = fallback_path
+                self.camera_manager.load_cameras()
 
         # List API may omit exclude_zones (null). Pull full roi-sync once so yaml gets zones.
         self._bootstrap_roi_from_backend()
@@ -390,25 +355,166 @@ class MainAgent:
             print(f"[Main Agent] stop before restart failed: {e}")
         os._exit(0)
 
+    def _backend_api_base(self) -> str:
+        explicit = _env("BACKEND_API_BASE")
+        if explicit:
+            return explicit.rstrip("/")
+        for candidate in (_env("BACKEND_CAMERAS_URL"), _env("STREAMING_BACKEND_URL"), _env("AGENT_BACKEND_URL")):
+            if not candidate:
+                continue
+            parsed = urlparse(candidate)
+            if parsed.scheme and parsed.netloc:
+                return f"{parsed.scheme}://{parsed.netloc}"
+        return "https://api.retailsolution.ai"
+
+    def _resolve_backend_cameras_fetch(
+        self, backend_timeout: float
+    ) -> tuple[Optional[str], Optional[str], bool]:
+        """
+        Returns (url, bearer_token, is_agent_token).
+        Default: GET /api/agent/cameras with STREAMING_AGENT_TOKEN when BACKEND_CAMERAS_URL unset.
+        Set BACKEND_USE_AGENT_CAMERA_API=1 to prefer agent API even if legacy URL is configured.
+        """
+        backend_cameras_url = (_env("BACKEND_CAMERAS_URL") or "").strip() or None
+        agent_token = (_env("STREAMING_AGENT_TOKEN") or _env("AGENT_TOKEN") or "").strip() or None
+        prefer_agent_api = _env_bool("BACKEND_USE_AGENT_CAMERA_API", False)
+
+        if prefer_agent_api and agent_token:
+            url = f"{self._backend_api_base()}/api/agent/cameras"
+            print(f"[Main Agent] BACKEND_USE_AGENT_CAMERA_API: {url}")
+            return url, agent_token, True
+
+        if backend_cameras_url:
+            token = _env("BACKEND_CAMERAS_TOKEN")
+            if not token:
+                username = _env("BACKEND_CAMERAS_USERNAME")
+                password = _env("BACKEND_CAMERAS_PASSWORD")
+                if username and password:
+                    parsed = urlparse(backend_cameras_url)
+                    token_url = _env("BACKEND_TOKEN_URL") or urlunparse(
+                        (parsed.scheme, parsed.netloc, "/token", "", "", "")
+                    )
+                    if token_url:
+                        token = CameraManager.fetch_backend_token(
+                            token_url,
+                            username.strip(),
+                            password.strip(),
+                            timeout=backend_timeout,
+                            scope=_env("BACKEND_TOKEN_SCOPE") or "camera:read",
+                        )
+            if token:
+                self._backend_bearer_token = str(token).strip()
+            return backend_cameras_url, token, False
+
+        if agent_token:
+            url = f"{self._backend_api_base()}/api/agent/cameras"
+            print(f"[Main Agent] Using agent camera API (no BACKEND_CAMERAS_URL): {url}")
+            return url, agent_token, True
+
+        return None, None, False
+
+    def _resolve_backend_cameras_fetch_legacy(
+        self, backend_timeout: float
+    ) -> tuple[Optional[str], Optional[str], bool]:
+        """Legacy user-JWT path via BACKEND_CAMERAS_URL (fallback during rollout)."""
+        backend_cameras_url = (_env("BACKEND_CAMERAS_URL") or "").strip() or None
+        if not backend_cameras_url:
+            return None, None, False
+        token = _env("BACKEND_CAMERAS_TOKEN")
+        if not token:
+            username = _env("BACKEND_CAMERAS_USERNAME")
+            password = _env("BACKEND_CAMERAS_PASSWORD")
+            if username and password:
+                parsed = urlparse(backend_cameras_url)
+                token_url = _env("BACKEND_TOKEN_URL") or urlunparse(
+                    (parsed.scheme, parsed.netloc, "/token", "", "", "")
+                )
+                if token_url:
+                    token = CameraManager.fetch_backend_token(
+                        token_url,
+                        username.strip(),
+                        password.strip(),
+                        timeout=backend_timeout,
+                        scope=_env("BACKEND_TOKEN_SCOPE") or "camera:read",
+                    )
+        if token:
+            self._backend_bearer_token = str(token).strip()
+        return backend_cameras_url, token, False
+
+    def _load_cameras_from_backend(self, cameras_config: str, backend_timeout: float) -> bool:
+        backend_cameras_url, token, is_agent_token = self._resolve_backend_cameras_fetch(backend_timeout)
+        if not backend_cameras_url:
+            return False
+
+        self.backend_snapshot_base_url = self._backend_api_base()
+        raw = CameraManager._fetch_cameras_from_backend_raw(
+            backend_cameras_url, backend_timeout, token or None
+        )
+        if raw is None and is_agent_token and _env_bool("BACKEND_USE_AGENT_CAMERA_API", False):
+            legacy_url = (_env("BACKEND_CAMERAS_URL") or "").strip()
+            if legacy_url:
+                print(
+                    "[Main Agent] Agent camera API failed; falling back to BACKEND_CAMERAS_URL"
+                )
+                legacy_url, legacy_token, _ = self._resolve_backend_cameras_fetch_legacy(
+                    backend_timeout
+                )
+                if legacy_url:
+                    raw = CameraManager._fetch_cameras_from_backend_raw(
+                        legacy_url, backend_timeout, legacy_token or None
+                    )
+                    is_agent_token = False
+        if raw is None:
+            print("[Main Agent] Backend camera fetch failed. Check STREAMING_AGENT_TOKEN or BACKEND_CAMERAS_*.")
+            return False
+
+        _cameras_dir = os.path.dirname(cameras_config)
+        _raw_path = (
+            os.path.join(_cameras_dir, "backend_cameras.json")
+            if _cameras_dir
+            else "backend_cameras.json"
+        )
+        try:
+            with open(_raw_path, "w", encoding="utf-8") as f:
+                json.dump(raw, f, ensure_ascii=False, indent=2)
+            print(f"[Main Agent] Raw backend response saved to {_raw_path}")
+        except Exception as e:
+            print(f"[Main Agent] Could not save raw JSON to {_raw_path}: {e}")
+
+        data = CameraManager._normalize_backend_response(raw)
+        self.camera_manager.load_cameras_from_data(data)
+        self.camera_manager.config_file = cameras_config
+        resolved = self.camera_manager.resolve_connectivity()
+        if resolved:
+            print(
+                f"[Main Agent] Resolved RTSP IP for camera(s): "
+                f"{', '.join(camera_id for camera_id, _, _ in resolved)}"
+            )
+            for camera_id, old_ip, new_ip in resolved:
+                camera = self.camera_manager.get_camera(camera_id)
+                if not camera:
+                    continue
+                self._recovered_ip[camera_id] = new_ip
+                self._post_camera_network(
+                    camera,
+                    reason="mac_rediscovery",
+                    previous_ip=old_ip or None,
+                )
+        n = len(self.camera_manager.cameras)
+        if self.camera_manager.save_cameras():
+            source = "agent API" if is_agent_token else "backend URL"
+            print(f"[Main Agent] OK: {n} camera(s) from {source} saved to {cameras_config}")
+        else:
+            print(f"[Main Agent] Cameras loaded from backend ({n}), save to {cameras_config} failed")
+        return True
+
     def _reload_cameras_from_backend(self) -> None:
-        """Re-fetch cameras from BACKEND_CAMERAS_URL or reload cameras.yaml, then sync capture."""
+        """Re-fetch cameras from backend or reload cameras.yaml, then sync capture."""
         print("[Main Agent] reload_cameras requested")
-        backend_cameras_url = _env("BACKEND_CAMERAS_URL")
         cameras_config = _env("CAMERAS_CONFIG_PATH") or "cameras.yaml"
         cameras_config = self._resolve_path(cameras_config)
         backend_timeout = _env_float("BACKEND_CAMERAS_TIMEOUT", 10.0)
-        if backend_cameras_url:
-            token = self._backend_bearer_token or _env("BACKEND_CAMERAS_TOKEN") or None
-            raw = CameraManager._fetch_cameras_from_backend_raw(
-                backend_cameras_url, backend_timeout, token
-            )
-            if raw is None:
-                raise RuntimeError("backend cameras fetch failed")
-            data = CameraManager._normalize_backend_response(raw)
-            self.camera_manager.load_cameras_from_data(data)
-            self.camera_manager.config_file = cameras_config
-            self.camera_manager.save_cameras()
-            print(f"[Main Agent] reload_cameras: {len(self.camera_manager.cameras)} camera(s) from backend")
+        if self._load_cameras_from_backend(cameras_config, backend_timeout):
             self._reapply_recovered_ips()
         else:
             self.camera_manager.config_file = cameras_config
@@ -599,13 +705,13 @@ class MainAgent:
             line_params=line_params,
             exclude_zones=exclude_zones,
         )
-        crops = crop_persons(frame, rects)
+        crop_items = crop_persons_with_rects(frame, rects)
         h, w = frame.shape[:2]
 
         if self._sender_debug:
-            if crops:
+            if crop_items:
                 print(
-                    f"[DEBUG] camera={camera_id} person_hit boxes={len(rects)} crops={len(crops)} "
+                    f"[DEBUG] camera={camera_id} person_hit boxes={len(rects)} crops={len(crop_items)} "
                     f"frame={w}x{h} PERSON_CONF={self.person_conf} PERSON_IOU={self.person_iou}"
                 )
                 self._debug_miss_state.pop(camera_id, None)
@@ -639,9 +745,13 @@ class MainAgent:
         building_name = getattr(camera, "building_name", None) if camera else None
         camera_name = getattr(camera, "name", None) if camera else None
 
-        if not crops:
+        if not crop_items:
             return
-        for crop_img in crops:
+        for crop_img, rect in crop_items:
+            local_x, local_y = foot_point(rect)
+            seq = self._track_seq.get(camera_id, 0) + 1
+            self._track_seq[camera_id] = seq
+            track_id = f"cam{camera_id}_t{seq}"
             self.sender_agent.send_snapshot(
                 crop_img,
                 timestamp,
@@ -651,6 +761,9 @@ class MainAgent:
                 company_name,
                 building_name,
                 camera_name,
+                local_x=local_x,
+                local_y=local_y,
+                track_id=track_id,
             )
 
     def _initial_roi_sync_cursor(self) -> str:

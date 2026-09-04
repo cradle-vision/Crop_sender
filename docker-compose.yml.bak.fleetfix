@@ -1,6 +1,7 @@
 services:
   sender-crop:
     image: ${AGENT_IMAGE:-ghcr.io/cradle-vision/crop-sender:main}
+    build: .
     container_name: sender-crop
     restart: unless-stopped
     shm_size: "512m"
@@ -42,6 +43,7 @@ services:
 
   streaming-agent:
     image: ${AGENT_IMAGE:-ghcr.io/cradle-vision/crop-sender:main}
+    build: .
     container_name: streaming-agent
     restart: unless-stopped
     profiles: ["streaming"]

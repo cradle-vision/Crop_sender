@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
+import shutil
 import socket
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable, List, Optional, Set
@@ -179,6 +182,213 @@ def learn_mac_for_ip(
     if mac:
         return mac
     return _mac_from_isapi(ip, username, password)
+
+
+def build_rtsp_url(
+    ip: str,
+    *,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    port: int = 554,
+    path: str = "/",
+) -> str:
+    host = str(ip or "").strip()
+    if not host:
+        return ""
+    rtsp_path = str(path or "/").strip()
+    if not rtsp_path.startswith("/"):
+        rtsp_path = "/" + rtsp_path
+    port_suffix = f":{int(port)}" if port else ""
+    if username and password is not None:
+        return f"rtsp://{username}:{password}@{host}{port_suffix}{rtsp_path}"
+    return f"rtsp://{host}{port_suffix}{rtsp_path}"
+
+
+def rtsp_probe_reachable(url: str, *, timeout: float = 6.0) -> bool:
+    """True when ffprobe can open the RTSP video stream."""
+    raw = str(url or "").strip()
+    if not raw.lower().startswith("rtsp"):
+        return False
+    ffprobe = shutil.which("ffprobe") or "ffprobe"
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-rtsp_transport",
+        "tcp",
+        "-timeout",
+        "5000000",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "csv=p=0",
+        raw,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
+        return result.returncode == 0 and bool((result.stdout or b"").strip())
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def ip_rtsp_reachable(
+    ip: str,
+    *,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    port: int = 554,
+    path: str = "/",
+) -> bool:
+    host = str(ip or "").strip()
+    if not host:
+        return False
+    if not tcp_probe(host, int(port or 554), timeout=0.5):
+        return False
+    return rtsp_probe_reachable(
+        build_rtsp_url(host, username=username, password=password, port=port, path=path)
+    )
+
+
+def lan_credential_scan_enabled() -> bool:
+    """True when CAMERA_LAN_CREDENTIAL_SCAN=1 (off by default).
+
+    Credential-based LAN scan must stay off when multiple cameras share login/password:
+    the first reachable host wins, which is often a different physical camera.
+    """
+    return os.environ.get("CAMERA_LAN_CREDENTIAL_SCAN", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def ip_mac_matches(
+    ip: str,
+    expected_mac: Optional[str],
+    *,
+    port: int = 554,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+) -> bool:
+    """True when expected_mac is unset or the host at ip resolves to that MAC."""
+    want = normalize_mac(expected_mac)
+    if not want:
+        return True
+    host = str(ip or "").strip()
+    if not host:
+        return False
+    found = mac_from_arp(host) or learn_mac_for_ip(
+        host, port=port, username=username, password=password
+    )
+    return normalize_mac(found) == want
+
+
+def find_rtsp_by_credentials(
+    *,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    hint_ip: Optional[str] = None,
+    port: int = 554,
+    path: str = "/",
+    mac: Optional[str] = None,
+    skip_ips: Optional[Set[str]] = None,
+    workers: int = 48,
+) -> Optional[str]:
+    """
+    Find a camera on the local /24 when backend IP is stale.
+    Prefer hint_ip, then other hosts with RTSP port open that accept credentials.
+
+    Unsafe when several cameras share the same RTSP login — use only with
+    CAMERA_LAN_CREDENTIAL_SCAN=1 and a single camera on the LAN segment.
+    """
+    skip = set(skip_ips or ())
+    candidates: List[str] = []
+    seen: Set[str] = set()
+
+    def _add(ip: Optional[str]) -> None:
+        host = str(ip or "").strip()
+        if not host or host in skip or host in seen:
+            return
+        seen.add(host)
+        candidates.append(host)
+
+    _add(hint_ip)
+    open_hosts: List[str] = []
+    for net in candidate_networks(hint_ip):
+        for host in net.hosts():
+            _add(str(host))
+
+    with ThreadPoolExecutor(max_workers=max(4, workers)) as pool:
+        probes = {pool.submit(tcp_probe, ip, int(port or 554), 0.25): ip for ip in candidates}
+        for fut in as_completed(probes):
+            ip = probes[fut]
+            try:
+                if fut.result():
+                    open_hosts.append(ip)
+            except Exception:
+                pass
+
+    for ip in open_hosts:
+        if not ip_rtsp_reachable(ip, username=username, password=password, port=port, path=path):
+            continue
+        if not ip_mac_matches(ip, mac, port=port, username=username, password=password):
+            continue
+        return ip
+    return None
+
+
+def resolve_effective_ip(
+    *,
+    ip: Optional[str] = None,
+    health_ip: Optional[str] = None,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    port: int = 554,
+    path: str = "/",
+    mac: Optional[str] = None,
+    lan_scan: Optional[bool] = None,
+    skip_ips: Optional[Set[str]] = None,
+) -> Optional[str]:
+    """
+    Pick the IP both capture and streaming should use.
+    Order: health_ip, configured ip, MAC rediscovery, optional LAN credential scan.
+    """
+    if lan_scan is None:
+        lan_scan = lan_credential_scan_enabled()
+    skip = set(skip_ips or ())
+    candidates: List[str] = []
+    for candidate in (health_ip, ip):
+        host = str(candidate or "").strip()
+        if host and host not in candidates:
+            candidates.append(host)
+
+    for host in candidates:
+        if host in skip:
+            continue
+        if not ip_rtsp_reachable(host, username=username, password=password, port=port, path=path):
+            continue
+        if not ip_mac_matches(host, mac, port=port, username=username, password=password):
+            continue
+        return host
+
+    mac_ip = find_ip_for_mac(mac or "", hint_ip=ip or health_ip, port=port, skip_ips=skip)
+    if mac_ip and mac_ip not in skip:
+        if ip_rtsp_reachable(mac_ip, username=username, password=password, port=port, path=path):
+            return mac_ip
+
+    if not lan_scan:
+        return None
+    return find_rtsp_by_credentials(
+        username=username,
+        password=password,
+        hint_ip=ip or health_ip,
+        port=port,
+        path=path,
+        mac=mac,
+        skip_ips=skip,
+    )
 
 
 def _mac_from_isapi(ip: str, username: Optional[str], password: Optional[str]) -> Optional[str]:

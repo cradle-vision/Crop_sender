@@ -959,6 +959,9 @@ class KafkaSenderAgent:
         company_name: Optional[str] = None,
         building_name: Optional[str] = None,
         camera_name: Optional[str] = None,
+        local_x: Optional[float] = None,
+        local_y: Optional[float] = None,
+        track_id: Optional[str] = None,
     ) -> bool:
         """JPEG encode → MinIO (or local spill) → Kafka or disk buffer. Non-blocking for Kafka."""
         def _sanitize(value: Optional[str]) -> Optional[str]:
@@ -974,6 +977,7 @@ class KafkaSenderAgent:
         company_name = _sanitize(company_name)
         building_name = _sanitize(building_name)
         camera_name = _sanitize(camera_name)
+        track_id = _sanitize(track_id)
 
         try:
             payload, camera_key = self._upload_crop(
@@ -987,6 +991,9 @@ class KafkaSenderAgent:
                 camera_name=camera_name,
                 _slug=self._slug,
                 force_disk=self._should_store_locally(),
+                local_x=local_x,
+                local_y=local_y,
+                track_id=track_id,
             )
         except Exception as e:
             print(f"[Kafka Sender Agent] Crop upload failed: {e}")
@@ -1034,6 +1041,9 @@ class KafkaSenderAgent:
         camera_name: Optional[str],
         _slug: Callable[[Optional[str]], Optional[str]],
         force_disk: bool = False,
+        local_x: Optional[float] = None,
+        local_y: Optional[float] = None,
+        track_id: Optional[str] = None,
     ) -> Tuple[Optional[dict], str]:
         data = encode_jpeg_bgr(frame, quality=self.jpeg_quality)
         if data is None:
@@ -1053,6 +1063,7 @@ class KafkaSenderAgent:
         object_name = f"{prefix}/{ts_ms}_{file_id}.jpg"
 
         payload: Dict[str, Any] = {
+            "entity_type": "visitor",
             "camera_id": camera_id,
             "timestamp": ts_ms,
             "format": "jpeg",
@@ -1067,6 +1078,14 @@ class KafkaSenderAgent:
             payload["company_name"] = company_name
         if building_name:
             payload["building_name"] = building_name
+        if track_id:
+            payload["track_id"] = track_id
+        if local_x is not None and local_y is not None:
+            try:
+                payload["local_x"] = float(local_x)
+                payload["local_y"] = float(local_y)
+            except (TypeError, ValueError):
+                pass
 
         uploaded = False
         if self._use_minio and not force_disk:

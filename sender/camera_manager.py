@@ -5,7 +5,8 @@ import ssl
 import subprocess
 import urllib.request
 import urllib.parse
-from typing import List, Dict, Optional, Union
+from typing import List, Dict, Optional, Union, Set
+from urllib.parse import urlparse
 from dataclasses import dataclass, asdict, fields
 
 
@@ -17,6 +18,7 @@ class CameraInfo:
     source: Union[int, str]  # URL/path for stream source
     type: str  # 'rtsp', 'http', 'file'
     ip_address: Optional[str] = None
+    health_ip_address: Optional[str] = None
     mac_address: Optional[str] = None
     port: Optional[int] = None
     username: Optional[str] = None
@@ -44,6 +46,8 @@ class CameraInfo:
     # Exclude zones (pixel rects); applied when exclude_zones_active is not False
     exclude_zones: Optional[List] = None
     exclude_zones_active: Optional[bool] = None
+    # Indoor 3D: true when camera has active store-map calibration (from backend)
+    calibration_active: Optional[bool] = None
 
 
 class CameraManager:
@@ -178,15 +182,24 @@ class CameraManager:
                 parsed = _parse_bool(eza)
                 if parsed is not None:
                     out["exclude_zones_active"] = parsed
+            cal = _parse_bool(_pick(out, ("calibration_active", "calibrationActive")))
+            if cal is not None:
+                out["calibration_active"] = cal
             # camera_id: БЕРЁМ ИМЕННО id из backend (основной ключ камеры),
             # а device_id используем только как fallback, если id нет.
             if 'id' in out:
                 out['camera_id'] = str(out['id'])
             elif 'device_id' in out and 'camera_id' not in out:
                 out['camera_id'] = str(out['device_id'])
-            # ip_address: backend uses device_ip
-            if 'device_ip' in out and out.get('device_ip') and not out.get('ip_address'):
-                out['ip_address'] = str(out['device_ip']).strip()
+            # ip_address: backend uses device_ip; prefer live health_ip when present
+            health_ip = _pick(out, ("health_ip_address", "healthIpAddress"))
+            device_ip = out.get("device_ip") or out.get("ip_address")
+            if health_ip:
+                out["health_ip_address"] = str(health_ip).strip()
+            if device_ip and not out.get("ip_address"):
+                out["ip_address"] = str(device_ip).strip()
+            elif device_ip:
+                out["ip_address"] = str(device_ip).strip()
             mac_raw = _pick(out, (
                 "mac_address", "macAddress", "device_mac", "deviceMac", "mac", "mac_addr",
             ))
@@ -519,6 +532,48 @@ class CameraManager:
         
         return True
 
+    def resolve_connectivity(self, *, lan_scan: Optional[bool] = None) -> List[tuple[str, str, str]]:
+        """Align RTSP host for all enabled cameras (shared with streaming-agent).
+
+        Returns list of (camera_id, old_ip, new_ip) for cameras that changed.
+        """
+        try:
+            from camera_net import resolve_effective_ip
+        except ImportError:
+            from sender.camera_net import resolve_effective_ip  # type: ignore
+
+        updated: List[tuple[str, str, str]] = []
+        skip_ips: Set[str] = set()
+        for camera in self.get_enabled_cameras():
+            if camera.type != "rtsp":
+                continue
+            old_ip = str(camera.ip_address or "").strip()
+            health_ip = str(getattr(camera, "health_ip_address", "") or "").strip() or None
+            path = "/"
+            if isinstance(camera.source, str) and "://" in camera.source:
+                parsed = urlparse(camera.source)
+                if parsed.path:
+                    path = parsed.path
+            new_ip = resolve_effective_ip(
+                ip=old_ip or None,
+                health_ip=health_ip,
+                username=camera.username,
+                password=camera.password,
+                port=int(camera.port or 554),
+                path=path,
+                mac=getattr(camera, "mac_address", None),
+                lan_scan=lan_scan,
+                skip_ips=skip_ips,
+            )
+            if not new_ip or new_ip == old_ip:
+                if new_ip:
+                    skip_ips.add(new_ip)
+                continue
+            if self.apply_discovered_ip(camera.camera_id, new_ip, camera.mac_address):
+                updated.append((camera.camera_id, old_ip, new_ip))
+                skip_ips.add(new_ip)
+        return updated
+
     def apply_discovered_ip(self, camera_id: str, new_ip: str, mac_address: Optional[str] = None) -> bool:
         """Rewrite local RTSP/HTTP source after MAC-based IP rediscovery."""
         camera = self.cameras.get(camera_id)
@@ -528,9 +583,28 @@ class CameraManager:
         if not new_ip:
             return False
         try:
-            from camera_net import normalize_mac, replace_host_in_url
+            from camera_net import ip_mac_matches, normalize_mac, replace_host_in_url
         except ImportError:
-            from sender.camera_net import normalize_mac, replace_host_in_url  # type: ignore
+            from sender.camera_net import (  # type: ignore
+                ip_mac_matches,
+                normalize_mac,
+                replace_host_in_url,
+            )
+        expected_mac = normalize_mac(mac_address) or normalize_mac(
+            getattr(camera, "mac_address", None)
+        )
+        if expected_mac and not ip_mac_matches(
+            new_ip,
+            expected_mac,
+            port=int(camera.port or 554),
+            username=camera.username,
+            password=camera.password,
+        ):
+            print(
+                f"[Camera Manager] Refusing IP update for camera {camera_id}: "
+                f"MAC at {new_ip} does not match {expected_mac}"
+            )
+            return False
         old_ip = camera.ip_address
         camera.ip_address = new_ip
         if isinstance(camera.source, str) and camera.source:

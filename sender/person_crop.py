@@ -566,6 +566,12 @@ def detect_persons(
     return rects
 
 
+def foot_point(rect: Tuple[int, int, int, int]) -> Tuple[float, float]:
+    """Bottom-center of person bbox in full-frame pixels (best for floor-plan projection)."""
+    x1, y1, x2, y2 = rect
+    return (float(x1 + x2) / 2.0, float(y2))
+
+
 def crop_persons(
     frame: np.ndarray,
     rects: List[Tuple[int, int, int, int]],
@@ -575,7 +581,19 @@ def crop_persons(
     Crop person regions from frame. rects: (x1, y1, x2, y2). padding: fraction of bbox.
     Returns list of BGR images.
     """
-    crops = []
+    return [crop for crop, _rect in crop_persons_with_rects(frame, rects, padding=padding)]
+
+
+def crop_persons_with_rects(
+    frame: np.ndarray,
+    rects: List[Tuple[int, int, int, int]],
+    padding: float = 0.1,
+) -> List[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
+    """
+    Crop person regions and keep the source bbox for each successful crop.
+    Used so Kafka can include local_x/local_y (foot point) for indoor 3D tracking.
+    """
+    out: List[Tuple[np.ndarray, Tuple[int, int, int, int]]] = []
     h_img, w_img = frame.shape[:2]
     for (x1, y1, x2, y2) in rects:
         w, h = x2 - x1, y2 - y1
@@ -587,8 +605,8 @@ def crop_persons(
         y2p = min(h_img, y2 + pad_h)
         crop = frame[y1p:y2p, x1p:x2p].copy()
         if crop.size > 0:
-            crops.append(crop)
-    return crops
+            out.append((crop, (x1, y1, x2, y2)))
+    return out
 
 
 def is_available() -> bool:
