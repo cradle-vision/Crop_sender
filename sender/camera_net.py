@@ -263,6 +263,9 @@ def find_rtsp_by_credentials(
     """
     Find a camera on the local /24 when backend IP is stale.
     Prefer hint_ip, then other hosts with RTSP port open that accept credentials.
+
+    Unsafe when multiple cameras share the same login/password — disabled by
+    default via resolve_effective_ip(lan_scan=False). Prefer MAC rediscovery.
     """
     skip = set(skip_ips or ())
     candidates: List[str] = []
@@ -306,12 +309,13 @@ def resolve_effective_ip(
     port: int = 554,
     path: str = "/",
     mac: Optional[str] = None,
-    lan_scan: bool = True,
+    lan_scan: bool = False,
     skip_ips: Optional[Set[str]] = None,
 ) -> Optional[str]:
     """
     Pick the IP both capture and streaming should use.
-    Order: health_ip, configured ip, MAC rediscovery, LAN RTSP scan.
+    Order: health_ip, configured ip, MAC rediscovery.
+    Credential LAN scan is off by default (unsafe when cameras share login/password).
     """
     skip = set(skip_ips or ())
     candidates: List[str] = []

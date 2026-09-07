@@ -62,17 +62,21 @@ class CameraManager:
         self.config_file = config_file
         self.auto_save = auto_save
         self.cameras: Dict[str, CameraInfo] = {}
+        self._ip_changed_camera_ids: List[str] = []
         if config_file and os.path.exists(config_file) and not os.path.isdir(config_file):
             self.load_cameras()
     
     def load_cameras_from_data(self, data: dict) -> None:
         """Load cameras from dict (same structure as YAML or API: { 'cameras': [ {...}, ... ] })."""
-        previous_macs = {
-            cid: getattr(cam, "mac_address", None)
+        previous_state = {
+            cid: (
+                str(getattr(cam, "ip_address", None) or "").strip(),
+                getattr(cam, "mac_address", None),
+            )
             for cid, cam in self.cameras.items()
-            if getattr(cam, "mac_address", None)
         }
         self.cameras = {}
+        self._ip_changed_camera_ids: List[str] = []
         cameras_list = data.get('cameras')
         if not isinstance(cameras_list, list):
             for key in ('items', 'data', 'results', 'content', 'records'):
@@ -279,8 +283,20 @@ class CameraManager:
                 filtered['type'] = 'rtsp'
             if not filtered.get('name'):
                 filtered['name'] = filtered.get('camera_id') or 'camera'
-            if not filtered.get("mac_address"):
-                filtered["mac_address"] = previous_macs.get(str(filtered.get("camera_id")))
+            cam_key = str(filtered.get("camera_id"))
+            prev_ip, prev_mac = previous_state.get(cam_key, ("", None))
+            new_ip = str(filtered.get("ip_address") or "").strip()
+            if prev_ip and new_ip and prev_ip != new_ip:
+                # Backend moved this camera to another IP — drop old MAC and re-learn.
+                filtered["mac_address"] = None
+                self._ip_changed_camera_ids.append(cam_key)
+                print(
+                    f"[Camera Manager] Backend IP changed for {cam_key}: "
+                    f"{prev_ip} -> {new_ip}; clearing MAC for re-learn"
+                )
+            elif not filtered.get("mac_address"):
+                # Keep locally learned MAC only when IP did not change.
+                filtered["mac_address"] = prev_mac
             try:
                 camera = CameraInfo(**filtered)
                 self.cameras[camera.camera_id] = camera
@@ -527,9 +543,16 @@ class CameraManager:
         
         return True
 
-    def resolve_connectivity(self, *, lan_scan: bool = True) -> List[tuple[str, str, str]]:
+    def consume_ip_changed_camera_ids(self) -> List[str]:
+        """Camera IDs whose backend IP changed on the last load (MAC was cleared)."""
+        changed = list(getattr(self, "_ip_changed_camera_ids", []) or [])
+        self._ip_changed_camera_ids = []
+        return changed
+
+    def resolve_connectivity(self, *, lan_scan: bool = False) -> List[tuple[str, str, str]]:
         """Align RTSP host for all enabled cameras (shared with streaming-agent).
 
+        Only health_ip / configured IP / MAC rediscovery — no credential LAN scan.
         Returns list of (camera_id, old_ip, new_ip) for cameras that changed.
         """
         try:

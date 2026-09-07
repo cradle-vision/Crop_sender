@@ -441,7 +441,7 @@ def _parse_camera(obj: dict[str, Any]) -> CameraEntry | None:
     return _camera_entry_from_yaml_item(obj, str(url).strip())
 
 
-def _resolve_main_rtsp_url(cam: dict[str, Any], *, lan_scan: bool = True) -> str:
+def _resolve_main_rtsp_url(cam: dict[str, Any], *, lan_scan: bool = False) -> str:
     """
     Build main RTSP URL using the same LAN/IP resolver as sender-crop.
     Keeps streaming and capture on the same camera host.

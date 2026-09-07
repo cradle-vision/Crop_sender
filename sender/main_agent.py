@@ -481,10 +481,15 @@ class MainAgent:
         data = CameraManager._normalize_backend_response(raw)
         self.camera_manager.load_cameras_from_data(data)
         self.camera_manager.config_file = cameras_config
-        resolved = self.camera_manager.resolve_connectivity()
+        for camera_id in self.camera_manager.consume_ip_changed_camera_ids():
+            # Backend intentionally moved IP — do not re-apply old MAC rediscovery.
+            self._recovered_ip.pop(camera_id, None)
+            self._network_conflict_cams.pop(str(camera_id), None)
+            self._mac_scan_last.pop(camera_id, None)
+        resolved = self.camera_manager.resolve_connectivity(lan_scan=False)
         if resolved:
             print(
-                f"[Main Agent] Resolved RTSP IP for camera(s): "
+                f"[Main Agent] Resolved RTSP IP for camera(s) via MAC/health: "
                 f"{', '.join(camera_id for camera_id, _, _ in resolved)}"
             )
             for camera_id, old_ip, new_ip in resolved:
