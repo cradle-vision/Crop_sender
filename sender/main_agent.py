@@ -151,7 +151,7 @@ class MainAgent:
         bootstrap_servers = (
             _env('KAFKA_BOOTSTRAP_SERVERS')
             or _env('SENDER_KAFKA_BOOTSTRAP_SERVERS')
-            or '64.227.62.36:9092'
+            or '198.163.196.167:9092'
         )
         bootstrap_servers = str(bootstrap_servers).replace('http://', '').replace('https://', '').rstrip('/')
 
