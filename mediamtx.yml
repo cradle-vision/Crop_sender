@@ -1,5 +1,4 @@
-# MediaMTX: local RTSP relay for streaming-agent (camera → localhost → FFmpeg → RTMP).
-# Docs: https://mediamtx.org/docs/references/configuration-file
+# MediaMTX 1.11.3 — HTTP HLS playback (1.21 sets Secure cookies and breaks http://)
 
 logLevel: info
 logDestinations: [stdout]
@@ -7,24 +6,29 @@ logDestinations: [stdout]
 readTimeout: 30s
 writeTimeout: 30s
 
-api: true
+api: yes
 apiAddress: :9997
-apiAllowOrigins: ['*']
 
-webrtc: true
+rtsp: yes
+rtspAddress: :8554
+
+rtmp: yes
+rtmpAddress: :1935
+
+hls: yes
+hlsAddress: :8888
+hlsAllowOrigin: '*'
+hlsAlwaysRemux: yes
+hlsVariant: mpegts
+
+webrtc: yes
 webrtcAddress: :8889
-webrtcAllowOrigins: ['*']
-webrtcLocalUDPAddress: :8189
-webrtcIPsFromInterfaces: true
-webrtcAdditionalHosts: []
-
+webrtcAllowOrigin: '*'
+webrtcICEUDPMuxAddress: :8189
 webrtcICEServers2:
   - url: stun:stun.l.google.com:19302
 
-rtsp: true
-rtspAddress: :8554
-
-# Relay paths (up_<camera_id>) are added via API with sourceOnDemand per path.
-
 paths:
+  fake-store:
+    source: publisher
   all_others:
