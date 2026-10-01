@@ -28,10 +28,11 @@ from camera_manager import CameraManager
 from camera_net import find_ip_for_mac, learn_mac_for_ip, normalize_mac
 from person_crop import (
     detect_persons,
-    crop_persons,
+    crop_persons_with_rects,
     is_available as person_detector_available,
     resolve_exclude_zones,
 )
+import face_filter
 from jpeg_utils import encode_jpeg_bgr
 from roi_command_server import RoiCommandServer
 from roi_local_http import RoiLocalHttpServer
@@ -235,6 +236,22 @@ class MainAgent:
                 "See cpu-person-detection/ and PERSON_MODEL_PATH."
             )
         print("[Main Agent] Using person detection (cpu-person-detection binary)")
+
+        self.face_filter_enabled = face_filter.FACE_FILTER_ENABLED
+        if self.face_filter_enabled and not face_filter.is_available():
+            raise RuntimeError(
+                f"YuNet model not found: {face_filter.YUNET_MODEL_PATH}. "
+                "Set YUNET_MODEL_PATH or FACE_FILTER_ENABLED=false."
+            )
+        self._face_stats = face_filter.FaceFilterStats()
+        if self.face_filter_enabled:
+            print(
+                f"[Main Agent] Face filter ON (YuNet, no resize): model={face_filter.YUNET_MODEL_PATH} "
+                f"FACE_SCORE_THRESHOLD={face_filter.FACE_SCORE_THRESHOLD} "
+                f"FACE_CROP_SCALE={face_filter.FACE_CROP_SCALE}"
+            )
+        else:
+            print("[Main Agent] Face filter OFF: sending person crops")
         print("[Main Agent] RTSP capture: using FFmpeg pipe only")
 
         # Decode/sample rate: FFmpeg fps= filter from DEFAULT_FPS in .env (per-store). 0 = unlimited.
@@ -707,7 +724,23 @@ class MainAgent:
             line_params=line_params,
             exclude_zones=exclude_zones,
         )
-        crops = crop_persons(frame, rects)
+        person_crops = crop_persons_with_rects(frame, rects)
+        if self.face_filter_enabled:
+            crops = []
+            for person_img, person_rect in person_crops:
+                t0 = time.perf_counter()
+                faces = face_filter.detect_faces(person_img)
+                yunet_ms = (time.perf_counter() - t0) * 1000.0
+                face_imgs = face_filter.face_crops(frame, person_rect, faces) if faces else []
+                crops.extend(face_imgs)
+                self._face_stats.record(bool(faces), len(face_imgs), yunet_ms)
+                if self._sender_debug:
+                    print(
+                        f"[DEBUG] camera={camera_id} person={person_rect} faces={len(faces)} "
+                        f"face_crops={len(face_imgs)} yunet_ms={yunet_ms:.1f}"
+                    )
+        else:
+            crops = [img for img, _ in person_crops]
         h, w = frame.shape[:2]
 
         if self._sender_debug:
@@ -719,7 +752,8 @@ class MainAgent:
                 self._debug_miss_state.pop(camera_id, None)
             elif rects:
                 print(
-                    f"[DEBUG] camera={camera_id} boxes={len(rects)} but 0 crops (unexpected); "
+                    f"[DEBUG] camera={camera_id} boxes={len(rects)} but 0 crops "
+                    f"({'no face found' if self.face_filter_enabled else 'unexpected'}); "
                     f"frame={w}x{h}"
                 )
             else:

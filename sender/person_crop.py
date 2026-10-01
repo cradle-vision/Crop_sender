@@ -575,7 +575,16 @@ def crop_persons(
     Crop person regions from frame. rects: (x1, y1, x2, y2). padding: fraction of bbox.
     Returns list of BGR images.
     """
-    crops = []
+    return [crop for crop, _ in crop_persons_with_rects(frame, rects, padding)]
+
+
+def crop_persons_with_rects(
+    frame: np.ndarray,
+    rects: List[Tuple[int, int, int, int]],
+    padding: float = 0.1,
+) -> List[Tuple[np.ndarray, BBox]]:
+    """Like crop_persons, but also returns the padded full-frame rect (x1, y1, x2, y2) of each crop."""
+    out: List[Tuple[np.ndarray, BBox]] = []
     h_img, w_img = frame.shape[:2]
     for (x1, y1, x2, y2) in rects:
         w, h = x2 - x1, y2 - y1
@@ -587,8 +596,8 @@ def crop_persons(
         y2p = min(h_img, y2 + pad_h)
         crop = frame[y1p:y2p, x1p:x2p].copy()
         if crop.size > 0:
-            crops.append(crop)
-    return crops
+            out.append((crop, (x1p, y1p, x2p, y2p)))
+    return out
 
 
 def is_available() -> bool:
