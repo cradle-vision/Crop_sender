@@ -47,18 +47,16 @@ def _vaapi_device_from_env() -> Optional[str]:
     return None
 
 
-def _stderr_is_vaapi_failure(stderr_tail: str) -> bool:
+def _stderr_is_hwaccel_failure(stderr_tail: str) -> bool:
     low = (stderr_tail or "").lower()
     return any(
         token in low
         for token in (
-            "vaapi",
-            "va-api",
-            "libva",
-            "ihd_drv",
-            "i965_drv",
-            "renderd128",
+            "error creating a mfx session",
+            "failed to set value",
+            "device creation failed",
             "no va display",
+            "no device available for decoder",
         )
     )
 
@@ -204,7 +202,7 @@ class SnapshotCaptureAgent:
         self._watchdog_thread: Optional[threading.Thread] = None
         self._vaapi_device = _vaapi_device_from_env()
         self._vaapi_failed = False
-        decode = f"vaapi:{self._vaapi_device}" if self._vaapi_device else "software"
+        decode = f"qsv:{self._vaapi_device}" if self._vaapi_device else "software"
         print(
             f"[Capture Agent {self.camera_id}] Processing queue depth: {self.processing_queue_max}, "
             f"workers: {self.processing_workers}, decode={decode} "
@@ -304,11 +302,16 @@ class SnapshotCaptureAgent:
         return 0, 0
 
     def _ffmpeg_hwaccel_args(self) -> list[str]:
-        """Decode on the iGPU. Frames are copied back to RAM so the fps filter stays unchanged."""
+        """Intel Quick Sync. VAAPI on ffmpeg 7 aborts the N150 decoder after one bad frame."""
         device = self._vaapi_device
         if not device or self._vaapi_failed:
             return []
-        return ["-hwaccel", "vaapi", "-hwaccel_device", device]
+        return [
+            "-hwaccel", "qsv",
+            "-qsv_device", device,
+            "-hwaccel_output_format", "qsv",
+            "-c:v", "h264_qsv",
+        ]
 
     def _ffmpeg_decode_prefix(self) -> list[str]:
         inp = self._input_for_ffmpeg or str(self.source)
@@ -325,7 +328,13 @@ class SnapshotCaptureAgent:
     def _ffmpeg_output_suffix(self) -> list[str]:
         """Output raw BGR24. Use fps filter for steady sampling; avoid -r on rawvideo (dup/drop)."""
         out: list[str] = []
-        if self.fps > 0:
+        if self._ffmpeg_hwaccel_args():
+            vf = "hwdownload,format=nv12"
+            if self.fps > 0:
+                vf += f",fps={self.fps}"
+            vf += ",format=bgr24"
+            out.extend(["-vf", vf])
+        elif self.fps > 0:
             out.extend(["-vf", f"fps={self.fps}"])
         out.extend(["-f", "rawvideo", "-pix_fmt", "bgr24", "-an", "-"])
         return out
@@ -587,11 +596,11 @@ class SnapshotCaptureAgent:
                     self.is_running
                     and not got_frame
                     and self._ffmpeg_hwaccel_args()
-                    and _stderr_is_vaapi_failure(stderr_tail)
+                    and _stderr_is_hwaccel_failure(stderr_tail)
                 ):
                     self._vaapi_failed = True
                     print(
-                        f"[Capture Agent {self.camera_id}] VAAPI decode failed; "
+                        f"[Capture Agent {self.camera_id}] Quick Sync decode failed; "
                         "using software decode"
                     )
                 if self.is_running and disconnect_reason:

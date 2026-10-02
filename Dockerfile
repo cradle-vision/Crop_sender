@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     wget \
     tar \
     ffmpeg \
+    libmfx-gen1.2 \
     libsm6 \
     libxext6 \
     libxrender-dev \
