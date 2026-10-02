@@ -3,6 +3,9 @@ services:
     image: ${AGENT_IMAGE:-ghcr.io/cradle-vision/crop-sender:main}
     container_name: sender-crop
     restart: unless-stopped
+    # Intel iGPU H264 decode. Hosts without /dev/dri cannot recreate until this line is removed.
+    devices:
+      - /dev/dri:/dev/dri
     shm_size: "512m"
     pids_limit: 8192
     volumes:

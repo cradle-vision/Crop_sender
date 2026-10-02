@@ -33,6 +33,35 @@ _DEFAULT_FFPROBE_TIMEOUT_SEC = 8.0
 _DEFAULT_WATCHDOG_SEC = 90.0
 _OFFLINE_LOG_INTERVAL_SEC = 60.0
 
+
+def _vaapi_device_from_env() -> Optional[str]:
+    """auto: use the iGPU when the device node is visible. off: always software decode."""
+    mode = os.environ.get("FFMPEG_HWACCEL", "auto").strip().lower()
+    if mode in ("0", "off", "false", "software", "none", "sw"):
+        return None
+    device = os.environ.get("FFMPEG_VAAPI_DEVICE", "/dev/dri/renderD128").strip() or "/dev/dri/renderD128"
+    if mode in ("auto", "") and not os.path.exists(device):
+        return None
+    if mode in ("auto", "", "vaapi", "on", "true", "1"):
+        return device
+    return None
+
+
+def _stderr_is_vaapi_failure(stderr_tail: str) -> bool:
+    low = (stderr_tail or "").lower()
+    return any(
+        token in low
+        for token in (
+            "vaapi",
+            "va-api",
+            "libva",
+            "ihd_drv",
+            "i965_drv",
+            "renderd128",
+            "no va display",
+        )
+    )
+
 # Cached RTSP socket timeout CLI flag: "-timeout" (most builds) or "-stimeout" (some newer).
 _rtsp_timeout_cli_flag: Optional[str] = None
 _rtsp_timeout_flag_logged = False
@@ -173,9 +202,12 @@ class SnapshotCaptureAgent:
         watchdog = _env_float("CAPTURE_WATCHDOG_SEC", _DEFAULT_WATCHDOG_SEC)
         self._watchdog_sec = max(30.0, watchdog) if watchdog > 0 else 0.0
         self._watchdog_thread: Optional[threading.Thread] = None
+        self._vaapi_device = _vaapi_device_from_env()
+        self._vaapi_failed = False
+        decode = f"vaapi:{self._vaapi_device}" if self._vaapi_device else "software"
         print(
             f"[Capture Agent {self.camera_id}] Processing queue depth: {self.processing_queue_max}, "
-            f"workers: {self.processing_workers} "
+            f"workers: {self.processing_workers}, decode={decode} "
             f"(higher queue = more backlog tolerance, more latency/RAM if detection is slow)"
         )
 
@@ -271,16 +303,24 @@ class SnapshotCaptureAgent:
             return 0, 0
         return 0, 0
 
+    def _ffmpeg_hwaccel_args(self) -> list[str]:
+        """Decode on the iGPU. Frames are copied back to RAM so the fps filter stays unchanged."""
+        device = self._vaapi_device
+        if not device or self._vaapi_failed:
+            return []
+        return ["-hwaccel", "vaapi", "-hwaccel_device", device]
+
     def _ffmpeg_decode_prefix(self) -> list[str]:
         inp = self._input_for_ffmpeg or str(self.source)
         base = ["ffmpeg", "-y", "-nostdin", "-loglevel", "error"]
+        hw = self._ffmpeg_hwaccel_args()
         if self.camera_type == "rtsp":
-            return base + self._rtsp_input_opts() + ["-i", inp]
+            return base + hw + self._rtsp_input_opts() + ["-i", inp]
         if self.camera_type == "http":
-            return base + ["-rw_timeout", "5000000", "-i", inp]
+            return base + hw + ["-rw_timeout", "5000000", "-i", inp]
         if self.camera_type == "file":
-            return base + ["-i", inp]
-        return base + ["-i", inp]
+            return base + hw + ["-i", inp]
+        return base + hw + ["-i", inp]
 
     def _ffmpeg_output_suffix(self) -> list[str]:
         """Output raw BGR24. Use fps filter for steady sampling; avoid -r on rawvideo (dup/drop)."""
@@ -478,15 +518,20 @@ class SnapshotCaptureAgent:
                 f"[Capture Agent {self.camera_id}] Connecting to camera "
                 f"(attempt {self._reconnect_attempts})"
             )
+            got_frame = False
             try:
                 w, h, frame_size = self._resolve_frame_size()
                 cmd = self._ffmpeg_decode_prefix() + self._ffmpeg_output_suffix()
+                proc_env = os.environ.copy()
+                if self._ffmpeg_hwaccel_args():
+                    proc_env.setdefault("LIBVA_DRIVER_NAME", "iHD")
                 self._ffmpeg_proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     stdin=subprocess.DEVNULL,
                     start_new_session=True,
+                    env=proc_env,
                 )
                 self._stderr_chunks, self._stderr_drain_thread = self._start_stderr_drain(
                     self._ffmpeg_proc
@@ -538,6 +583,17 @@ class SnapshotCaptureAgent:
                     except Exception:
                         pass
                 self._stop_ffmpeg()
+                if (
+                    self.is_running
+                    and not got_frame
+                    and self._ffmpeg_hwaccel_args()
+                    and _stderr_is_vaapi_failure(stderr_tail)
+                ):
+                    self._vaapi_failed = True
+                    print(
+                        f"[Capture Agent {self.camera_id}] VAAPI decode failed; "
+                        "using software decode"
+                    )
                 if self.is_running and disconnect_reason:
                     self._mark_stream_lost(disconnect_reason)
                     if stderr_tail and not self._stream_healthy:
