@@ -20,6 +20,8 @@ from typing import Callable, Optional, Tuple, Union
 
 import numpy as np
 
+from nv12_frame import Nv12Frame
+
 _PROCESS_SENTINEL = object()
 
 _DEFAULT_CAPTURE_FPS = 5.0
@@ -243,7 +245,11 @@ class SnapshotCaptureAgent:
                 thread.start()
                 self.processing_threads.append(thread)
         if self.fps > 0:
-            print(f"[Capture Agent {self.camera_id}] Capture started (FFmpeg fps filter: {self.fps})")
+            pix = "nv12" if self._raw_is_nv12() else "bgr24"
+            print(
+                f"[Capture Agent {self.camera_id}] Capture started "
+                f"(FFmpeg fps filter: {self.fps}, pix_fmt={pix})"
+            )
         else:
             print(f"[Capture Agent {self.camera_id}] Capture started (full decode rate; high CPU/bandwidth)")
 
@@ -328,16 +334,27 @@ class SnapshotCaptureAgent:
     def _ffmpeg_output_suffix(self) -> list[str]:
         """Output raw BGR24. Use fps filter for steady sampling; avoid -r on rawvideo (dup/drop)."""
         out: list[str] = []
-        if self._ffmpeg_hwaccel_args():
+        if self._raw_is_nv12():
             vf = "hwdownload,format=nv12"
             if self.fps > 0:
                 vf += f",fps={self.fps}"
-            vf += ",format=bgr24"
-            out.extend(["-vf", vf])
-        elif self.fps > 0:
+            out.extend(["-vf", vf, "-f", "rawvideo", "-pix_fmt", "nv12", "-an", "-"])
+            return out
+        if self.fps > 0:
             out.extend(["-vf", f"fps={self.fps}"])
         out.extend(["-f", "rawvideo", "-pix_fmt", "bgr24", "-an", "-"])
         return out
+
+    def _raw_is_nv12(self) -> bool:
+        """GPU decode stays NV12. Software decode still sends BGR."""
+        if not self._ffmpeg_hwaccel_args():
+            return False
+        w, h = self._last_good_resolution
+        if w <= 0 or h <= 0:
+            w, h = self.width, self.height
+        if w <= 0 or h <= 0:
+            return True
+        return w % 2 == 0 and h % 2 == 0
 
     def _offer_processing(self, item: Tuple[float, np.ndarray]) -> None:
         """Enqueue for the worker; drop oldest pending frames if queue is full."""
@@ -479,6 +496,8 @@ class SnapshotCaptureAgent:
             w, h = self.width, self.height
             if not self._stream_healthy:
                 self._log_offline_periodic()
+        if self._raw_is_nv12():
+            return w, h, w * h * 3 // 2
         return w, h, w * h * 3
 
     def _watchdog_loop(self) -> None:
@@ -570,7 +589,11 @@ class SnapshotCaptureAgent:
                     current_time = time.time()
                     self.last_frame_unix = current_time
                     if self.callback is not None:
-                        frame = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3)).copy()
+                        if self._raw_is_nv12():
+                            nv = np.frombuffer(raw, dtype=np.uint8).reshape((h * 3 // 2, w)).copy()
+                            frame = Nv12Frame(nv, w, h)
+                        else:
+                            frame = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 3)).copy()
                         self._offer_processing((current_time, frame))
                 if self.is_running and not got_frame and not disconnect_reason:
                     code = self._ffmpeg_proc.poll() if self._ffmpeg_proc else None

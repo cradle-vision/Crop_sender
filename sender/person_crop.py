@@ -17,6 +17,8 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from nv12_frame import Nv12Frame
+
 ExcludeZone = Tuple[int, int, int, int]
 BBox = Tuple[int, int, int, int]
 
@@ -519,19 +521,19 @@ def detect_persons(
     model = Path(model_path or os.environ.get("PERSON_MODEL_PATH") or _find_model_path())
     if not model.exists():
         return []
-    h, w = frame.shape[:2]
+    h, w = _frame_size(frame)
     if w == 0 or h == 0:
         return []
 
     zones = parse_exclude_zones(exclude_zones) if exclude_zones else []
     left = top = right = bottom = 0
     mid_zones: List[ExcludeZone] = []
-    detect_frame = frame
+    detect_frame = _as_bgr(frame)
     detect_line = line_params
     if zones:
         left, top, right, bottom, mid_zones = _split_edge_strips(zones, w, h)
         if left or top or right or bottom:
-            detect_frame = frame[top : h - bottom, left : w - right]
+            detect_frame = _region_bgr(frame, left, top, w - right, h - bottom)
             ch, cw = detect_frame.shape[:2]
             if cw <= 0 or ch <= 0:
                 return []
@@ -576,7 +578,7 @@ def crop_persons(
     Returns list of BGR images.
     """
     crops = []
-    h_img, w_img = frame.shape[:2]
+    h_img, w_img = _frame_size(frame)
     for (x1, y1, x2, y2) in rects:
         w, h = x2 - x1, y2 - y1
         pad_w = int(w * padding)
@@ -585,10 +587,28 @@ def crop_persons(
         y1p = max(0, y1 - pad_h)
         x2p = min(w_img, x2 + pad_w)
         y2p = min(h_img, y2 + pad_h)
-        crop = frame[y1p:y2p, x1p:x2p].copy()
+        crop = _region_bgr(frame, x1p, y1p, x2p, y2p)
         if crop.size > 0:
             crops.append(crop)
     return crops
+
+
+def _frame_size(frame) -> Tuple[int, int]:
+    if isinstance(frame, Nv12Frame):
+        return frame.height, frame.width
+    return int(frame.shape[0]), int(frame.shape[1])
+
+
+def _as_bgr(frame) -> np.ndarray:
+    if isinstance(frame, Nv12Frame):
+        return frame.to_bgr()
+    return frame
+
+
+def _region_bgr(frame, x1: int, y1: int, x2: int, y2: int) -> np.ndarray:
+    if isinstance(frame, Nv12Frame):
+        return frame.region_bgr(x1, y1, x2, y2)
+    return frame[y1:y2, x1:x2]
 
 
 def is_available() -> bool:

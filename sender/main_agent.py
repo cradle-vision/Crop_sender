@@ -34,6 +34,7 @@ from person_crop import (
     resolve_exclude_zones,
 )
 from jpeg_utils import encode_jpeg_bgr
+from nv12_frame import Nv12Frame
 from roi_command_server import RoiCommandServer
 from roi_local_http import RoiLocalHttpServer
 
@@ -679,9 +680,10 @@ class MainAgent:
             last = self._snapshot_last_attempt.get(camera_id, 0.0)
             if now - last >= self._snapshot_retry_interval:
                 self._snapshot_last_attempt[camera_id] = now
+                snap = frame.to_bgr() if isinstance(frame, Nv12Frame) else frame.copy()
                 threading.Thread(
                     target=self._initial_snapshot_worker,
-                    args=(frame.copy(), timestamp, camera_id, camera),
+                    args=(snap, timestamp, camera_id, camera),
                     daemon=True,
                     name=f"snapshot-{camera_id}",
                 ).start()
@@ -711,7 +713,10 @@ class MainAgent:
             exclude_zones=exclude_zones,
         )
         crops = crop_persons(frame, rects)
-        h, w = frame.shape[:2]
+        if isinstance(frame, Nv12Frame):
+            h, w = frame.height, frame.width
+        else:
+            h, w = frame.shape[:2]
 
         if self._sender_debug:
             if crops:
