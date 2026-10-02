@@ -959,6 +959,7 @@ class KafkaSenderAgent:
         company_name: Optional[str] = None,
         building_name: Optional[str] = None,
         camera_name: Optional[str] = None,
+        defer_to_disk: bool = False,
     ) -> bool:
         """JPEG encode → MinIO (or local spill) → Kafka or disk buffer. Non-blocking for Kafka."""
         def _sanitize(value: Optional[str]) -> Optional[str]:
@@ -986,7 +987,7 @@ class KafkaSenderAgent:
                 building_name=building_name,
                 camera_name=camera_name,
                 _slug=self._slug,
-                force_disk=self._should_store_locally(),
+                force_disk=defer_to_disk or self._should_store_locally(),
             )
         except Exception as e:
             print(f"[Kafka Sender Agent] Crop upload failed: {e}")
@@ -995,7 +996,7 @@ class KafkaSenderAgent:
         if payload is None:
             return False
 
-        if self._should_store_locally():
+        if defer_to_disk or self._should_store_locally():
             if self._enqueue_buffer(payload, camera_key):
                 self._was_draining_backlog = True
                 return True

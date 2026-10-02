@@ -784,6 +784,7 @@ class MainAgent:
             company_name,
             building_name,
             camera_name,
+            defer_to_disk=True,
         )
 
     def _initial_roi_sync_cursor(self) -> str:
