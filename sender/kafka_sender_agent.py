@@ -38,7 +38,7 @@ class KafkaSenderAgent:
         self,
         bootstrap_servers: str = "localhost:9092",
         topic: str = "snapshots",
-        jpeg_quality: int = 100,
+        jpeg_quality: int = 75,
         minio_config: Optional[Dict[str, Any]] = None,
         resilience_config: Optional[Dict[str, Any]] = None,
     ):

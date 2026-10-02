@@ -26,6 +26,7 @@ from snapshot_capture_agent import SnapshotCaptureAgent
 from kafka_sender_agent import KafkaSenderAgent
 from camera_manager import CameraManager
 from camera_net import find_ip_for_mac, learn_mac_for_ip, normalize_mac
+from yunet_filter import YunetFilter
 from person_crop import (
     detect_persons,
     crop_persons,
@@ -156,8 +157,8 @@ class MainAgent:
         bootstrap_servers = str(bootstrap_servers).replace('http://', '').replace('https://', '').rstrip('/')
 
         topic = _env('KAFKA_TOPIC') or 'snapshots'
-        jpeg_quality = 100
-        print(f"[Main Agent] Kafka: {bootstrap_servers}, topic={topic}")
+        jpeg_quality = 75
+        print(f"[Main Agent] Kafka: {bootstrap_servers}, topic={topic}, jpeg_quality={jpeg_quality}")
 
         minio_enabled = _env_bool('MINIO_ENABLED', True)
         minio_config = {
@@ -239,7 +240,9 @@ class MainAgent:
 
         # Decode/sample rate: FFmpeg fps= filter from DEFAULT_FPS in .env (per-store). 0 = unlimited.
         self.capture_fps = max(0.0, _env_float("DEFAULT_FPS", 3.0))
-        self.processing_queue_max = _env_int("PROCESSING_QUEUE_MAX", 200, 1, 500)
+        self.processing_queue_max = _env_int("PROCESSING_QUEUE_MAX", 500, 1, 500)
+        self.face_filter = YunetFilter(self._send_crop)
+        self.face_filter.start()
         self.processing_workers = _env_int("PROCESSING_WORKERS", 3, 1, 16)
         print(
             f"[Main Agent] DEFAULT_FPS={self.capture_fps} "
@@ -750,7 +753,7 @@ class MainAgent:
         if not crops:
             return
         for crop_img in crops:
-            self.sender_agent.send_snapshot(
+            self.face_filter.submit(
                 crop_img,
                 timestamp,
                 camera_id,
@@ -760,6 +763,28 @@ class MainAgent:
                 building_name,
                 camera_name,
             )
+
+    def _send_crop(
+        self,
+        crop_img,
+        timestamp: float,
+        camera_id: str,
+        company_id,
+        building_id,
+        company_name,
+        building_name,
+        camera_name,
+    ) -> None:
+        self.sender_agent.send_snapshot(
+            crop_img,
+            timestamp,
+            camera_id,
+            company_id,
+            building_id,
+            company_name,
+            building_name,
+            camera_name,
+        )
 
     def _initial_roi_sync_cursor(self) -> str:
         latest = None
@@ -1346,6 +1371,8 @@ class MainAgent:
         """Stop all agents"""
         print("[Main Agent] Stopping system...")
         self.running = False
+        if getattr(self, "face_filter", None) is not None:
+            self.face_filter.stop()
         if self._control_client:
             try:
                 self._control_client.stop()
