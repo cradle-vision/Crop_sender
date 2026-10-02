@@ -45,7 +45,7 @@ class YunetFilter:
 
     def __init__(self, on_face: Callable[..., None]):
         self._on_face = on_face
-        self.enabled = _env_bool("FACE_PREFILTER_ENABLED", False)
+        self.enabled = _env_bool("FACE_PREFILTER_ENABLED", True)
         self.min_score = _env_float("FACE_PREFILTER_MIN_SCORE", 0.6)
         self.input_max_side = _env_int("FACE_PREFILTER_INPUT_MAX_SIDE", 320, 64, 1280)
         self.score_threshold = _env_float("FACE_PREFILTER_SCORE_THRESHOLD", 0.5)
